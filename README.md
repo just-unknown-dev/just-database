@@ -65,7 +65,7 @@ void main() async {
   );
 
   final result = await db.query('SELECT * FROM users WHERE age > 25');
-  print(result.rows); // [{id: 1, name: Alice, ...}]
+  debugPrint(result.rows); // [{id: 1, name: Alice, ...}]
 
   await db.close();
 }
@@ -119,7 +119,7 @@ void main() async {
   await users.createTable(db);
 
   final alice = await users.insert(db, const User(name: 'Alice', email: 'a@x.com', age: 30));
-  print(alice.id); // auto-assigned
+  debugPrint(alice.id); // auto-assigned
 
   final all   = await users.findAll(db, where: 'age > 18', orderBy: 'name');
   final total = await users.count(db);
@@ -188,7 +188,7 @@ final db2 = await JustDatabase.open(
   encryptionKey: 'my-secret-passphrase',
 );
 final result = await db2.query('SELECT * FROM secrets');
-print(result.rows); // [{id: 1, value: top secret}]
+debugPrint(result.rows); // [{id: 1, value: top secret}]
 ```
 
 ### Rules
@@ -466,7 +466,7 @@ final suite = await db.runStandardBenchmark(
   warmup:     5,
   iterations: 100,
 );
-print(DatabaseBenchmark.formatTable(suite.results));
+debugPrint(DatabaseBenchmark.formatTable(suite.results));
 
 // Single query benchmark
 final stat = await db.benchmarkQuery(
@@ -474,7 +474,7 @@ final stat = await db.benchmarkQuery(
   'SELECT u.name, COUNT(o.id) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id',
   warmup: 3, iterations: 50,
 );
-print('avg ${stat.avgMs.toStringAsFixed(2)} ms  p99 ${stat.p99Ms.toStringAsFixed(2)} ms');
+debugPrint('avg ${stat.avgMs.toStringAsFixed(2)} ms  p99 ${stat.p99Ms.toStringAsFixed(2)} ms');
 ```
 
 ---
