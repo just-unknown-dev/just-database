@@ -1,0 +1,25 @@
+# IDE and editor files
+.idea/
+.vscode/
+*.iml
+
+# Build artifacts
+.dart_tool/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+.metadata
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Development files
+pubspec.lock
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
+Thumbs.db
