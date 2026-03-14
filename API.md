@@ -4,12 +4,32 @@ Complete API reference for just_database package.
 
 ## Table of Contents
 
+- [Platform Support](#platform-support)
 - [Core Classes](#core-classes)
+- [BackupManager](#backupmanager)
 - [Database Management](#database-management)
 - [Schema & Tables](#schema--tables)
 - [Indexing](#indexing)
 - [Query Execution](#query-execution)
 - [UI Components](#ui-components)
+
+---
+
+## Platform Support
+
+| Platform | SQL / ORM | File persistence | Backup file helpers | `SecureKeyManager` |
+|---|---|---|---|---|
+| Android | ✅ | ✅ | ✅ | ✅ |
+| iOS | ✅ | ✅ | ✅ | ✅ |
+| macOS | ✅ | ✅ | ✅ | ✅ |
+| Windows | ✅ | ✅ | ✅ | ✅ |
+| Linux | ✅ | ✅ | ✅ | ✅ |
+| Web (JS) | ✅ | ❌ no-op | ❌ `UnsupportedError` | ✅ `localStorage` |
+| Web (WASM) | ✅ | ❌ no-op | ❌ `UnsupportedError` | ✅ `localStorage` |
+
+On web/WASM, `persist: true` is silently ignored — the database lives in memory
+only. All SQL, ORM, and in-memory backup operations (`exportSql`, `exportJson`,
+etc.) work normally.
 
 ---
 
@@ -118,6 +138,51 @@ Future<QueryStats> benchmarkQuery(
 ```
 Benchmarks a single SQL statement and returns `QueryStats`
 (avg / min / max / p95 / p99 / ops-per-sec).
+
+---
+
+## BackupManager
+
+Static utility class for exporting and importing database content.
+Re-exported from `just_database.dart`.
+
+### In-memory API (all platforms)
+
+```dart
+// Export all tables as a SQL dump string
+static String exportSql(Map<String, Table> tables)
+
+// Import from a SQL dump string; returns number of statements executed
+static Future<int> importSql(
+  String sql,
+  Map<String, Table> tables, {
+  bool ignoreErrors = false,
+})
+
+// Export all tables as a JSON-serialisable map
+static Map<String, dynamic> exportJson(Map<String, Table> tables)
+
+// Import from a JSON backup map; returns number of tables imported
+static int importJson(
+  Map<String, dynamic> json,
+  Map<String, Table> tables, {
+  bool ignoreErrors = false,
+})
+```
+
+### File helpers (native platforms only)
+
+Throw `UnsupportedError` on web and WASM.
+
+```dart
+static Future<void> backupToFile(Map<String, Table> tables, String filePath)
+static Future<int>  restoreFromFile(String filePath, Map<String, Table> tables, {bool ignoreErrors})
+static Future<void> backupToJsonFile(Map<String, Table> tables, String filePath)
+static Future<int>  restoreFromJsonFile(String filePath, Map<String, Table> tables, {bool ignoreErrors})
+```
+
+**Web / WASM alternative:** serialise with `exportSql` or `exportJson` and
+transmit the result string / map to a server.
 
 ---
 

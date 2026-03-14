@@ -1,6 +1,6 @@
 name: just_database
 description: "A pure-Dart SQL database engine."
-version: 1.1.0
+version: 1.2.0
 homepage: https://github.com/just-unknown-dev/just-database
 repository: https://github.com/just-unknown-dev/just-database
 issue_tracker: https://github.com/just-unknown-dev/just-database/issues
@@ -10,6 +10,14 @@ environment:
   sdk: ^3.11.0
   flutter: ">=3.0.0"
 
+platforms:
+  android:
+  ios:
+  linux:
+  macos:
+  web:
+  windows:
+
 dependencies:
   flutter:
     sdk: flutter
@@ -17,7 +25,7 @@ dependencies:
   provider: ^6.1.2
   crypto: ^3.0.3
   encrypt: ^5.0.3
-  just_storage: ^1.0.0
+  just_storage: ^1.1.2
 
 dev_dependencies:
   flutter_test:

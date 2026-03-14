@@ -1,4 +1,4 @@
-﻿import '../core/database.dart';
+import '../core/database.dart';
 import '../sql/executor.dart';
 
 // =============================================================================
@@ -325,9 +325,7 @@ abstract class DbTable<T extends DbRecord> {
 
   /// Returns the row with the given [id], or `null` if not found.
   Future<T?> findById(JustDatabase db, int id) async {
-    final r = await db.query(
-      'SELECT * FROM $tableName WHERE id = $id LIMIT 1',
-    );
+    final r = await db.query('SELECT * FROM $tableName WHERE id = $id LIMIT 1');
     _check(r, 'findById');
     return r.rows.isEmpty ? null : fromRow(r.rows.first);
   }
