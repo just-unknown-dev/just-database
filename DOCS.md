@@ -29,7 +29,7 @@ Complete documentation index for the just_database package.
    - Migrating from SQLite
    - Migrating from Hive
    - Migrating from SharedPreferences
-   - Version upgrade instructions (1.0.0 → 1.1.0, 1.1.0 → 1.2.0)
+   - Version upgrade instructions (1.0.0 → 1.1.0, 1.1.0 → 1.2.0, 1.2.0 → 1.3.0)
    - Data format conversion
    - Troubleshooting
 
@@ -74,7 +74,7 @@ Start here:
 ### For Migrating Users
 
 1. Check [MIGRATION.md](MIGRATION.md) for your current database
-2. If upgrading, see the [version upgrade notes](MIGRATION.md#version-upgrades) (1.0.0 → 1.1.0 or 1.1.0 → 1.2.0)
+2. If upgrading, see the [version upgrade notes](MIGRATION.md#version-upgrades) (1.0.0 → 1.1.0, 1.1.0 → 1.2.0, or 1.2.0 → 1.3.0)
 3. Review [API.md](API.md) for feature equivalents
 4. Test with the [examples](example/)
 
@@ -255,6 +255,7 @@ See: [README#performance-tips](README.md#performance-tips) and [MIGRATION#perfor
 
 - **Indexing:** README, API.md (Indexing section), examples
 - **Persistence:** README (With File Persistence), API.md (DatabaseManager)
+- **Web persistence:** README (Platform Support), MIGRATION.md (1.2.0 → 1.3.0)
 - **UI:** README (Built-in Admin UI), API.md (UI Components), flutter_admin_example.dart
 - **Migration:** MIGRATION.md (entire document)
 - **Constraints:** README (Table Constraints), API.md (Schema & Tables)
@@ -271,6 +272,7 @@ See: [README#performance-tips](README.md#performance-tips) and [MIGRATION#perfor
 ### By Use Case
 
 - **Mobile app with persistence:** README (With File Persistence) + flutter_admin_example.dart
+- **Web app with persistence:** README (Platform Support) — OPFS/IndexedDB auto-selected
 - **In-memory analytics:** README (Quick Start) + example.dart
 - **Data migration:** MIGRATION.md
 - **Admin dashboard:** README (Built-in Admin UI)
@@ -308,7 +310,7 @@ Found an error or want to improve the docs?
 just_database/
 ├── README.md              # Main documentation
 ├── API.md                 # API reference
-├── MIGRATION.md           # Migration guide (incl. 1.0.0 → 1.1.0, 1.1.0 → 1.2.0)
+├── MIGRATION.md           # Migration guide (incl. 1.0.0 → 1.1.0, 1.1.0 → 1.2.0, 1.2.0 → 1.3.0)
 ├── CHANGELOG.md           # Version history
 ├── CONTRIBUTING.md        # Contributor guide
 ├── CODE_OF_CONDUCT.md     # Code of conduct
@@ -334,6 +336,6 @@ just_database/
 
 ---
 
-**Last updated:** 2026-03-14
+**Last updated:** 2026-03-19
 
-**Package version:** 1.2.0
+**Package version:** 1.3.0
