@@ -29,7 +29,7 @@ Complete documentation index for the just_database package.
    - Migrating from SQLite
    - Migrating from Hive
    - Migrating from SharedPreferences
-   - Version upgrade instructions
+   - Version upgrade instructions (1.0.0 → 1.1.0, 1.1.0 → 1.2.0)
    - Data format conversion
    - Troubleshooting
 
@@ -74,7 +74,7 @@ Start here:
 ### For Migrating Users
 
 1. Check [MIGRATION.md](MIGRATION.md) for your current database
-2. If upgrading from 1.0.0, see the [version upgrade notes](MIGRATION.md#version-upgrades)
+2. If upgrading, see the [version upgrade notes](MIGRATION.md#version-upgrades) (1.0.0 → 1.1.0 or 1.1.0 → 1.2.0)
 3. Review [API.md](API.md) for feature equivalents
 4. Test with the [examples](example/)
 
@@ -308,7 +308,7 @@ Found an error or want to improve the docs?
 just_database/
 ├── README.md              # Main documentation
 ├── API.md                 # API reference
-├── MIGRATION.md           # Migration guide (incl. 1.0.0 → 1.1.0)
+├── MIGRATION.md           # Migration guide (incl. 1.0.0 → 1.1.0, 1.1.0 → 1.2.0)
 ├── CHANGELOG.md           # Version history
 ├── CONTRIBUTING.md        # Contributor guide
 ├── CODE_OF_CONDUCT.md     # Code of conduct
@@ -334,6 +334,6 @@ just_database/
 
 ---
 
-**Last updated:** 2026-02-23
+**Last updated:** 2026-03-14
 
-**Package version:** 1.1.0
+**Package version:** 1.2.0
