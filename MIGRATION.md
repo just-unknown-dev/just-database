@@ -237,6 +237,42 @@ final userName = user['name'];
 
 ## Version Upgrades
 
+### 1.1.0 → 1.2.0
+
+This is a **non-breaking** release. No code changes are required for existing
+native (Android / iOS / Desktop) apps.
+
+#### New: full Web and WASM support
+
+The package now works on Flutter Web (both JS and WASM compilation targets).
+The `platforms:` key is declared in `pubspec.yaml`, and conditional imports
+use `dart.library.js_interop` so the correct stub is selected on both web
+targets.
+
+**Behavior on web / WASM:**
+
+| Feature | Behavior |
+|---|---|
+| SQL queries, ORM, transactions | ✅ fully supported |
+| File persistence (`persist: true`) | Silent no-op — data lives in memory only |
+| `BackupManager.exportSql` / `exportJson` | ✅ fully supported |
+| `BackupManager.backupToFile` / `restoreFromFile` | Throws `UnsupportedError` |
+| `SecureKeyManager` | ✅ uses browser `localStorage` via `just_storage` |
+
+```dart
+// On web: use in-memory backup helpers instead of file helpers
+final sql = BackupManager.exportSql(tables);
+// Send `sql` to your server for persistence
+```
+
+#### Changed dependency
+
+`just_storage` bumped from path dependency to `^1.1.2` (published release).
+
+If your app pins `just_storage` directly, update its constraint to `^1.1.2`.
+
+---
+
 ### 1.0.0 → 1.1.0
 
 This is a **non-breaking** release. No code changes are required for apps that
