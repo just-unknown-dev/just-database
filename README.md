@@ -24,6 +24,7 @@ persistence, a rich SQL dialect, an ORM layer, and an embeddable admin UI.
 | Benchmarking | DatabaseBenchmark, BenchmarkSuite, QueryStats (p95/p99) |
 | ORM | DbTable<T> / DbRecord / DbColumn — type-safe CRUD with zero boilerplate |
 | **Secure mode** | **AES-256-GCM encryption at rest, SHA-256 key derivation, per-save random IV** |
+| **Web persistence** | **OPFS + Web Worker (sync I/O, WAL) with IndexedDB fallback** |
 | Admin UI | 4-tab Flutter admin screen embeddable in any app |
 
 ---
@@ -41,8 +42,8 @@ persistence, a rich SQL dialect, an ORM layer, and an embeddable admin UI.
 | Feature | **just\_database** | sqflite | drift | hive | isar |
 |---|---|---|---|---|---|
 | Pure Dart (no native code) | ✅ | ❌ native SQLite | ❌ native SQLite | ✅ | ❌ native (Rust) |
-| Web (JS) | ✅ | ❌ | ⚠️ via sql.js | ✅ | ⚠️ partial |
-| Web (WASM) | ✅ | ❌ | ❌ | ✅ | ❌ |
+| Web (JS) | ✅ | ✅ OPFS/IDB | ⚠️ via sql.js | ✅ | ⚠️ partial |
+| Web (WASM) | ✅ | ✅ OPFS/IDB | ❌ | ✅ | ❌ |
 | Full SQL dialect | ✅ | ✅ SQLite | ✅ SQLite | ❌ | ❌ |
 | Views & triggers | ✅ | ✅ | ✅ | ❌ | ❌ |
 | Transactions & savepoints | ✅ | ✅ | ✅ | ❌ | ✅ |
@@ -73,22 +74,36 @@ flutter pub get
 
 ## Platform Support
 
-| Platform | SQL queries | File persistence | Backup file helpers | `SecureKeyManager` |
+| Platform | SQL queries | Persistence | Backup file helpers | `SecureKeyManager` |
 |---|---|---|---|---|
-| Android | ✅ | ✅ | ✅ | ✅ |
-| iOS | ✅ | ✅ | ✅ | ✅ |
-| macOS | ✅ | ✅ | ✅ | ✅ |
-| Windows | ✅ | ✅ | ✅ | ✅ |
-| Linux | ✅ | ✅ | ✅ | ✅ |
-| Web (JS) | ✅ | ❌ no-op | ❌ throws | ✅ `localStorage` |
-| Web (WASM) | ✅ | ❌ no-op | ❌ throws | ✅ `localStorage` |
+| Android | ✅ | ✅ JSON file | ✅ | ✅ |
+| iOS | ✅ | ✅ JSON file | ✅ | ✅ |
+| macOS | ✅ | ✅ JSON file | ✅ | ✅ |
+| Windows | ✅ | ✅ JSON file | ✅ | ✅ |
+| Linux | ✅ | ✅ JSON file | ✅ | ✅ |
+| Web (JS) | ✅ | ✅ OPFS / IndexedDB | ❌ throws | ✅ `localStorage` |
+| Web (WASM) | ✅ | ✅ OPFS / IndexedDB | ❌ throws | ✅ `localStorage` |
 
-> **Web / WASM note:** Opening a database with `persist: true` on web silently
-> keeps all data in-memory only for the page lifetime — no error is thrown, but
-> `.jdb` files are never written. `BackupManager.backupToFile` and the other
-> file helpers throw `UnsupportedError` on web/WASM; use
-> `BackupManager.exportSql` / `BackupManager.exportJson` to serialise data as a
-> string or map instead.
+> **Web persistence (new in 1.3.0):** When `persist: true` on web, the database
+> engine automatically selects the best available storage backend:
+>
+> 1. **OPFS + Web Worker** — if the browser supports the Origin Private File
+>    System with synchronous access handles, the full SQL engine runs in a
+>    dedicated Web Worker with synchronous byte-level I/O and a Write-Ahead Log
+>    (WAL). This is the fastest path.
+> 2. **IndexedDB** — if OPFS is unavailable (e.g. older browsers, private
+>    browsing), the SQL engine runs on the main thread and persists database
+>    snapshots as JSON blobs in IndexedDB.
+> 3. **In-memory** — if neither storage API is available, data lives in memory
+>    only for the page lifetime.
+>
+> The public API is unchanged — `JustDatabase.open('name')` handles backend
+> selection transparently. Use `db.storageBackend` to inspect which backend was
+> chosen at runtime.
+>
+> `BackupManager.backupToFile` and the other file helpers still throw
+> `UnsupportedError` on web/WASM; use `BackupManager.exportSql` /
+> `BackupManager.exportJson` to serialise data as a string or map instead.
 
 ---
 
