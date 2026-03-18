@@ -5,13 +5,14 @@ persistence, a rich SQL dialect, an ORM layer, and an embeddable admin UI.
 
 [![pub.dev](https://img.shields.io/pub/v/just_database.svg)](https://pub.dev/packages/just_database)
 [![License: BSD 3-Clause License](https://img.shields.io/badge/License-BSD-blue.svg)](LICENSE)
+[![Contributing](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](CONTRIBUTING.md)
 ---
 
 ## Features
 
 | Capability | Details |
 |---|---|
-| Pure Dart | No native code — runs on Android, iOS, Web, Desktop |
+| Pure Dart | No native code — runs on Android, iOS, Web (JS & WASM), Desktop |
 | SQL dialect | SELECT/INSERT/UPDATE/DELETE/CREATE/DROP/ALTER, JOINs, subqueries, GROUP BY/HAVING |
 | Views | CREATE VIEW, DROP VIEW, INSTEAD OF triggers |
 | Triggers | BEFORE/AFTER INSERT/UPDATE/DELETE, NEW/OLD, WHEN clause |
@@ -27,16 +28,67 @@ persistence, a rich SQL dialect, an ORM layer, and an embeddable admin UI.
 
 ---
 
+### When to choose what
+
+- **just_database** — you need pure Dart (web/WASM/tests with no native toolchain), full SQL with views and triggers, built-in encryption, spatial queries, or an embeddable admin UI.
+- **sqflite / drift** — you target Android/iOS/desktop only, already rely on SQLite, and want the most battle-tested native SQLite bindings. Drift adds a type-safe query builder and migrations on top.
+- **hive** — you only need a fast key-value store, not relational queries. Very low learning curve and startup time.
+- **isar** — you want maximum read/write throughput on a document-oriented model with a high-level query DSL, and native code is acceptable.
+
+
+## Comparison with Other Packages
+
+| Feature | **just\_database** | sqflite | drift | hive | isar |
+|---|---|---|---|---|---|
+| Pure Dart (no native code) | ✅ | ❌ native SQLite | ❌ native SQLite | ✅ | ❌ native (Rust) |
+| Web (JS) | ✅ | ❌ | ⚠️ via sql.js | ✅ | ⚠️ partial |
+| Web (WASM) | ✅ | ❌ | ❌ | ✅ | ❌ |
+| Full SQL dialect | ✅ | ✅ SQLite | ✅ SQLite | ❌ | ❌ |
+| Views & triggers | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Transactions & savepoints | ✅ | ✅ | ✅ | ❌ | ✅ |
+| ORM / type-safe queries | ✅ no codegen | ❌ | ✅ codegen | ⚠️ TypeAdapters | ✅ codegen |
+| Schema migrations | ✅ | ✅ | ✅ | ❌ | ✅ |
+| AES encryption (built-in) | ✅ | ❌ | ❌ | ❌ | ✅ (paid tier) |
+| Spatial / R-tree | ✅ | ❌ | ❌ | ❌ | ❌ |
+| In-memory mode | ✅ | ❌ | ⚠️ in-memory SQLite | ✅ | ❌ |
+| Built-in admin UI | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Built-in benchmarking | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Backup / restore API | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Codegen required | ❌ | ❌ | ✅ | ❌ | ✅ |
+
+---
+
 ## Installation
 
 ```yaml
 dependencies:
-  just_database: ^1.0.0
+  just_database: ^1.2.0
 ```
 
 ```bash
 flutter pub get
 ```
+
+---
+
+## Platform Support
+
+| Platform | SQL queries | File persistence | Backup file helpers | `SecureKeyManager` |
+|---|---|---|---|---|
+| Android | ✅ | ✅ | ✅ | ✅ |
+| iOS | ✅ | ✅ | ✅ | ✅ |
+| macOS | ✅ | ✅ | ✅ | ✅ |
+| Windows | ✅ | ✅ | ✅ | ✅ |
+| Linux | ✅ | ✅ | ✅ | ✅ |
+| Web (JS) | ✅ | ❌ no-op | ❌ throws | ✅ `localStorage` |
+| Web (WASM) | ✅ | ❌ no-op | ❌ throws | ✅ `localStorage` |
+
+> **Web / WASM note:** Opening a database with `persist: true` on web silently
+> keeps all data in-memory only for the page lifetime — no error is thrown, but
+> `.jdb` files are never written. `BackupManager.backupToFile` and the other
+> file helpers throw `UnsupportedError` on web/WASM; use
+> `BackupManager.exportSql` / `BackupManager.exportJson` to serialise data as a
+> string or map instead.
 
 ---
 
@@ -412,19 +464,23 @@ await db.query('SELECT /*+ NO_INDEX */ * FROM products WHERE price < 50');
 ## Backup & Restore
 
 ```dart
-// SQL dump
-final sql = await db.exportSql();
-await db.importSql(sql); // restore into any database
+// SQL dump — works on all platforms
+final sql = BackupManager.exportSql(tables);
+await BackupManager.importSql(sql, tables);
 
-// JSON snapshot
-final json = await db.exportJson();
-await db.importJson(json);
+// JSON snapshot — works on all platforms
+final json = BackupManager.exportJson(tables);
+BackupManager.importJson(json, tables);
 
-// File helpers
-final manager = BackupManager(db);
-await manager.backupToFile('/path/to/backup.sql');
-await manager.restoreFromFile('/path/to/backup.sql');
+// File helpers — native platforms only (throws UnsupportedError on web/WASM)
+await BackupManager.backupToFile(tables, '/path/to/backup.sql');
+await BackupManager.restoreFromFile('/path/to/backup.sql', tables);
+await BackupManager.backupToJsonFile(tables, '/path/to/backup.json');
+await BackupManager.restoreFromJsonFile('/path/to/backup.json', tables);
 ```
+
+> **Web / WASM:** Use `exportSql` / `exportJson` and transmit the result to a
+> server for storage. The file helpers are not available on web.
 
 ---
 
