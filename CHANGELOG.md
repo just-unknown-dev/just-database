@@ -1,5 +1,40 @@
 ﻿# Changelog
 
+## [1.3.0] - 2026-03-19
+
+### Added — Web Persistence (OPFS + IndexedDB)
+
+- **OPFS Web Worker persistence** — databases opened with `persist: true` on web
+  now survive page reloads. A dedicated Web Worker runs the SQL engine against
+  the Origin Private File System using synchronous `FileSystemSyncAccessHandle`,
+  keeping the main thread free.
+- **Write-Ahead Log (WAL)** — all mutations are journalled to a separate OPFS
+  file before being applied, providing crash-safe durability. Auto-checkpoint
+  triggers at 1 MB or 1 000 entries.
+- **IndexedDB fallback** — when OPFS or Web Workers are unavailable (older
+  browsers, cross-origin iframes), the engine automatically falls back to
+  IndexedDB snapshot persistence on the main thread.
+- **In-memory last resort** — if neither OPFS nor IndexedDB is available, the
+  database runs in memory only (same as 1.2.0 behaviour).
+- `WebStorageBackend` enum — `opfsWorker`, `indexedDb`, `memory`. Indicates
+  which backend was selected at runtime.
+- `storageBackend` getter on `JustDatabase` (web only) — returns the active
+  `WebStorageBackend`.
+- `DatabaseSerializer` utility (`lib/src/serialization.dart`) — extracted
+  encode / decode helpers shared by native file persistence and the web layer.
+- 8 new files under `lib/src/web/`: `opfs_support.dart`, `opfs_storage.dart`,
+  `wal_manager.dart`, `opfs_persistence.dart`, `idb_persistence.dart`,
+  `worker_protocol.dart`, `database_worker.dart`, `worker_client.dart`.
+- `database_native.dart` / `database_web.dart` — `database.dart` is now a
+  conditional export gateway (`dart.library.js_interop`), matching the existing
+  pattern used by persistence and backup.
+
+### Changed
+
+- `web` package promoted from transitive to direct dependency (`^1.1.0`).
+- `persistence_web.dart` now delegates to `OpfsPersistence` or
+  `IdbPersistence` instead of being a no-op stub.
+
 ## [1.2.0] - 2026-03-14
 
 ### Added — Web & WASM Support
