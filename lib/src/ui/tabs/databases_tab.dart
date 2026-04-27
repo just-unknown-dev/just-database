@@ -33,6 +33,8 @@ class DatabasesTab extends StatelessWidget {
                       info: info,
                       isSelected: provider.currentDatabase?.name == info.name,
                       onOpen: () => provider.selectDatabase(info.name),
+                      onOpenDetail: () =>
+                          _openDetailPage(context, provider, info),
                       onDelete: () =>
                           _confirmDelete(context, provider, info.name),
                       onSeed: seedCallback != null
@@ -196,6 +198,22 @@ class DatabasesTab extends StatelessWidget {
     );
   }
 
+  Future<void> _openDetailPage(
+    BuildContext context,
+    DatabaseProvider provider,
+    DatabaseInfo info,
+  ) async {
+    await provider.selectDatabase(info.name);
+    if (!context.mounted) return;
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute<void>(
+        builder: (_) =>
+            DatabaseDetailPage(provider: provider, info: info),
+      ),
+    );
+  }
+
   Future<void> _openBenchmarkPage(
     BuildContext context,
     DatabaseProvider provider,
@@ -261,6 +279,7 @@ class _DatabaseCard extends StatelessWidget {
   final DatabaseInfo info;
   final bool isSelected;
   final VoidCallback onOpen;
+  final VoidCallback onOpenDetail;
   final VoidCallback onDelete;
   final VoidCallback? onSeed;
   final VoidCallback onInsert;
@@ -270,6 +289,7 @@ class _DatabaseCard extends StatelessWidget {
     required this.info,
     required this.isSelected,
     required this.onOpen,
+    required this.onOpenDetail,
     required this.onDelete,
     this.onSeed,
     required this.onInsert,
@@ -336,7 +356,7 @@ class _DatabaseCard extends StatelessWidget {
           onSelected: (action) {
             switch (action) {
               case 'open':
-                onOpen();
+                onOpenDetail();
               case 'insert':
                 onInsert();
               case 'benchmark':

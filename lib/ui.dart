@@ -8,6 +8,7 @@
 library;
 
 export 'src/ui/database_provider.dart';
+export 'src/ui/pages/database_detail_page.dart';
 export 'src/ui/tabs/databases_tab.dart';
 export 'src/ui/tabs/schema_tab.dart';
 export 'src/ui/tabs/query_editor_tab.dart';
