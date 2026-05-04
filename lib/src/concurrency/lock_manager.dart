@@ -214,6 +214,11 @@ class _ReadWriteLock {
 // WRITE FAST — buffered writes with periodic batch flush
 // Writes are collected in a buffer and committed on a 100ms timer.
 // Reads flush the buffer for the target table before executing.
+//
+// DURABILITY NOTE: writes are volatile until the next flush cycle (≤100 ms).
+// A process crash during that window loses the buffered writes.
+// Use DatabaseMode.standard if you need each write to be durable on return.
+// Always call dispose() during app shutdown to flush any pending buffer.
 // =============================================================================
 
 class WriteFastLockManager implements LockManager {

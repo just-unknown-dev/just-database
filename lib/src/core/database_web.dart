@@ -136,6 +136,20 @@ class JustDatabase {
 
   bool _isOpen = false;
 
+  /// Optional callback invoked when a database opened with `persist: true`
+  /// cannot find a durable storage backend and falls back to in-memory mode.
+  ///
+  /// Data written to an in-memory database will not survive a page reload.
+  /// Set this once at app startup to surface the warning in your logging
+  /// infrastructure:
+  ///
+  /// ```dart
+  /// import 'dart:developer' as dev;
+  /// JustDatabase.onStorageDowngrade = (name, reason) =>
+  ///     dev.log('[just_database] $name: $reason', level: 900);
+  /// ```
+  static void Function(String dbName, String reason)? onStorageDowngrade;
+
   JustDatabase._({
     required this.name,
     required this.mode,
@@ -197,7 +211,13 @@ class JustDatabase {
       }
     }
 
-    // In-memory fallback (no persistence, or persist=false)
+    // In-memory fallback: persist was requested but no durable backend exists.
+    if (persist) {
+      onStorageDowngrade?.call(
+        name,
+        'Neither OPFS nor IndexedDB is available — data will not survive a page reload.',
+      );
+    }
     await db._openInMemory();
     return db;
   }
@@ -386,6 +406,50 @@ class JustDatabase {
   bool get isOpen => _isOpen;
 
   // ---------------------------------------------------------------------------
+  // Async introspection — works in ALL backends including OPFS worker mode.
+  // Prefer these over the sync getters when the storage backend is unknown.
+  // ---------------------------------------------------------------------------
+
+  Future<List<String>> tableNamesAsync() {
+    if (_worker != null) return _worker!.tableNames;
+    return Future.value(List.unmodifiable(_tables.keys));
+  }
+
+  Future<List<String>> viewNamesAsync() {
+    if (_worker != null) return _worker!.viewNames;
+    return Future.value(_executor!.viewNames);
+  }
+
+  Future<List<String>> triggerNamesAsync() {
+    if (_worker != null) return _worker!.triggerNames;
+    return Future.value(_executor!.triggerNames);
+  }
+
+  Future<List<String>> indexNamesForTableAsync(String tableName) {
+    if (_worker != null) return _worker!.indexNamesForTable(tableName);
+    final key = _findTableKey(tableName);
+    return Future.value(key != null ? (_tables[key]?.indexNames ?? []) : []);
+  }
+
+  Future<TableSchema?> getTableSchemaAsync(String name) async {
+    if (_worker != null) {
+      final json = await _worker!.getTableSchema(name);
+      return json != null ? TableSchema.fromJson(json) : null;
+    }
+    return getTableSchema(name);
+  }
+
+  Future<int> totalRowsAsync() {
+    if (_worker != null) return _worker!.totalRows;
+    return Future.value(totalRows);
+  }
+
+  Future<int> estimatedSizeBytesAsync() {
+    if (_worker != null) return _worker!.estimatedSizeBytes;
+    return Future.value(estimatedSizeBytes);
+  }
+
+  // ---------------------------------------------------------------------------
   // Benchmarking
   // ---------------------------------------------------------------------------
 
@@ -447,6 +511,9 @@ class JustDatabase {
         if (persist &&
             result.success &&
             storageBackend == WebStorageBackend.indexedDb) {
+          // Best-effort persistence: query returns before IndexedDB write
+          // completes. A page crash in this window loses at most one write.
+          // OPFS-worker mode is unaffected — WAL durability is handled there.
           unawaited(_saveToIdb());
         }
         return result;

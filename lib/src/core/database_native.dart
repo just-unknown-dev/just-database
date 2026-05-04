@@ -332,6 +332,10 @@ class JustDatabase {
       try {
         final result = await _executor.execute(stmt);
         if (persist && result.success) {
+          // Best-effort, fire-and-forget persistence: the query returns before
+          // the write reaches disk. A crash in this window loses at most one
+          // committed write. For strict durability use DatabaseMode.standard
+          // and await db.flush() after critical operations (not yet exposed).
           unawaited(_saveToDisk());
         }
         return result;
