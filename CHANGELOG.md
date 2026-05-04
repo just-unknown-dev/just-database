@@ -1,5 +1,58 @@
 ﻿# Changelog
 
+## [1.4.0] - 2026-05-04
+
+### Added
+
+- **`DatabaseDetailPage`** — new admin UI page for inspecting a single
+  database: table list, row counts, schema viewer, and live query runner.
+  Exported from `lib/ui.dart` and linked from `DatabasesTab` via tap-through
+  navigation. (`66afd4eb`)
+- **Async web introspection** — `tableNamesAsync()`, `viewNamesAsync()`,
+  `triggerNamesAsync()`, `indexNamesForTableAsync()`, `getTableSchemaAsync()`,
+  `totalRowsAsync()`, and `estimatedSizeBytesAsync()` added to the web
+  `JustDatabase`. These delegate to the OPFS worker via the existing
+  `WorkerClient` introspect protocol; the old sync getters still work for
+  IndexedDB and in-memory backends.
+- **`JustDatabase.onStorageDowngrade`** — static callback invoked when
+  `persist: true` is requested on web but neither OPFS nor IndexedDB is
+  available. Lets callers surface the warning in their own logging stack
+  instead of silently running in-memory.
+
+### Changed
+
+- **State management** — admin UI widgets migrated from `provider` to
+  `just_signals` (`^1.0.1`). `provider` is no longer a dependency.
+  (`28a9d1db`)
+- **PBKDF2 iterations raised to 310 000** (was 100 000) to meet NIST SP
+  800-132 (2023) recommendation for PBKDF2-HMAC-SHA256.
+  **⚠ Breaking for encrypted databases**: any `.jdb` file encrypted with a
+  password under v1.3.x will be unreadable after this upgrade because the
+  derived key changes. Migrate by exporting with `BackupManager.exportSql()`
+  before upgrading, then re-importing after. Auto-key databases (`resolveAutoKey`)
+  are unaffected — the raw key is stored directly and not re-derived.
+- **PBKDF2 runs in a background isolate** — `SecureKeyManager.resolveKey()`
+  now executes the CPU-heavy derivation via `Isolate.run()`, so the Flutter
+  UI thread is never blocked even on low-end devices.
+
+### Fixed
+
+- **Version constant** — `kJustDatabaseVersion` in `version.dart` now matches
+  `pubspec.yaml` (`1.4.0`).
+- **Hex encoding performance** — BLOB SQL literals (`_sqlLiteral` in
+  `db_table.dart`) and encryption key serialisation (`secure_key_manager.dart`)
+  now use a `StringBuffer` + lookup-table approach instead of
+  `map(...).join()`, eliminating N intermediate `String` allocations per byte.
+
+### Documentation
+
+- Clarified **best-effort durability** semantics: persistence after each write
+  is fire-and-forget (`unawaited`). A process crash between query return and
+  disk flush loses at most one committed write. See code comments in
+  `database_native.dart` and `database_web.dart`.
+- `WriteFastLockManager` now documents its 100 ms volatile write window and
+  recommends `DatabaseMode.standard` when per-write durability is required.
+
 ## [1.3.0] - 2026-03-19
 
 ### Added — Web Persistence (OPFS + IndexedDB)
