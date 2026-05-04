@@ -1,5 +1,18 @@
 ﻿# Changelog
 
+## [1.4.1] - 2026-05-05
+
+### Fixed
+
+- **Web / WASM platform compatibility** — `SecureKeyManager.resolveKey()` now
+  uses Flutter's `compute()` instead of `Isolate.run()` to offload the
+  PBKDF2-HMAC-SHA256 derivation. `dart:isolate` is unavailable on web and WASM,
+  causing the entire `ui.dart` import chain to be flagged as incompatible on
+  pub.dev. `compute` provides identical off-thread behaviour on native (isolate)
+  and web/WASM (web worker).
+- **pub.dev description length** — package description expanded to meet the
+  pub.dev requirement of 50–180 characters (was 34).
+
 ## [1.4.0] - 2026-05-04
 
 ### Added

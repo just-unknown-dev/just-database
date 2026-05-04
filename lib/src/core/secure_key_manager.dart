@@ -1,8 +1,8 @@
-import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:just_storage/just_storage.dart';
 
 /// Manages the lifecycle of a database encryption key derived from a user
@@ -81,10 +81,11 @@ class SecureKeyManager {
     }
 
     final salt = _hexToBytes(saltHex);
-    // Run the CPU-heavy derivation in a background isolate so the UI thread
-    // is never blocked, even on low-end devices.
-    final keyBytes = await Isolate.run(
-      () => _pbkdf2HmacSha256(password, salt, _iterations, _keyLength),
+    // Run the CPU-heavy derivation off the UI thread via compute, which uses
+    // isolates on native and web workers on web/WASM.
+    final keyBytes = await compute(
+      _runPbkdf2,
+      (password: password, salt: salt, iterations: _iterations, keyLength: _keyLength),
     );
     return _bytesToHex(keyBytes);
   }
@@ -144,6 +145,11 @@ class SecureKeyManager {
   // ---------------------------------------------------------------------------
   // PBKDF2-HMAC-SHA256 implementation using the `crypto` package.
   // ---------------------------------------------------------------------------
+
+  static Uint8List _runPbkdf2(
+    ({String password, Uint8List salt, int iterations, int keyLength}) args,
+  ) =>
+      _pbkdf2HmacSha256(args.password, args.salt, args.iterations, args.keyLength);
 
   /// Derives a [dkLen]-byte key from [password] and [salt] using
   /// PBKDF2-HMAC-SHA256 with [c] iterations.
