@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:just_signals/just_signals.dart';
 import 'package:just_database/just_database.dart';
 
@@ -191,6 +192,8 @@ class _TableDataCardState extends State<_TableDataCard> {
               tableName: widget.tableName,
               columns: _columns!,
               rows: _rows!,
+              db: widget.db,
+              onMutated: _loadData,
             ),
         ],
       ),
@@ -198,29 +201,176 @@ class _TableDataCardState extends State<_TableDataCard> {
   }
 }
 
-class _TableDataView extends StatelessWidget {
+// ---------------------------------------------------------------------------
+// Row data view with edit / delete support
+// ---------------------------------------------------------------------------
+
+class _TableDataView extends StatefulWidget {
   final String tableName;
   final List<String> columns;
   final List<Map<String, dynamic>> rows;
+  final JustDatabase db;
+  final VoidCallback onMutated;
 
   const _TableDataView({
     required this.tableName,
     required this.columns,
     required this.rows,
+    required this.db,
+    required this.onMutated,
   });
+
+  @override
+  State<_TableDataView> createState() => _TableDataViewState();
+}
+
+class _TableDataViewState extends State<_TableDataView> {
+  final Set<int> _selected = {};
+
+  // Build a WHERE clause for the given row. Uses the PK if one exists,
+  // otherwise falls back to matching every column value.
+  String _whereFor(Map<String, dynamic> row) {
+    final schema = widget.db.getTableSchema(widget.tableName);
+    if (schema != null) {
+      for (final col in schema.columns) {
+        if (col.constraints.primaryKey && row.containsKey(col.name)) {
+          return '${col.name} = ${_sqlLiteral(row[col.name])}';
+        }
+      }
+    }
+    return widget.columns.map((col) {
+      final v = row[col];
+      return v == null ? '$col IS NULL' : '$col = ${_sqlLiteral(v)}';
+    }).join(' AND ');
+  }
+
+  String _sqlLiteral(dynamic v) {
+    if (v == null) return 'NULL';
+    if (v is int || v is double) return v.toString();
+    if (v is bool) return v ? '1' : '0';
+    return "'${v.toString().replaceAll("'", "''")}'";
+  }
+
+  Future<void> _deleteRow(Map<String, dynamic> row) async {
+    final result = await widget.db.execute(
+      'DELETE FROM ${widget.tableName} WHERE ${_whereFor(row)}',
+    );
+    if (!mounted) return;
+    if (result.success) {
+      widget.onMutated();
+    } else {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(result.errorMessage ?? 'Delete failed'),
+          backgroundColor: Theme.of(context).colorScheme.error,
+        ),
+      );
+    }
+  }
+
+  Future<void> _deleteSelected() async {
+    final toDelete = _selected.map((i) => widget.rows[i]).toList();
+    String? firstError;
+    for (final row in toDelete) {
+      final result = await widget.db.execute(
+        'DELETE FROM ${widget.tableName} WHERE ${_whereFor(row)}',
+      );
+      firstError ??= result.success ? null : (result.errorMessage ?? 'Delete failed');
+    }
+    if (!mounted) return;
+    setState(() => _selected.clear());
+    if (firstError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(firstError),
+          backgroundColor: Theme.of(context).colorScheme.error,
+        ),
+      );
+    }
+    widget.onMutated();
+  }
+
+  Future<void> _confirmDeleteRow(Map<String, dynamic> row) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete row?'),
+        content: const Text('This will permanently remove the row.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+              foregroundColor: Theme.of(ctx).colorScheme.onError,
+            ),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) await _deleteRow(row);
+  }
+
+  Future<void> _confirmDeleteSelected() async {
+    final count = _selected.length;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete $count row${count != 1 ? 's' : ''}?'),
+        content: Text(
+          'Permanently remove $count selected row${count != 1 ? 's' : ''}.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            style: FilledButton.styleFrom(
+              backgroundColor: Theme.of(ctx).colorScheme.error,
+              foregroundColor: Theme.of(ctx).colorScheme.onError,
+            ),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) await _deleteSelected();
+  }
+
+  Future<void> _openEditDialog(Map<String, dynamic> row) async {
+    final schema = widget.db.getTableSchema(widget.tableName);
+    if (schema == null) return;
+    final updated = await showDialog<bool>(
+      context: context,
+      builder: (_) => _EditRowDialog(
+        db: widget.db,
+        tableName: widget.tableName,
+        schema: schema,
+        row: row,
+        whereClause: _whereFor(row),
+      ),
+    );
+    if (updated == true) widget.onMutated();
+  }
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
 
-    if (columns.isEmpty) {
+    if (widget.columns.isEmpty) {
       return Padding(
         padding: const EdgeInsets.all(16),
         child: Text('No columns defined', style: TextStyle(color: cs.outline)),
       );
     }
 
-    if (rows.isEmpty) {
+    if (widget.rows.isEmpty) {
       return Padding(
         padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
         child: Row(
@@ -228,7 +378,7 @@ class _TableDataView extends StatelessWidget {
             Icon(Icons.inbox_outlined, size: 16, color: cs.outline),
             const SizedBox(width: 8),
             Text(
-              'No rows in $tableName',
+              'No rows in ${widget.tableName}',
               style: TextStyle(color: cs.outline, fontSize: 13),
             ),
           ],
@@ -240,41 +390,89 @@ class _TableDataView extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Divider(height: 1, color: cs.outlineVariant),
+        if (_selected.isNotEmpty)
+          _SelectionBar(
+            count: _selected.length,
+            onDelete: _confirmDeleteSelected,
+            onClear: () => setState(() => _selected.clear()),
+          ),
         SingleChildScrollView(
           scrollDirection: Axis.horizontal,
           child: DataTable(
             headingRowColor: WidgetStatePropertyAll(cs.surfaceContainerLow),
             columnSpacing: 20,
             horizontalMargin: 16,
-            columns: columns
-                .map(
-                  (col) => DataColumn(
-                    label: Text(
-                      col,
-                      style: const TextStyle(fontWeight: FontWeight.bold),
+            columns: [
+              const DataColumn(label: SizedBox(width: 72, child: Text(''))),
+              ...widget.columns.map(
+                (col) => DataColumn(
+                  label: Text(
+                    col,
+                    style: const TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ),
+            ],
+            rows: List.generate(widget.rows.length, (i) {
+              final row = widget.rows[i];
+              return DataRow(
+                selected: _selected.contains(i),
+                onSelectChanged: (v) => setState(() {
+                  if (v == true) {
+                    _selected.add(i);
+                  } else {
+                    _selected.remove(i);
+                  }
+                }),
+                cells: [
+                  DataCell(
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        SizedBox(
+                          width: 32,
+                          height: 32,
+                          child: IconButton(
+                            padding: EdgeInsets.zero,
+                            iconSize: 16,
+                            icon: Icon(Icons.edit_outlined, color: cs.primary),
+                            tooltip: 'Edit row',
+                            onPressed: () => _openEditDialog(row),
+                          ),
+                        ),
+                        SizedBox(
+                          width: 32,
+                          height: 32,
+                          child: IconButton(
+                            padding: EdgeInsets.zero,
+                            iconSize: 16,
+                            icon: Icon(Icons.delete_outline, color: cs.error),
+                            tooltip: 'Delete row',
+                            onPressed: () => _confirmDeleteRow(row),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                )
-                .toList(),
-            rows: rows
-                .map(
-                  (row) => DataRow(
-                    cells: columns
-                        .map(
-                          (col) => DataCell(
-                            Text(
-                              _formatValue(row[col]),
-                              style: const TextStyle(fontSize: 13),
-                            ),
-                          ),
-                        )
-                        .toList(),
+                  ...widget.columns.map(
+                    (col) => DataCell(
+                      Text(
+                        _formatValue(row[col]),
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: row[col] == null ? cs.outline : null,
+                          fontStyle:
+                              row[col] == null ? FontStyle.italic : null,
+                        ),
+                      ),
+                    ),
                   ),
-                )
-                .toList(),
+                ],
+              );
+            }),
           ),
         ),
-        if (rows.length >= 500)
+        if (widget.rows.length >= 500)
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
             child: Text(
@@ -293,6 +491,457 @@ class _TableDataView extends StatelessWidget {
     final str = value.toString();
     if (str.length > 80) return '${str.substring(0, 77)}…';
     return str;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Selection action bar
+// ---------------------------------------------------------------------------
+
+class _SelectionBar extends StatelessWidget {
+  final int count;
+  final VoidCallback onDelete;
+  final VoidCallback onClear;
+
+  const _SelectionBar({
+    required this.count,
+    required this.onDelete,
+    required this.onClear,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      color: cs.primaryContainer.withValues(alpha: 0.4),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Row(
+        children: [
+          Text(
+            '$count selected',
+            style: TextStyle(fontWeight: FontWeight.w600, color: cs.primary),
+          ),
+          const Spacer(),
+          TextButton(onPressed: onClear, child: const Text('Clear')),
+          const SizedBox(width: 8),
+          FilledButton.icon(
+            onPressed: onDelete,
+            icon: const Icon(Icons.delete_outline, size: 16),
+            label: const Text('Delete selected'),
+            style: FilledButton.styleFrom(
+              backgroundColor: cs.error,
+              foregroundColor: cs.onError,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Edit row dialog
+// ---------------------------------------------------------------------------
+
+class _EditRowDialog extends StatefulWidget {
+  final JustDatabase db;
+  final String tableName;
+  final TableSchema schema;
+  final Map<String, dynamic> row;
+  final String whereClause;
+
+  const _EditRowDialog({
+    required this.db,
+    required this.tableName,
+    required this.schema,
+    required this.row,
+    required this.whereClause,
+  });
+
+  @override
+  State<_EditRowDialog> createState() => _EditRowDialogState();
+}
+
+class _EditRowDialogState extends State<_EditRowDialog> {
+  final _formKey = GlobalKey<FormState>();
+  final Map<String, TextEditingController> _textControllers = {};
+  final Map<String, bool> _boolValues = {};
+  bool _submitting = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    for (final col in widget.schema.columns) {
+      final val = widget.row[col.name];
+      if (col.type == DataType.boolean) {
+        _boolValues[col.name] = val == true || val == 1;
+      } else {
+        _textControllers[col.name] = TextEditingController(
+          text: val?.toString() ?? '',
+        );
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    for (final c in _textControllers.values) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (!(_formKey.currentState?.validate() ?? false)) return;
+    setState(() {
+      _submitting = true;
+      _error = null;
+    });
+
+    final setParts = <String>[];
+    for (final col in widget.schema.columns) {
+      // Never modify auto-increment primary keys
+      if (col.constraints.primaryKey && col.constraints.autoIncrement) continue;
+
+      if (col.type == DataType.boolean) {
+        final v = _boolValues[col.name] ?? false;
+        setParts.add('${col.name} = ${v ? 1 : 0}');
+      } else {
+        final ctrl = _textControllers[col.name];
+        final raw = ctrl?.text.trim() ?? '';
+        if (raw.isEmpty) {
+          if (col.constraints.notNull && !col.constraints.hasDefault) {
+            setState(() {
+              _error = '${col.name} is required';
+              _submitting = false;
+            });
+            return;
+          }
+          setParts.add('${col.name} = NULL');
+        } else if (col.type == DataType.integer || col.type == DataType.real) {
+          setParts.add('${col.name} = $raw');
+        } else {
+          setParts.add("${col.name} = '${raw.replaceAll("'", "''")}'");
+        }
+      }
+    }
+
+    if (setParts.isEmpty) {
+      setState(() {
+        _error = 'No editable columns.';
+        _submitting = false;
+      });
+      return;
+    }
+
+    final sql =
+        'UPDATE ${widget.tableName} SET ${setParts.join(', ')} '
+        'WHERE ${widget.whereClause}';
+    final result = await widget.db.execute(sql);
+    if (!mounted) return;
+
+    if (result.success) {
+      Navigator.of(context).pop(true);
+    } else {
+      setState(() {
+        _error = result.errorMessage ?? 'Update failed';
+        _submitting = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('Edit row — ${widget.tableName}'),
+      content: SizedBox(
+        width: 420,
+        child: SingleChildScrollView(
+          child: Form(
+            key: _formKey,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (_error != null) _InlineError(error: _error!),
+                ...widget.schema.columns.map(
+                  (col) => _EditField(
+                    col: col,
+                    controller: _textControllers[col.name],
+                    boolValue: _boolValues[col.name],
+                    onBoolChanged: (v) =>
+                        setState(() => _boolValues[col.name] = v),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed:
+              _submitting ? null : () => Navigator.of(context).pop(false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton.icon(
+          onPressed: _submitting ? null : _submit,
+          icon: _submitting
+              ? const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Icon(Icons.save_outlined, size: 16),
+          label: const Text('Save'),
+        ),
+      ],
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Edit field — one column in the edit dialog
+// ---------------------------------------------------------------------------
+
+class _EditField extends StatelessWidget {
+  final ColumnDefinition col;
+  final TextEditingController? controller;
+  final bool? boolValue;
+  final ValueChanged<bool> onBoolChanged;
+
+  const _EditField({
+    required this.col,
+    required this.controller,
+    required this.boolValue,
+    required this.onBoolChanged,
+  });
+
+  bool get _isAutoInc =>
+      col.constraints.primaryKey && col.constraints.autoIncrement;
+
+  String get _typeLabel => switch (col.type) {
+    DataType.integer => 'INTEGER',
+    DataType.real => 'REAL',
+    DataType.text => 'TEXT',
+    DataType.boolean => 'BOOLEAN',
+    DataType.datetime => 'DATETIME',
+    DataType.blob => 'BLOB',
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final isRequired =
+        col.constraints.notNull &&
+        !col.constraints.hasDefault &&
+        !_isAutoInc;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              if (col.constraints.primaryKey) ...[
+                Icon(Icons.key, size: 12, color: cs.primary),
+                const SizedBox(width: 4),
+              ],
+              Text(
+                col.name,
+                style: const TextStyle(
+                  fontWeight: FontWeight.w600,
+                  fontSize: 13,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+                decoration: BoxDecoration(
+                  color: cs.secondaryContainer,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Text(
+                  _typeLabel,
+                  style: TextStyle(
+                    fontSize: 10,
+                    color: cs.onSecondaryContainer,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              if (_isAutoInc) ...[
+                const SizedBox(width: 4),
+                Text('auto', style: TextStyle(fontSize: 10, color: cs.outline)),
+              ],
+              if (isRequired) ...[
+                const SizedBox(width: 4),
+                Text(
+                  'required',
+                  style: TextStyle(fontSize: 10, color: cs.error),
+                ),
+              ],
+            ],
+          ),
+          const SizedBox(height: 6),
+          if (col.type == DataType.boolean)
+            AbsorbPointer(
+              absorbing: _isAutoInc,
+              child: Opacity(
+                opacity: _isAutoInc ? 0.5 : 1.0,
+                child: _BoolToggle(
+                  value: boolValue ?? false,
+                  onChanged: onBoolChanged,
+                ),
+              ),
+            )
+          else
+            _EditTextField(
+              col: col,
+              controller: controller!,
+              readOnly: _isAutoInc,
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _BoolToggle extends StatelessWidget {
+  final bool value;
+  final ValueChanged<bool> onChanged;
+  const _BoolToggle({required this.value, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Switch(value: value, onChanged: onChanged),
+        const SizedBox(width: 8),
+        Text(
+          value ? 'true' : 'false',
+          style: TextStyle(
+            color: value
+                ? Theme.of(context).colorScheme.primary
+                : Theme.of(context).colorScheme.outline,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _EditTextField extends StatelessWidget {
+  final ColumnDefinition col;
+  final TextEditingController controller;
+  final bool readOnly;
+
+  const _EditTextField({
+    required this.col,
+    required this.controller,
+    required this.readOnly,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final isRequired =
+        col.constraints.notNull && !col.constraints.hasDefault && !readOnly;
+
+    TextInputType keyboardType = TextInputType.text;
+    List<TextInputFormatter> formatters = [];
+    String? hint;
+
+    switch (col.type) {
+      case DataType.integer:
+        keyboardType = TextInputType.number;
+        formatters = [FilteringTextInputFormatter.allow(RegExp(r'^-?\d*'))];
+      case DataType.real:
+        keyboardType = const TextInputType.numberWithOptions(decimal: true);
+        formatters = [
+          FilteringTextInputFormatter.allow(RegExp(r'^-?\d*\.?\d*')),
+        ];
+      case DataType.datetime:
+        hint = 'e.g. 2026-02-20T10:00:00';
+      case DataType.blob:
+        hint = 'hex bytes';
+      default:
+        break;
+    }
+
+    return TextFormField(
+      controller: controller,
+      readOnly: readOnly,
+      keyboardType: keyboardType,
+      inputFormatters: formatters,
+      decoration: InputDecoration(
+        hintText: hint,
+        border: const OutlineInputBorder(),
+        contentPadding:
+            const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        filled: readOnly,
+        fillColor: readOnly ? cs.surfaceContainerHighest : null,
+        suffixIcon: col.type == DataType.datetime && !readOnly
+            ? IconButton(
+                icon: const Icon(Icons.calendar_today, size: 18),
+                tooltip: 'Pick date',
+                onPressed: () async {
+                  final now = DateTime.now();
+                  final picked = await showDatePicker(
+                    context: context,
+                    initialDate: now,
+                    firstDate: DateTime(2000),
+                    lastDate: DateTime(2100),
+                  );
+                  if (picked != null) {
+                    controller.text =
+                        picked.toIso8601String().split('T').first;
+                  }
+                },
+              )
+            : null,
+      ),
+      validator: isRequired
+          ? (v) =>
+                (v == null || v.trim().isEmpty) ? '${col.name} is required' : null
+          : null,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Small shared widgets
+// ---------------------------------------------------------------------------
+
+class _InlineError extends StatelessWidget {
+  final String error;
+  const _InlineError({required this.error});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+      decoration: BoxDecoration(
+        color: cs.errorContainer,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.error_outline, size: 16, color: cs.onErrorContainer),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              error,
+              style: TextStyle(fontSize: 12, color: cs.onErrorContainer),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }
 
