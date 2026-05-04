@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
 import 'package:just_database/just_database.dart';
 import 'package:just_database/ui.dart';
 
@@ -13,38 +12,35 @@ class MyApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ChangeNotifierProvider(
-      create: (_) => DatabaseProvider(),
-      child: MaterialApp(
-        title: 'just_database Admin',
-        debugShowCheckedModeBanner: false,
-        theme: ThemeData(
-          colorScheme: ColorScheme.fromSeed(
-            seedColor: Colors.blue,
-            brightness: Brightness.light,
-          ),
-          useMaterial3: true,
+    return MaterialApp(
+      title: 'just_database Admin',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.blue,
+          brightness: Brightness.light,
         ),
-        darkTheme: ThemeData(
-          colorScheme: ColorScheme.fromSeed(
-            seedColor: Colors.blue,
-            brightness: Brightness.dark,
-          ),
-          useMaterial3: true,
-        ),
-        themeMode: ThemeMode.system,
-        home: const JUDatabaseAdminScreen(
-          // Optional: Override theme for just the database screen
-          // theme: ThemeData(
-          //   colorScheme: ColorScheme.fromSeed(
-          //     seedColor: Colors.purple,
-          //   ),
-          //   useMaterial3: true,
-          // ),
-        ),
-        // Note: Custom seed data can be provided via DatabasesTab widget
-        // when building a custom UI
+        useMaterial3: true,
       ),
+      darkTheme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.blue,
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
+      ),
+      themeMode: ThemeMode.system,
+      home: const JUDatabaseAdminScreen(
+        // Optional: Override theme for just the database screen
+        // theme: ThemeData(
+        //   colorScheme: ColorScheme.fromSeed(
+        //     seedColor: Colors.purple,
+        //   ),
+        //   useMaterial3: true,
+        // ),
+      ),
+      // Note: Custom seed data can be provided via DatabasesTab widget
+      // when building a custom UI
     );
   }
 }
@@ -55,15 +51,12 @@ class SimpleAdminApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ChangeNotifierProvider(
-      create: (_) => DatabaseProvider(),
-      child: MaterialApp(
-        title: 'just_database Admin',
-        theme: ThemeData.from(
-          colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
-        ),
-        home: const JUDatabaseAdminScreen(),
+    return MaterialApp(
+      title: 'just_database Admin',
+      theme: ThemeData.from(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
       ),
+      home: const JUDatabaseAdminScreen(),
     );
   }
 }
@@ -74,12 +67,9 @@ class MinimalExample extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ChangeNotifierProvider(
-      create: (_) => DatabaseProvider(),
-      child: MaterialApp(
-        title: 'just_database',
-        home: const JUDatabaseAdminScreen(),
-      ),
+    return MaterialApp(
+      title: 'just_database',
+      home: const JUDatabaseAdminScreen(),
     );
   }
 }

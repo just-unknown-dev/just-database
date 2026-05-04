@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:just_signals/just_signals.dart';
 import 'package:just_database/just_database.dart';
 
 const List<String> _exampleQueries = [
@@ -16,7 +16,9 @@ const List<String> _exampleQueries = [
 ];
 
 class QueryEditorTab extends StatefulWidget {
-  const QueryEditorTab({super.key});
+  final DatabaseProvider provider;
+
+  const QueryEditorTab({super.key, required this.provider});
 
   @override
   State<QueryEditorTab> createState() => _QueryEditorTabState();
@@ -35,62 +37,66 @@ class _QueryEditorTabState extends State<QueryEditorTab> {
 
   @override
   Widget build(BuildContext context) {
-    final provider = context.watch<DatabaseProvider>();
-    return Column(
-      children: [
-        // SQL input area
-        _SqlInputArea(controller: _sqlController),
+    return SignalBuilder<int>(
+      signal: widget.provider.revision,
+      builder: (context, value, child) => Column(
+        children: [
+          // SQL input area
+          _SqlInputArea(controller: _sqlController),
 
-        // Action bar
-        _ActionBar(
-          onRun: () {
-            setState(() {
-              _showHistory = false;
+          // Action bar
+          _ActionBar(
+            onRun: () {
+              setState(() {
+                _showHistory = false;
+                _showExamples = false;
+              });
+              widget.provider.runQuery(_sqlController.text);
+            },
+            onClear: () => _sqlController.clear(),
+            onToggleHistory: () => setState(() {
+              _showHistory = !_showHistory;
               _showExamples = false;
-            });
-            provider.runQuery(_sqlController.text);
-          },
-          onClear: () => _sqlController.clear(),
-          onToggleHistory: () => setState(() {
-            _showHistory = !_showHistory;
-            _showExamples = false;
-          }),
-          onToggleExamples: () => setState(() {
-            _showExamples = !_showExamples;
-            _showHistory = false;
-          }),
-          isLoading: provider.isLoading,
-          showHistory: _showHistory,
-          showExamples: _showExamples,
-        ),
+            }),
+            onToggleExamples: () => setState(() {
+              _showExamples = !_showExamples;
+              _showHistory = false;
+            }),
+            isLoading: widget.provider.isLoading,
+            showHistory: _showHistory,
+            showExamples: _showExamples,
+          ),
 
-        // Error banner
-        if (provider.lastError != null)
-          _ErrorBanner(message: provider.lastError!),
+          // Error banner
+          if (widget.provider.lastError != null)
+            _ErrorBanner(message: widget.provider.lastError!),
 
-        // Results / History / Examples
-        Expanded(
-          child: _showHistory
-              ? _HistoryPanel(
-                  history: provider.queryHistory,
-                  onSelect: (sql) {
-                    _sqlController.text = sql;
-                    setState(() => _showHistory = false);
-                  },
-                )
-              : _showExamples
-              ? _ExamplesPanel(
-                  onSelect: (sql) {
-                    _sqlController.text = sql;
-                    setState(() => _showExamples = false);
-                  },
-                )
-              : SizedBox(
-                  width: double.infinity,
-                  child: _ResultsPanel(result: provider.lastQueryResult),
-                ),
-        ),
-      ],
+          // Results / History / Examples
+          Expanded(
+            child: _showHistory
+                ? _HistoryPanel(
+                    history: widget.provider.queryHistory,
+                    onSelect: (sql) {
+                      _sqlController.text = sql;
+                      setState(() => _showHistory = false);
+                    },
+                  )
+                : _showExamples
+                ? _ExamplesPanel(
+                    onSelect: (sql) {
+                      _sqlController.text = sql;
+                      setState(() => _showExamples = false);
+                    },
+                  )
+                : SizedBox(
+                    width: double.infinity,
+                    child: _ResultsPanel(
+                      result: widget.provider.lastQueryResult,
+                    ),
+                  ),
+          ),
+        ],
+      ),
     );
   }
 }
