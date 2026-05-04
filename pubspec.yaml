@@ -1,6 +1,6 @@
 name: just_database
 description: "A lightweight pure-Dart SQL database engine for Flutter with AES-256 encryption, migrations, spatial indexing, and a built-in admin UI for mobile and desktop apps."
-version: 1.4.1
+version: 1.4.2
 homepage: https://github.com/just-unknown-dev/just-database
 repository: https://github.com/just-unknown-dev/just-database
 issue_tracker: https://github.com/just-unknown-dev/just-database/issues

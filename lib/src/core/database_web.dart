@@ -7,7 +7,8 @@ import '../sql/executor.dart';
 import '../sql/parser.dart';
 import '../concurrency/lock_manager.dart';
 import '../benchmark/benchmark.dart';
-import '../web/worker_client.dart';
+import '../web/worker_client_stub.dart'
+    if (dart.library.html) '../web/worker_client.dart';
 import '../web/idb_persistence.dart' as idb;
 import '../web/opfs_support.dart';
 import 'database_mode.dart';

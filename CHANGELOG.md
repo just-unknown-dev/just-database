@@ -1,5 +1,22 @@
 ﻿# Changelog
 
+## [1.4.2] - 2026-05-05
+
+### Fixed
+
+- **WASM platform compatibility** — `database_web.dart` now uses a conditional
+  import to select between the real `worker_client.dart` (JS-web, where
+  `dart:isolate` compiles to web workers) and a new `worker_client_stub.dart`
+  (WASM, where `dart:isolate` is unavailable). The stub's `spawn()` returns an
+  error, which the existing fallback chain in `JustDatabase.open` catches and
+  uses to proceed to IndexedDB or in-memory storage. Previously the unconditional
+  import of `dart:isolate` through `database_web.dart` → `worker_client.dart` →
+  `database_worker.dart` caused pub.dev to flag the package as incompatible with
+  both web and WASM.
+- **Redundant import** — removed `import 'dart:typed_data'` from
+  `secure_key_manager.dart`; all used symbols are already re-exported by
+  `package:flutter/foundation.dart`.
+
 ## [1.4.1] - 2026-05-05
 
 ### Fixed
