@@ -1,249 +1,257 @@
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:just_signals/just_signals.dart';
 import 'package:just_database/just_database.dart';
 
 class SettingsTab extends StatelessWidget {
-  const SettingsTab({super.key});
+  final DatabaseProvider provider;
+
+  const SettingsTab({super.key, required this.provider});
 
   @override
   Widget build(BuildContext context) {
-    final provider = context.watch<DatabaseProvider>();
-    final db = provider.currentDatabase;
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        // --- Storage section ---
-        _SectionCard(
-          title: 'Storage',
+    return SignalBuilder<int>(
+      signal: provider.revision,
+      builder: (context, value, child) {
+        final db = provider.currentDatabase;
+        return ListView(
+          padding: const EdgeInsets.all(16),
           children: [
-            SwitchListTile(
-              title: const Text('File Persistence (default)'),
-              subtitle: const Text(
-                'Default for new databases. Can be overridden per database when creating.',
-              ),
-              value: provider.persistEnabled,
-              onChanged: provider.setPersistEnabled,
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-
-        // --- Default Mode section ---
-        _SectionCard(
-          title: 'Default Database Mode',
-          children: [
-            RadioGroup<DatabaseMode>(
-              groupValue: provider.defaultMode,
-              onChanged: (DatabaseMode? v) {
-                if (v != null) provider.setDefaultMode(v);
-              },
-              child: Column(
-                children: DatabaseMode.values
-                    .map(
-                      (mode) => RadioListTile<DatabaseMode>(
-                        title: Text(_modeName(mode)),
-                        subtitle: Text(_modeDescription(mode)),
-                        secondary: Icon(
-                          _modeIcon(mode),
-                          color: _modeColor(mode),
-                        ),
-                        value: mode,
-                      ),
-                    )
-                    .toList(),
-              ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-
-        // --- Current database info ---
-        if (db != null) ...[
-          _SectionCard(
-            title: 'Current Database',
-            children: [
-              // Identity row
-              ListTile(
-                leading: const Icon(Icons.storage),
-                title: Text(db.name),
-                subtitle: Text(
-                  '${_modeName(db.mode)} mode · '
-                  '${db.persist ? "persisted" : "in-memory"}',
+            // --- Storage section ---
+            _SectionCard(
+              title: 'Storage',
+              children: [
+                SwitchListTile(
+                  title: const Text('File Persistence (default)'),
+                  subtitle: const Text(
+                    'Default for new databases. Can be overridden per database when creating.',
+                  ),
+                  value: provider.persistEnabled,
+                  onChanged: provider.setPersistEnabled,
                 ),
-                trailing: _ModeBadge(mode: db.mode),
-              ),
-              const Divider(height: 1, indent: 16, endIndent: 16),
-              // Stats grid
-              Padding(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 16,
-                  vertical: 12,
+              ],
+            ),
+            const SizedBox(height: 12),
+
+            // --- Default Mode section ---
+            _SectionCard(
+              title: 'Default Database Mode',
+              children: [
+                RadioGroup<DatabaseMode>(
+                  groupValue: provider.defaultMode,
+                  onChanged: (DatabaseMode? v) {
+                    if (v != null) provider.setDefaultMode(v);
+                  },
+                  child: Column(
+                    children: DatabaseMode.values
+                        .map(
+                          (mode) => RadioListTile<DatabaseMode>(
+                            title: Text(_modeName(mode)),
+                            subtitle: Text(_modeDescription(mode)),
+                            secondary: Icon(
+                              _modeIcon(mode),
+                              color: _modeColor(mode),
+                            ),
+                            value: mode,
+                          ),
+                        )
+                        .toList(),
+                  ),
                 ),
-                child: _DbStatsGrid(db: db),
+              ],
+            ),
+            const SizedBox(height: 12),
+
+            // --- Current database info ---
+            if (db != null) ...[
+              _SectionCard(
+                title: 'Current Database',
+                children: [
+                  // Identity row
+                  ListTile(
+                    leading: const Icon(Icons.storage),
+                    title: Text(db.name),
+                    subtitle: Text(
+                      '${_modeName(db.mode)} mode · '
+                      '${db.persist ? "persisted" : "in-memory"}',
+                    ),
+                    trailing: _ModeBadge(mode: db.mode),
+                  ),
+                  const Divider(height: 1, indent: 16, endIndent: 16),
+                  // Stats grid
+                  Padding(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 12,
+                    ),
+                    child: _DbStatsGrid(db: db),
+                  ),
+                ],
               ),
+              const SizedBox(height: 12),
             ],
-          ),
-          const SizedBox(height: 12),
-        ],
 
-        // --- Danger Zone section ---
-        _SectionCard(
-          title: 'Danger Zone',
-          titleColor: Theme.of(context).colorScheme.error,
-          children: [
-            ListTile(
-              leading: Icon(
-                Icons.delete_forever,
-                color: Theme.of(context).colorScheme.error,
-              ),
-              title: Text(
-                'Clear All Databases',
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
-              ),
-              subtitle: const Text(
-                'Permanently removes ALL databases from memory and disk',
-              ),
-              onTap: () => _confirmClearAll(context, provider),
+            // --- Danger Zone section ---
+            _SectionCard(
+              title: 'Danger Zone',
+              titleColor: Theme.of(context).colorScheme.error,
+              children: [
+                ListTile(
+                  leading: Icon(
+                    Icons.delete_forever,
+                    color: Theme.of(context).colorScheme.error,
+                  ),
+                  title: Text(
+                    'Clear All Databases',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                  subtitle: const Text(
+                    'Permanently removes ALL databases from memory and disk',
+                  ),
+                  onTap: () => _confirmClearAll(context, provider),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+
+            // --- Engine features overview ---
+            _SectionCard(
+              title: 'Engine Features',
+              children: const [
+                _FeatureTile(
+                  icon: Icons.table_rows_outlined,
+                  label: 'Core SQL',
+                  detail:
+                      'SELECT · INSERT · UPDATE · DELETE\n'
+                      'CREATE / DROP / ALTER TABLE · CREATE / DROP VIEW\n'
+                      'INNER / LEFT / RIGHT JOIN · Subqueries\n'
+                      'GROUP BY · HAVING · ORDER BY · LIMIT / OFFSET',
+                ),
+                _FeatureTile(
+                  icon: Icons.functions,
+                  label: 'Functions',
+                  detail:
+                      'Aggregates: COUNT · SUM · AVG · MIN · MAX\n'
+                      'String: UPPER · LOWER · LENGTH · SUBSTR · TRIM\n'
+                      '         REPLACE · CONCAT\n'
+                      'Math: ABS · ROUND\n'
+                      'Null: COALESCE · IFNULL',
+                ),
+                _FeatureTile(
+                  icon: Icons.bolt,
+                  label: 'Triggers',
+                  detail:
+                      'BEFORE / AFTER INSERT, UPDATE, DELETE\n'
+                      'INSTEAD OF (on views)\n'
+                      'NEW / OLD row references · WHEN clause\n'
+                      'Multi-statement trigger bodies (BEGIN … END)',
+                ),
+                _FeatureTile(
+                  icon: Icons.pin_drop_outlined,
+                  label: 'Spatial (R-tree)',
+                  detail:
+                      'Point · BoundingBox · Polygon geometry types\n'
+                      'ST_MAKEPOINT · ST_X · ST_Y · ST_DISTANCE\n'
+                      'ST_WITHIN · ST_INTERSECTS · ST_CONTAINS · ST_BBOX\n'
+                      'CREATE SPATIAL INDEX · Quadratic-split R-tree',
+                ),
+                _FeatureTile(
+                  icon: Icons.manage_search,
+                  label: 'Indexes',
+                  detail:
+                      'AUTO-INDEX on frequently queried columns\n'
+                      'CREATE [UNIQUE] INDEX · CREATE SPATIAL INDEX\n'
+                      'Composite indexes · DROP INDEX',
+                ),
+                _FeatureTile(
+                  icon: Icons.tips_and_updates_outlined,
+                  label: 'Query Hints',
+                  detail:
+                      '/*+ INDEX(table idx) */  — force index use\n'
+                      '/*+ NO_INDEX */          — skip all indexes\n'
+                      '/*+ FULL_SCAN */         — table scan\n'
+                      '/*+ FORCE_INDEX(…) */    — alias for INDEX\n'
+                      'Inline and leading hint comment styles',
+                ),
+                _FeatureTile(
+                  icon: Icons.swap_horiz,
+                  label: 'Transactions',
+                  detail:
+                      'BEGIN / COMMIT / ROLLBACK (WAL)\n'
+                      'BEGIN DEFERRED / IMMEDIATE modes\n'
+                      'SAVEPOINT · RELEASE SAVEPOINT\n'
+                      'ROLLBACK TO SAVEPOINT\n'
+                      'transaction() helper with auto-rollback',
+                ),
+                _FeatureTile(
+                  icon: Icons.backup_outlined,
+                  label: 'Backup & Restore',
+                  detail:
+                      'exportSql() — full SQL dump (CREATE + INSERT)\n'
+                      'importSql() — restore from SQL dump\n'
+                      'exportJson() / importJson() — JSON snapshot\n'
+                      'backupToFile / restoreFromFile helpers',
+                ),
+                _FeatureTile(
+                  icon: Icons.lock_outline,
+                  label: 'Secure Mode',
+                  detail:
+                      'DatabaseMode.secure — AES-256-GCM encryption at rest\n'
+                      'Passphrase → SHA-256 → 32-byte AES key (never stored)\n'
+                      'Random 16-byte IV per save · GCM auth tag validates key\n'
+                      'Wrong key on load raises StateError',
+                ),
+                _FeatureTile(
+                  icon: Icons.upgrade,
+                  label: 'Schema Migrations',
+                  detail:
+                      'SqlMigration — up/down raw SQL scripts\n'
+                      'CallbackMigration — Dart function callbacks\n'
+                      'MigrationRunner — versioned apply / rollback\n'
+                      'SHA-256 checksum validation · status() report\n'
+                      'Persistent _migrations tracking table',
+                ),
+                _FeatureTile(
+                  icon: Icons.speed,
+                  label: 'Benchmarking',
+                  detail:
+                      'DatabaseBenchmark — 8-operation standard suite\n'
+                      'BenchmarkSuite — configurable custom suites\n'
+                      'QueryStats — avg · min · max · p95 · p99 · ops/s\n'
+                      'Warm-up iterations · seed-row control\n'
+                      'runStandardBenchmark() / benchmarkQuery() on JustDatabase',
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+
+            // --- About section ---
+            _SectionCard(
+              title: 'About',
+              children: const [
+                ListTile(
+                  leading: Icon(Icons.info_outline),
+                  title: Text('just_database'),
+                  subtitle: Text(
+                    'Pure Dart / Flutter SQL engine · v$kJustDatabaseVersion',
+                  ),
+                ),
+                ListTile(
+                  leading: Icon(Icons.code),
+                  title: Text('License'),
+                  subtitle: Text('BSD 3-Clause License'),
+                ),
+                ListTile(
+                  leading: Icon(Icons.hub_outlined),
+                  title: Text('Repository'),
+                  subtitle: Text('github.com/psbskb22/just-database'),
+                ),
+              ],
             ),
           ],
-        ),
-        const SizedBox(height: 12),
-
-        // --- Engine features overview ---
-        _SectionCard(
-          title: 'Engine Features',
-          children: const [
-            _FeatureTile(
-              icon: Icons.table_rows_outlined,
-              label: 'Core SQL',
-              detail:
-                  'SELECT · INSERT · UPDATE · DELETE\n'
-                  'CREATE / DROP / ALTER TABLE · CREATE / DROP VIEW\n'
-                  'INNER / LEFT / RIGHT JOIN · Subqueries\n'
-                  'GROUP BY · HAVING · ORDER BY · LIMIT / OFFSET',
-            ),
-            _FeatureTile(
-              icon: Icons.functions,
-              label: 'Functions',
-              detail:
-                  'Aggregates: COUNT · SUM · AVG · MIN · MAX\n'
-                  'String: UPPER · LOWER · LENGTH · SUBSTR · TRIM\n'
-                  '         REPLACE · CONCAT\n'
-                  'Math: ABS · ROUND\n'
-                  'Null: COALESCE · IFNULL',
-            ),
-            _FeatureTile(
-              icon: Icons.bolt,
-              label: 'Triggers',
-              detail:
-                  'BEFORE / AFTER INSERT, UPDATE, DELETE\n'
-                  'INSTEAD OF (on views)\n'
-                  'NEW / OLD row references · WHEN clause\n'
-                  'Multi-statement trigger bodies (BEGIN … END)',
-            ),
-            _FeatureTile(
-              icon: Icons.pin_drop_outlined,
-              label: 'Spatial (R-tree)',
-              detail:
-                  'Point · BoundingBox · Polygon geometry types\n'
-                  'ST_MAKEPOINT · ST_X · ST_Y · ST_DISTANCE\n'
-                  'ST_WITHIN · ST_INTERSECTS · ST_CONTAINS · ST_BBOX\n'
-                  'CREATE SPATIAL INDEX · Quadratic-split R-tree',
-            ),
-            _FeatureTile(
-              icon: Icons.manage_search,
-              label: 'Indexes',
-              detail:
-                  'AUTO-INDEX on frequently queried columns\n'
-                  'CREATE [UNIQUE] INDEX · CREATE SPATIAL INDEX\n'
-                  'Composite indexes · DROP INDEX',
-            ),
-            _FeatureTile(
-              icon: Icons.tips_and_updates_outlined,
-              label: 'Query Hints',
-              detail:
-                  '/*+ INDEX(table idx) */  — force index use\n'
-                  '/*+ NO_INDEX */          — skip all indexes\n'
-                  '/*+ FULL_SCAN */         — table scan\n'
-                  '/*+ FORCE_INDEX(…) */    — alias for INDEX\n'
-                  'Inline and leading hint comment styles',
-            ),
-            _FeatureTile(
-              icon: Icons.swap_horiz,
-              label: 'Transactions',
-              detail:
-                  'BEGIN / COMMIT / ROLLBACK (WAL)\n'
-                  'BEGIN DEFERRED / IMMEDIATE modes\n'
-                  'SAVEPOINT · RELEASE SAVEPOINT\n'
-                  'ROLLBACK TO SAVEPOINT\n'
-                  'transaction() helper with auto-rollback',
-            ),
-            _FeatureTile(
-              icon: Icons.backup_outlined,
-              label: 'Backup & Restore',
-              detail:
-                  'exportSql() — full SQL dump (CREATE + INSERT)\n'
-                  'importSql() — restore from SQL dump\n'
-                  'exportJson() / importJson() — JSON snapshot\n'
-                  'backupToFile / restoreFromFile helpers',
-            ),
-            _FeatureTile(
-              icon: Icons.lock_outline,
-              label: 'Secure Mode',
-              detail:
-                  'DatabaseMode.secure — AES-256-GCM encryption at rest\n'
-                  'Passphrase → SHA-256 → 32-byte AES key (never stored)\n'
-                  'Random 16-byte IV per save · GCM auth tag validates key\n'
-                  'Wrong key on load raises StateError',
-            ),
-            _FeatureTile(
-              icon: Icons.upgrade,
-              label: 'Schema Migrations',
-              detail:
-                  'SqlMigration — up/down raw SQL scripts\n'
-                  'CallbackMigration — Dart function callbacks\n'
-                  'MigrationRunner — versioned apply / rollback\n'
-                  'SHA-256 checksum validation · status() report\n'
-                  'Persistent _migrations tracking table',
-            ),
-            _FeatureTile(
-              icon: Icons.speed,
-              label: 'Benchmarking',
-              detail:
-                  'DatabaseBenchmark — 8-operation standard suite\n'
-                  'BenchmarkSuite — configurable custom suites\n'
-                  'QueryStats — avg · min · max · p95 · p99 · ops/s\n'
-                  'Warm-up iterations · seed-row control\n'
-                  'runStandardBenchmark() / benchmarkQuery() on JustDatabase',
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-
-        // --- About section ---
-        _SectionCard(
-          title: 'About',
-          children: const [
-            ListTile(
-              leading: Icon(Icons.info_outline),
-              title: Text('just_database'),
-              subtitle: Text(
-                'Pure Dart / Flutter SQL engine · v$kJustDatabaseVersion',
-              ),
-            ),
-            ListTile(
-              leading: Icon(Icons.code),
-              title: Text('License'),
-              subtitle: Text('BSD 3-Clause License'),
-            ),
-            ListTile(
-              leading: Icon(Icons.hub_outlined),
-              title: Text('Repository'),
-              subtitle: Text('github.com/psbskb22/just-database'),
-            ),
-          ],
-        ),
-      ],
+        );
+      },
     );
   }
 

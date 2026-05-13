@@ -1,6 +1,6 @@
 ﻿import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:provider/provider.dart';
+import 'package:just_signals/just_signals.dart';
 import 'package:just_database/just_database.dart';
 
 /// A full-screen page that lets the user pick any table from the current
@@ -16,10 +16,12 @@ import 'package:just_database/just_database.dart';
 /// );
 /// ```
 class InsertPage extends StatefulWidget {
+  final DatabaseProvider provider;
+
   /// Table to pre-select when the page opens. `null` shows the dropdown blank.
   final String? initialTable;
 
-  const InsertPage({super.key, this.initialTable});
+  const InsertPage({super.key, required this.provider, this.initialTable});
 
   @override
   State<InsertPage> createState() => _InsertPageState();
@@ -40,7 +42,7 @@ class _InsertPageState extends State<InsertPage> {
     super.initState();
     if (widget.initialTable != null) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        final db = context.read<DatabaseProvider>().currentDatabase;
+        final db = widget.provider.currentDatabase;
         if (db != null) _selectTable(widget.initialTable, db);
       });
     }
@@ -174,93 +176,103 @@ class _InsertPageState extends State<InsertPage> {
 
   @override
   Widget build(BuildContext context) {
-    final provider = context.watch<DatabaseProvider>();
-    final db = provider.currentDatabase;
+    return SignalBuilder<int>(
+      signal: widget.provider.revision,
+      builder: (context, value, child) {
+        final db = widget.provider.currentDatabase;
 
-    // Ensure the selected table still exists after DDL changes
-    if (db != null &&
-        _selectedTable != null &&
-        !db.tableNames.contains(_selectedTable)) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        setState(() => _selectedTable = null);
-      });
-    }
+        // Ensure the selected table still exists after DDL changes
+        if (db != null &&
+            _selectedTable != null &&
+            !db.tableNames.contains(_selectedTable)) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            setState(() => _selectedTable = null);
+          });
+        }
 
-    return Scaffold(
-      appBar: AppBar(
-        leading: IconButton(
-          onPressed: () {
-            Navigator.of(context).pop();
-          },
-          icon: Icon(Icons.arrow_back_ios_outlined, size: 18),
-        ),
-        title: Text(
-          _selectedTable != null ? 'Insert into $_selectedTable' : 'Insert Row',
-        ),
-      ),
-      body: db == null
-          ? const _NoDatabaseView()
-          : db.tableNames.isEmpty
-          ? const _NoTablesView()
-          : SingleChildScrollView(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  // -- Table selector ----------------------------------------
-                  _TableSelector(
-                    tables: db.tableNames,
-                    selected: _selectedTable,
-                    onChanged: (t) => _selectTable(t, db),
-                  ),
-
-                  if (_selectedTable != null) ...[
-                    const SizedBox(height: 16),
-
-                    // -- Dynamic form --------------------------------------
-                    _RowForm(
-                      formKey: _formKey,
-                      schema: db.getTableSchema(_selectedTable!),
-                      textControllers: _textControllers,
-                      boolValues: _boolValues,
-                      onBoolChanged: (col, val) =>
-                          setState(() => _boolValues[col] = val),
-                    ),
-
-                    const SizedBox(height: 16),
-
-                    // -- Feedback banners ----------------------------------
-                    if (_successMessage != null)
-                      _Banner(
-                        message: _successMessage!,
-                        color: Colors.green,
-                        icon: Icons.check_circle_outline,
-                      ),
-                    if (_errorMessage != null)
-                      _Banner(
-                        message: _errorMessage!,
-                        color: Colors.red,
-                        icon: Icons.error_outline,
-                      ),
-
-                    const SizedBox(height: 8),
-
-                    // -- Submit button -------------------------------------
-                    FilledButton.icon(
-                      onPressed: _submitting ? null : () => _submit(db),
-                      icon: _submitting
-                          ? const SizedBox(
-                              width: 16,
-                              height: 16,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.add_rounded),
-                      label: Text(_submitting ? 'Inserting�' : 'Insert Row'),
-                    ),
-                  ],
-                ],
-              ),
+        return Scaffold(
+          appBar: AppBar(
+            leading: IconButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              icon: Icon(Icons.arrow_back_ios_outlined, size: 18),
             ),
+            title: Text(
+              _selectedTable != null
+                  ? 'Insert into $_selectedTable'
+                  : 'Insert Row',
+            ),
+          ),
+          body: db == null
+              ? const _NoDatabaseView()
+              : db.tableNames.isEmpty
+              ? const _NoTablesView()
+              : SingleChildScrollView(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      // -- Table selector ----------------------------------------
+                      _TableSelector(
+                        tables: db.tableNames,
+                        selected: _selectedTable,
+                        onChanged: (t) => _selectTable(t, db),
+                      ),
+
+                      if (_selectedTable != null) ...[
+                        const SizedBox(height: 16),
+
+                        // -- Dynamic form --------------------------------------
+                        _RowForm(
+                          formKey: _formKey,
+                          schema: db.getTableSchema(_selectedTable!),
+                          textControllers: _textControllers,
+                          boolValues: _boolValues,
+                          onBoolChanged: (col, val) =>
+                              setState(() => _boolValues[col] = val),
+                        ),
+
+                        const SizedBox(height: 16),
+
+                        // -- Feedback banners ----------------------------------
+                        if (_successMessage != null)
+                          _Banner(
+                            message: _successMessage!,
+                            color: Colors.green,
+                            icon: Icons.check_circle_outline,
+                          ),
+                        if (_errorMessage != null)
+                          _Banner(
+                            message: _errorMessage!,
+                            color: Colors.red,
+                            icon: Icons.error_outline,
+                          ),
+
+                        const SizedBox(height: 8),
+
+                        // -- Submit button -------------------------------------
+                        FilledButton.icon(
+                          onPressed: _submitting ? null : () => _submit(db),
+                          icon: _submitting
+                              ? const SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                )
+                              : const Icon(Icons.add_rounded),
+                          label: Text(
+                            _submitting ? 'Inserting�' : 'Insert Row',
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+        );
+      },
     );
   }
 }

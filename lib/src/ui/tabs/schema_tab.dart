@@ -1,65 +1,74 @@
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:just_signals/just_signals.dart';
 import 'package:just_database/just_database.dart';
 
 class SchemaTab extends StatelessWidget {
-  const SchemaTab({super.key});
+  final DatabaseProvider provider;
+
+  const SchemaTab({super.key, required this.provider});
 
   @override
   Widget build(BuildContext context) {
-    final provider = context.watch<DatabaseProvider>();
-    final db = provider.currentDatabase;
+    return SignalBuilder<int>(
+      signal: provider.revision,
+      builder: (context, value, child) {
+        final db = provider.currentDatabase;
 
-    if (db == null) {
-      return const Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.schema, size: 56, color: Colors.grey),
-            SizedBox(height: 12),
-            Text(
-              'No database selected',
-              style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+        if (db == null) {
+          return const Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.schema, size: 56, color: Colors.grey),
+                SizedBox(height: 12),
+                Text(
+                  'No database selected',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+                SizedBox(height: 4),
+                Text(
+                  'Open a database from the Databases tab.',
+                  style: TextStyle(color: Colors.grey),
+                ),
+              ],
             ),
-            SizedBox(height: 4),
-            Text(
-              'Open a database from the Databases tab.',
-              style: TextStyle(color: Colors.grey),
-            ),
-          ],
-        ),
-      );
-    }
+          );
+        }
 
-    final tables = db.tableNames;
-    if (tables.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.table_chart, size: 56, color: Colors.grey),
-            const SizedBox(height: 12),
-            Text(
-              'No tables in "${db.name}"',
-              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+        final tables = db.tableNames;
+        if (tables.isEmpty) {
+          return Center(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.table_chart, size: 56, color: Colors.grey),
+                const SizedBox(height: 12),
+                Text(
+                  'No tables in "${db.name}"',
+                  style: const TextStyle(
+                    fontSize: 16,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'Use the Query tab to CREATE TABLE.',
+                  style: TextStyle(color: Colors.grey),
+                ),
+              ],
             ),
-            const SizedBox(height: 4),
-            const Text(
-              'Use the Query tab to CREATE TABLE.',
-              style: TextStyle(color: Colors.grey),
-            ),
-          ],
-        ),
-      );
-    }
+          );
+        }
 
-    return ListView.builder(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      itemCount: tables.length,
-      itemBuilder: (_, i) {
-        final schema = db.getTableSchema(tables[i]);
-        if (schema == null) return const SizedBox.shrink();
-        return _TableSchemaCard(schema: schema);
+        return ListView.builder(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          itemCount: tables.length,
+          itemBuilder: (_, i) {
+            final schema = db.getTableSchema(tables[i]);
+            if (schema == null) return const SizedBox.shrink();
+            return _TableSchemaCard(schema: schema);
+          },
+        );
       },
     );
   }

@@ -1,11 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:provider/provider.dart';
+import 'package:just_signals/just_signals.dart';
 import 'package:just_database/just_database.dart';
 
 class BenchmarkPage extends StatefulWidget {
   final DatabaseInfo info;
-  const BenchmarkPage({super.key, required this.info});
+  final DatabaseProvider provider;
+
+  const BenchmarkPage({super.key, required this.info, required this.provider});
 
   @override
   State<BenchmarkPage> createState() => _BenchmarkPageState();
@@ -78,66 +80,70 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
 
   @override
   Widget build(BuildContext context) {
-    final provider = context.watch<DatabaseProvider>();
-    final db = provider.currentDatabase;
+    return SignalBuilder<int>(
+      signal: widget.provider.revision,
+      builder: (context, value, child) {
+        final db = widget.provider.currentDatabase;
 
-    return Scaffold(
-      appBar: AppBar(
-        leading: IconButton(
-          onPressed: () {
-            Navigator.of(context).pop();
-          },
-          icon: Icon(Icons.arrow_back_ios_outlined, size: 18),
-        ),
-        title: Text('Benchmark — ${widget.info.name}'),
-      ),
-      body: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _ConfigCard(
-            rowCountController: _rowCountController,
-            warmupController: _warmupController,
-            iterationsController: _iterationsController,
-            queryController: _queryController,
-            queryLabelController: _queryLabelController,
-            useCustomQuery: _useCustomQuery,
-            onModeChanged: (v) => setState(() {
-              _useCustomQuery = v;
-              _suiteResult = null;
-              _customResult = null;
-              _error = null;
-            }),
+        return Scaffold(
+          appBar: AppBar(
+            leading: IconButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              icon: Icon(Icons.arrow_back_ios_outlined, size: 18),
+            ),
+            title: Text('Benchmark — ${widget.info.name}'),
           ),
-          _RunBar(
-            canRun: db != null && !_running,
-            running: _running,
-            noDatabaseSelected: db == null,
-            onRun: db != null ? () => _run(db) : null,
-            onClear: () => setState(() {
-              _suiteResult = null;
-              _customResult = null;
-              _error = null;
-            }),
+          body: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _ConfigCard(
+                rowCountController: _rowCountController,
+                warmupController: _warmupController,
+                iterationsController: _iterationsController,
+                queryController: _queryController,
+                queryLabelController: _queryLabelController,
+                useCustomQuery: _useCustomQuery,
+                onModeChanged: (v) => setState(() {
+                  _useCustomQuery = v;
+                  _suiteResult = null;
+                  _customResult = null;
+                  _error = null;
+                }),
+              ),
+              _RunBar(
+                canRun: db != null && !_running,
+                running: _running,
+                noDatabaseSelected: db == null,
+                onRun: db != null ? () => _run(db) : null,
+                onClear: () => setState(() {
+                  _suiteResult = null;
+                  _customResult = null;
+                  _error = null;
+                }),
+              ),
+              if (_error != null) _ErrorBanner(message: _error!),
+              Expanded(
+                child: _useCustomQuery
+                    ? (_customResult != null
+                          ? _CustomResultPanel(stats: _customResult!)
+                          : _EmptyState(
+                              running: _running,
+                              message: 'Configure a query above, then tap Run.',
+                            ))
+                    : (_suiteResult != null
+                          ? _SuiteResultPanel(result: _suiteResult!)
+                          : _EmptyState(
+                              running: _running,
+                              message:
+                                  'Select a database and tap Run to start the standard benchmark suite.',
+                            )),
+              ),
+            ],
           ),
-          if (_error != null) _ErrorBanner(message: _error!),
-          Expanded(
-            child: _useCustomQuery
-                ? (_customResult != null
-                      ? _CustomResultPanel(stats: _customResult!)
-                      : _EmptyState(
-                          running: _running,
-                          message: 'Configure a query above, then tap Run.',
-                        ))
-                : (_suiteResult != null
-                      ? _SuiteResultPanel(result: _suiteResult!)
-                      : _EmptyState(
-                          running: _running,
-                          message:
-                              'Select a database and tap Run to start the standard benchmark suite.',
-                        )),
-          ),
-        ],
-      ),
+        );
+      },
     );
   }
 }

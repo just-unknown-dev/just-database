@@ -1,5 +1,7 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:flutter/services.dart';
+import 'package:just_signals/just_signals.dart';
 import 'package:just_database/just_database.dart';
 
 const List<String> _exampleQueries = [
@@ -16,7 +18,9 @@ const List<String> _exampleQueries = [
 ];
 
 class QueryEditorTab extends StatefulWidget {
-  const QueryEditorTab({super.key});
+  final DatabaseProvider provider;
+
+  const QueryEditorTab({super.key, required this.provider});
 
   @override
   State<QueryEditorTab> createState() => _QueryEditorTabState();
@@ -33,71 +37,105 @@ class _QueryEditorTabState extends State<QueryEditorTab> {
     super.dispose();
   }
 
+  void _runQuery() {
+    if (widget.provider.isLoading) return;
+    setState(() {
+      _showHistory = false;
+      _showExamples = false;
+    });
+    widget.provider.runQuery(_sqlController.text);
+  }
+
   @override
   Widget build(BuildContext context) {
-    final provider = context.watch<DatabaseProvider>();
-    return Column(
+    return SignalBuilder<int>(
+      signal: widget.provider.revision,
+      builder: (context, value, child) => Column(
       children: [
-        // SQL input area
-        _SqlInputArea(controller: _sqlController),
+          // SQL input area
+          _SqlInputArea(controller: _sqlController, onRun: _runQuery),
 
-        // Action bar
-        _ActionBar(
-          onRun: () {
-            setState(() {
-              _showHistory = false;
+          // Action bar
+          _ActionBar(
+            onRun: _runQuery,
+            onClear: () => _sqlController.clear(),
+            onToggleHistory: () => setState(() {
+              _showHistory = !_showHistory;
               _showExamples = false;
-            });
-            provider.runQuery(_sqlController.text);
-          },
-          onClear: () => _sqlController.clear(),
-          onToggleHistory: () => setState(() {
-            _showHistory = !_showHistory;
-            _showExamples = false;
-          }),
-          onToggleExamples: () => setState(() {
-            _showExamples = !_showExamples;
-            _showHistory = false;
-          }),
-          isLoading: provider.isLoading,
-          showHistory: _showHistory,
-          showExamples: _showExamples,
-        ),
+            }),
+            onToggleExamples: () => setState(() {
+              _showExamples = !_showExamples;
+              _showHistory = false;
+            }),
+            isLoading: widget.provider.isLoading,
+            showHistory: _showHistory,
+            showExamples: _showExamples,
+          ),
 
-        // Error banner
-        if (provider.lastError != null)
-          _ErrorBanner(message: provider.lastError!),
+          // Error banner
+          if (widget.provider.lastError != null)
+            _ErrorBanner(message: widget.provider.lastError!),
 
-        // Results / History / Examples
-        Expanded(
-          child: _showHistory
-              ? _HistoryPanel(
-                  history: provider.queryHistory,
-                  onSelect: (sql) {
-                    _sqlController.text = sql;
-                    setState(() => _showHistory = false);
-                  },
-                )
-              : _showExamples
-              ? _ExamplesPanel(
-                  onSelect: (sql) {
-                    _sqlController.text = sql;
-                    setState(() => _showExamples = false);
-                  },
-                )
-              : SizedBox(
-                  width: double.infinity,
-                  child: _ResultsPanel(result: provider.lastQueryResult),
-                ),
-        ),
-      ],
+          // Results / History / Examples
+          Expanded(
+            child: _showHistory
+                ? _HistoryPanel(
+                    history: widget.provider.queryHistory,
+                    onSelect: (sql) {
+                      _sqlController.text = sql;
+                      setState(() => _showHistory = false);
+                    },
+                  )
+                : _showExamples
+                ? _ExamplesPanel(
+                    onSelect: (sql) {
+                      _sqlController.text = sql;
+                      setState(() => _showExamples = false);
+                    },
+                  )
+                : SizedBox(
+                    width: double.infinity,
+                    child: _ResultsPanel(
+                      result: widget.provider.lastQueryResult,
+                    ),
+                  ),
+          ),
+        ],
+      ),
     );
   }
 }
 
-class _SqlInputArea extends StatelessWidget {
+class _SqlInputArea extends StatefulWidget {
   final TextEditingController controller;
-  const _SqlInputArea({required this.controller});
+  final VoidCallback onRun;
+  const _SqlInputArea({required this.controller, required this.onRun});
+
+  @override
+  State<_SqlInputArea> createState() => _SqlInputAreaState();
+}
+
+class _SqlInputAreaState extends State<_SqlInputArea> {
+  late final FocusNode _focusNode = FocusNode(
+    onKeyEvent: (_, event) {
+      if (event is! KeyDownEvent) return KeyEventResult.ignored;
+      final isAndroid = defaultTargetPlatform == TargetPlatform.android;
+      final modifierHeld = isAndroid
+          ? HardwareKeyboard.instance.isShiftPressed
+          : HardwareKeyboard.instance.isControlPressed;
+      if (modifierHeld && event.logicalKey == LogicalKeyboardKey.enter) {
+        widget.onRun();
+        return KeyEventResult.handled;
+      }
+      return KeyEventResult.ignored;
+    },
+  );
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -107,7 +145,8 @@ class _SqlInputArea extends StatelessWidget {
       color: isDark ? const Color(0xFF1E1E1E) : const Color(0xFF2D2D2D),
       padding: const EdgeInsets.all(12),
       child: TextField(
-        controller: controller,
+        controller: widget.controller,
+        focusNode: _focusNode,
         maxLines: null,
         expands: true,
         style: const TextStyle(
@@ -154,19 +193,24 @@ class _ActionBar extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       child: Row(
         children: [
-          FilledButton.icon(
-            onPressed: isLoading ? null : onRun,
-            icon: isLoading
-                ? const SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(
-                      strokeWidth: 2,
-                      color: Colors.white,
-                    ),
-                  )
-                : const Icon(Icons.play_arrow, size: 18),
-            label: const Text('Run'),
+          Tooltip(
+            message: defaultTargetPlatform == TargetPlatform.android
+                ? 'Shift+Enter'
+                : 'Ctrl+Enter',
+            child: FilledButton.icon(
+              onPressed: isLoading ? null : onRun,
+              icon: isLoading
+                  ? const SizedBox(
+                      width: 14,
+                      height: 14,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        color: Colors.white,
+                      ),
+                    )
+                  : const Icon(Icons.play_arrow, size: 18),
+              label: const Text('Run'),
+            ),
           ),
           const SizedBox(width: 8),
           OutlinedButton(onPressed: onClear, child: const Text('Clear')),

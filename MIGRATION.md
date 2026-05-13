@@ -237,6 +237,66 @@ final userName = user['name'];
 
 ## Version Upgrades
 
+### 1.2.0 → 1.3.0
+
+This is a **non-breaking** release. No code changes are required for existing
+apps. The public API is unchanged — `JustDatabase.open()` works identically on
+all platforms.
+
+#### New: OPFS Web Persistence with Web Worker
+
+Web databases now persist data across sessions using the **Origin Private File
+System (OPFS)** via the File System Access API. The SQL engine runs in a
+dedicated **Web Worker** (Dart isolate compiled to a worker) with synchronous
+byte-level I/O and a **Write-Ahead Log (WAL)** for crash safety.
+
+**Storage backend selection (automatic):**
+
+| Priority | Backend | When selected |
+|---|---|---|
+| 1 | **OPFS + Web Worker** | Browser supports `FileSystemSyncAccessHandle` |
+| 2 | **IndexedDB** | OPFS unavailable (older browsers, private browsing) |
+| 3 | **In-memory** | Neither API available, or `persist: false` |
+
+```dart
+final db = await JustDatabase.open('mydb');
+// db.storageBackend tells you which backend was chosen:
+//   WebStorageBackend.opfsWorker
+//   WebStorageBackend.indexedDb
+//   WebStorageBackend.memory
+```
+
+**Behavior on web / WASM (updated):**
+
+| Feature | Behavior |
+|---|---|
+| SQL queries, ORM, transactions | ✅ fully supported |
+| Persistence (`persist: true`) | ✅ OPFS (preferred) or IndexedDB (fallback) |
+| `BackupManager.exportSql` / `exportJson` | ✅ fully supported |
+| `BackupManager.backupToFile` / `restoreFromFile` | Throws `UnsupportedError` |
+| `SecureKeyManager` | ✅ uses browser `localStorage` via `just_storage` |
+
+#### New: `WebStorageBackend` enum
+
+On web, the `JustDatabase` instance exposes a `storageBackend` getter so you
+can inspect which backend was selected at runtime.
+
+#### New: `web` direct dependency
+
+`package:web ^1.1.0` is now a direct dependency (previously transitive via
+`just_storage`). If your app pins `web` directly, ensure your constraint is
+compatible.
+
+#### Architecture: conditional export for `database.dart`
+
+`database.dart` is now a conditional export gateway (like `persistence.dart`):
+- Native → `database_native.dart`
+- Web → `database_web.dart`
+
+This is an internal change with no public API impact.
+
+---
+
 ### 1.1.0 → 1.2.0
 
 This is a **non-breaking** release. No code changes are required for existing

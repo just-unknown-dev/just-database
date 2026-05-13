@@ -1,5 +1,123 @@
 ﻿# Changelog
 
+## [1.4.2] - 2026-05-05
+
+### Fixed
+
+- **WASM platform compatibility** — `database_web.dart` now uses a conditional
+  import to select between the real `worker_client.dart` (JS-web, where
+  `dart:isolate` compiles to web workers) and a new `worker_client_stub.dart`
+  (WASM, where `dart:isolate` is unavailable). The stub's `spawn()` returns an
+  error, which the existing fallback chain in `JustDatabase.open` catches and
+  uses to proceed to IndexedDB or in-memory storage. Previously the unconditional
+  import of `dart:isolate` through `database_web.dart` → `worker_client.dart` →
+  `database_worker.dart` caused pub.dev to flag the package as incompatible with
+  both web and WASM.
+- **Redundant import** — removed `import 'dart:typed_data'` from
+  `secure_key_manager.dart`; all used symbols are already re-exported by
+  `package:flutter/foundation.dart`.
+
+## [1.4.1] - 2026-05-05
+
+### Fixed
+
+- **Web / WASM platform compatibility** — `SecureKeyManager.resolveKey()` now
+  uses Flutter's `compute()` instead of `Isolate.run()` to offload the
+  PBKDF2-HMAC-SHA256 derivation. `dart:isolate` is unavailable on web and WASM,
+  causing the entire `ui.dart` import chain to be flagged as incompatible on
+  pub.dev. `compute` provides identical off-thread behaviour on native (isolate)
+  and web/WASM (web worker).
+- **pub.dev description length** — package description expanded to meet the
+  pub.dev requirement of 50–180 characters (was 34).
+
+## [1.4.0] - 2026-05-04
+
+### Added
+
+- **`DatabaseDetailPage`** — new admin UI page for inspecting a single
+  database: table list, row counts, schema viewer, and live query runner.
+  Exported from `lib/ui.dart` and linked from `DatabasesTab` via tap-through
+  navigation. (`66afd4eb`)
+- **Async web introspection** — `tableNamesAsync()`, `viewNamesAsync()`,
+  `triggerNamesAsync()`, `indexNamesForTableAsync()`, `getTableSchemaAsync()`,
+  `totalRowsAsync()`, and `estimatedSizeBytesAsync()` added to the web
+  `JustDatabase`. These delegate to the OPFS worker via the existing
+  `WorkerClient` introspect protocol; the old sync getters still work for
+  IndexedDB and in-memory backends.
+- **`JustDatabase.onStorageDowngrade`** — static callback invoked when
+  `persist: true` is requested on web but neither OPFS nor IndexedDB is
+  available. Lets callers surface the warning in their own logging stack
+  instead of silently running in-memory.
+
+### Changed
+
+- **State management** — admin UI widgets migrated from `provider` to
+  `just_signals` (`^1.0.1`). `provider` is no longer a dependency.
+  (`28a9d1db`)
+- **PBKDF2 iterations raised to 310 000** (was 100 000) to meet NIST SP
+  800-132 (2023) recommendation for PBKDF2-HMAC-SHA256.
+  **⚠ Breaking for encrypted databases**: any `.jdb` file encrypted with a
+  password under v1.3.x will be unreadable after this upgrade because the
+  derived key changes. Migrate by exporting with `BackupManager.exportSql()`
+  before upgrading, then re-importing after. Auto-key databases (`resolveAutoKey`)
+  are unaffected — the raw key is stored directly and not re-derived.
+- **PBKDF2 runs in a background isolate** — `SecureKeyManager.resolveKey()`
+  now executes the CPU-heavy derivation via `Isolate.run()`, so the Flutter
+  UI thread is never blocked even on low-end devices.
+
+### Fixed
+
+- **Version constant** — `kJustDatabaseVersion` in `version.dart` now matches
+  `pubspec.yaml` (`1.4.0`).
+- **Hex encoding performance** — BLOB SQL literals (`_sqlLiteral` in
+  `db_table.dart`) and encryption key serialisation (`secure_key_manager.dart`)
+  now use a `StringBuffer` + lookup-table approach instead of
+  `map(...).join()`, eliminating N intermediate `String` allocations per byte.
+
+### Documentation
+
+- Clarified **best-effort durability** semantics: persistence after each write
+  is fire-and-forget (`unawaited`). A process crash between query return and
+  disk flush loses at most one committed write. See code comments in
+  `database_native.dart` and `database_web.dart`.
+- `WriteFastLockManager` now documents its 100 ms volatile write window and
+  recommends `DatabaseMode.standard` when per-write durability is required.
+
+## [1.3.0] - 2026-03-19
+
+### Added — Web Persistence (OPFS + IndexedDB)
+
+- **OPFS Web Worker persistence** — databases opened with `persist: true` on web
+  now survive page reloads. A dedicated Web Worker runs the SQL engine against
+  the Origin Private File System using synchronous `FileSystemSyncAccessHandle`,
+  keeping the main thread free.
+- **Write-Ahead Log (WAL)** — all mutations are journalled to a separate OPFS
+  file before being applied, providing crash-safe durability. Auto-checkpoint
+  triggers at 1 MB or 1 000 entries.
+- **IndexedDB fallback** — when OPFS or Web Workers are unavailable (older
+  browsers, cross-origin iframes), the engine automatically falls back to
+  IndexedDB snapshot persistence on the main thread.
+- **In-memory last resort** — if neither OPFS nor IndexedDB is available, the
+  database runs in memory only (same as 1.2.0 behaviour).
+- `WebStorageBackend` enum — `opfsWorker`, `indexedDb`, `memory`. Indicates
+  which backend was selected at runtime.
+- `storageBackend` getter on `JustDatabase` (web only) — returns the active
+  `WebStorageBackend`.
+- `DatabaseSerializer` utility (`lib/src/serialization.dart`) — extracted
+  encode / decode helpers shared by native file persistence and the web layer.
+- 8 new files under `lib/src/web/`: `opfs_support.dart`, `opfs_storage.dart`,
+  `wal_manager.dart`, `opfs_persistence.dart`, `idb_persistence.dart`,
+  `worker_protocol.dart`, `database_worker.dart`, `worker_client.dart`.
+- `database_native.dart` / `database_web.dart` — `database.dart` is now a
+  conditional export gateway (`dart.library.js_interop`), matching the existing
+  pattern used by persistence and backup.
+
+### Changed
+
+- `web` package promoted from transitive to direct dependency (`^1.1.0`).
+- `persistence_web.dart` now delegates to `OpfsPersistence` or
+  `IdbPersistence` instead of being a no-op stub.
+
 ## [1.2.0] - 2026-03-14
 
 ### Added — Web & WASM Support
