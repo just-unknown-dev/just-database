@@ -1,5 +1,36 @@
 ﻿# Changelog
 
+## [1.2.0] - 2026-03-14
+
+### Added — Web & WASM Support
+
+- **Web (JS) and Web (WASM) platform targets** — `just_database` now compiles and
+  runs on all Flutter web targets without modification.
+- `persistence_native.dart` / `persistence_web.dart` — persistence implementation
+  split into a native file (`dart:io` + `path_provider` + `encrypt`) and a
+  web/WASM no-op stub. The public `persistence.dart` is now a conditional export
+  gateway: `dart.library.js_interop` selects the stub on both JS-web and WASM.
+- `backup_native.dart` / `backup_web.dart` — same conditional export pattern for
+  `BackupManager`. In-memory methods (`exportSql`, `importSql`, `exportJson`,
+  `importJson`) are fully functional on web. File helpers (`backupToFile`,
+  `restoreFromFile`, `backupToJsonFile`, `restoreFromJsonFile`) throw
+  `UnsupportedError` on web/WASM with a clear message.
+- `platforms:` declarations added to `pubspec.yaml` — explicitly lists
+  `android`, `ios`, `linux`, `macos`, `web`, and `windows` so pub.dev renders
+  the platform badge matrix correctly.
+- `SecureKeyManager` works transparently on web/WASM — key material is stored
+  via `just_storage ^1.1.2` which uses browser `localStorage` on web.
+
+### Changed
+
+- Conditional export guard changed from `dart.library.html` to
+  `dart.library.js_interop`. `dart.library.html` evaluates to `false` under
+  WASM, causing the native (dart:io) implementation to be selected incorrectly.
+  `dart.library.js_interop` is `true` on both JS-web and WASM.
+- `just_storage` dependency bumped to `^1.1.2` (WASM-ready; uses `package:web`).
+
+---
+
 ## [1.1.0] - 2026-02-23
 
 ### Added — Secure Mode (AES-256-GCM encryption at rest)
@@ -115,32 +146,3 @@
 - No `CHECK` constraints
 - No recursive CTEs (`WITH RECURSIVE`)
 - `BLOB` columns accept hex-string values in the Insert UI
-
----
-
-## [0.0.1] - 2026-02-20
-
-### Added
-
-- Initial release of just_database
-- Pure Dart SQL database engine with in-memory storage
-- Optional file persistence (path_provider)
-- `CREATE`, `SELECT`, `INSERT`, `UPDATE`, `DELETE` statements
-- `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY`, `NOT NULL`, `DEFAULT` constraints
-- Composite indexes for multi-column queries
-- Automatic query-based indexing (creates indexes after 100+ queries)
-- Three concurrency modes: `standard`, `readFast`, `writeFast`
-- Query tracking and performance monitoring
-- Index metadata with hit ratios and usage statistics
-- `DatabaseManager` for managing multiple databases
-- Flutter admin UI: Database management, Schema inspector, SQL query editor, Settings
-- `DatabaseProvider` ChangeNotifier for state management
-- `INTEGER`, `REAL`, `TEXT`, `BOOLEAN`, `BLOB`, `DATETIME` data types
-- `AUTOINCREMENT` support for primary keys
-- `JOIN` operations: `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`
-- Aggregate functions: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
-- `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`
-- `DISTINCT`
-- `ALTER TABLE`: `ADD COLUMN`, `DROP COLUMN`, `RENAME COLUMN`
-- Scalar subqueries in `SELECT` and `WHERE`
-- Nested subqueries

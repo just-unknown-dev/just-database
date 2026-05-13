@@ -25,7 +25,12 @@ class DatabaseRow {
   /// Keys are prefixed as "prefixA.col" and "prefixB.col" in addition to
   /// plain "col" (plain key uses last assignment, so prefer qualified form
   /// in expressions that could be ambiguous).
-  static DatabaseRow merge(DatabaseRow a, DatabaseRow b, {String? prefixA, String? prefixB}) {
+  static DatabaseRow merge(
+    DatabaseRow a,
+    DatabaseRow b, {
+    String? prefixA,
+    String? prefixB,
+  }) {
     final merged = <String, dynamic>{};
     // Plain keys first (b overwrites a on collision — callers must use qualified)
     for (final entry in a.values.entries) {
