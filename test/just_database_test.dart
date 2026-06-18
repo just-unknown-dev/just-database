@@ -31,6 +31,15 @@ void main() {
       );
     });
 
+    test('parses CREATE TABLE with negative integer DEFAULT', () {
+      expect(
+        () => Parser.parseSQL(
+          'CREATE TABLE habits (id INTEGER PRIMARY KEY, reminder_hour INTEGER DEFAULT -1)',
+        ),
+        returnsNormally,
+      );
+    });
+
     test('parses INSERT statement', () {
       expect(
         () => Parser.parseSQL("INSERT INTO users (name) VALUES ('Alice')"),
@@ -119,6 +128,19 @@ void main() {
       );
       expect(result.success, isTrue);
       expect(result.rows.length, 2);
+    });
+
+    test('negative integer DEFAULT is applied during insert', () async {
+      await db.execute(
+        'CREATE TABLE habits (id INTEGER PRIMARY KEY AUTOINCREMENT, reminder_hour INTEGER DEFAULT -1)',
+      );
+      final insert = await db.execute('INSERT INTO habits (id) VALUES (1)');
+      expect(insert.success, isTrue, reason: insert.errorMessage);
+
+      final result = await db.query('SELECT reminder_hour FROM habits LIMIT 1');
+      expect(result.success, isTrue, reason: result.errorMessage);
+      expect(result.rows, isNotEmpty);
+      expect(result.rows.first['reminder_hour'], -1);
     });
   });
 

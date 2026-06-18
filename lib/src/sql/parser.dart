@@ -535,7 +535,7 @@ class Parser {
       } else if (_match(TokenType.kwUnique) != null) {
         unique = true;
       } else if (_match(TokenType.kwDefault) != null) {
-        defaultValue = _parsePrimary();
+        defaultValue = _parseUnary();
       } else if (_check(TokenType.kwReferences)) {
         _advance();
         fkTable = _parseTableName();
