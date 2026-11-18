@@ -20,7 +20,7 @@ persistence, a rich SQL dialect, an ORM layer, and an embeddable admin UI.
 | Spatial | R-tree index, ST_* functions, Point/BoundingBox/Polygon |
 | Indexes | AUTO-INDEX, CREATE [UNIQUE/SPATIAL] INDEX, composite, query hints |
 | Backup | SQL dump + JSON snapshot, file helpers |
-| Migrations | SqlMigration, CallbackMigration, MigrationRunner, checksum |
+| Migrations | `db.migrate(...)`, SqlMigration, CallbackMigration, MigrationRunner, checksum |
 | Benchmarking | DatabaseBenchmark, BenchmarkSuite, QueryStats (p95/p99) |
 | ORM | DbTable<T> / DbRecord / DbColumn — type-safe CRUD with zero boilerplate |
 | **Secure mode** | **AES-256-GCM encryption at rest, SHA-256 key derivation, per-save random IV** |
@@ -519,7 +519,7 @@ await BackupManager.restoreFromJsonFile('/path/to/backup.json', tables);
 ## Schema Migrations
 
 ```dart
-final runner = MigrationRunner(db, migrations: [
+final migrations = [
   SqlMigration(
     version: 1,
     name: 'create_users',
@@ -529,19 +529,35 @@ final runner = MigrationRunner(db, migrations: [
   CallbackMigration(
     version: 2,
     name: 'seed_admin',
-    up: (db) async {
-      await db.execute("INSERT INTO users (name) VALUES ('Admin')");
+    upCallback: (executor) async {
+      final result = await executor.executeSQL(
+        "INSERT INTO users (name) VALUES ('Admin')",
+      );
+      if (!result.success) throw StateError(result.errorMessage!);
     },
-    down: (db) async {
-      await db.execute("DELETE FROM users WHERE name = 'Admin'");
+    downCallback: (executor) async {
+      await executor.executeSQL("DELETE FROM users WHERE name = 'Admin'");
     },
   ),
-]);
+];
 
-await runner.migrate();            // apply all pending
-await runner.rollback(toVersion: 1); // rollback to v1
-final status = await runner.status(); // see which are applied
+final db = await JustDatabase.open('app');
+await db.migrate(migrations);           // apply all pending, e.g. on every start
+
+final runner = db.migrationRunner(migrations);
+await runner.rollback(targetVersion: 1); // roll back to v1
+final status = await runner.status();    // see which are applied
+final version = await runner.currentVersion();
 ```
+
+Applied versions are recorded in a `_migrations` table, so `migrate` only runs
+new migrations. Persistent databases are saved when each runner operation
+finishes. Run migrations right after `open`, before the rest of the app uses
+the database. A `SqlMigration` fails as soon as one of its statements fails.
+`executeSQL` returns a `QueryResult` rather than throwing, so a callback
+should check `result.success` itself. A failed migration stops the run. On
+web, migrations are not yet supported in OPFS worker mode
+(`UnsupportedError`).
 
 ---
 
@@ -662,6 +678,31 @@ RELEASE SAVEPOINT name
 
 `PRIMARY KEY`  `AUTOINCREMENT`  `NOT NULL`  `UNIQUE`  `DEFAULT value`  `FOREIGN KEY  REFERENCES`
 
+#### Foreign keys
+
+```sql
+-- column level (no column = the referenced table's primary key)
+invoice_id INTEGER REFERENCES invoices (id) ON DELETE CASCADE
+-- table level
+FOREIGN KEY (invoice_id) REFERENCES invoices (id)
+  ON DELETE SET NULL ON UPDATE CASCADE
+```
+
+| Action | `ON DELETE` of the parent row | `ON UPDATE` of the referenced key |
+|---|---|---|
+| `NO ACTION` (default) | Nothing happens | Nothing happens |
+| `RESTRICT` | Statement fails if child rows exist | Statement fails if child rows exist |
+| `CASCADE` | Child rows are deleted (recursively) | Child rows take the new key |
+| `SET NULL` | Child column set to `NULL` | Child column set to `NULL` |
+| `SET DEFAULT` | Child column set to its `DEFAULT` | Child column set to its `DEFAULT` |
+
+Actions fire the child table's triggers and are undone by `ROLLBACK`. A
+`DELETE` checks every `RESTRICT` and `NOT NULL` violation before it changes
+any row. Limits: references themselves are not checked, so inserting a child
+row whose parent does not exist succeeds, like SQLite with
+`PRAGMA foreign_keys = OFF`. Actions are supported on single-column foreign
+keys only.
+
 ---
 
 ## API Reference
@@ -675,7 +716,8 @@ static Future<JustDatabase> open(String name, {
   String? encryptionKey,
 })
 
-// Called when persist: true falls back to in-memory on web (no durable backend)
+// Called when persist: true falls back to in-memory on web (no durable backend).
+// Available on all platforms; never called on native.
 static void Function(String dbName, String reason)? onStorageDowngrade;
 
 Future<QueryResult> query(String sql)
@@ -690,6 +732,10 @@ Future<QueryResult> rollback({String? savepoint})
 Future<QueryResult> savepoint(String name)
 Future<QueryResult> releaseSavepoint(String name)
 
+// Schema migrations (web: IndexedDB / in-memory backends only)
+Future<List<MigrationResult>> migrate(List<Migration> migrations, {int? targetVersion})
+MigrationRunner migrationRunner(List<Migration> migrations)
+
 // Introspection — sync (native / web non-worker backends)
 List<String> get tableNames
 List<String> get viewNames
@@ -699,7 +745,7 @@ TableSchema?  getTableSchema(String name)
 int get totalRows
 int get estimatedSizeBytes
 
-// Introspection — async (works on ALL backends including OPFS worker)
+// Introspection — async (all platforms and backends, including the OPFS worker)
 Future<List<String>> tableNamesAsync()
 Future<List<String>> viewNamesAsync()
 Future<List<String>> triggerNamesAsync()

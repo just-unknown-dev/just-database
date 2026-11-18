@@ -134,7 +134,7 @@ class OpfsStorageDriver {
             web.FileSystemGetDirectoryOptions(create: false),
           )
           .toDart;
-      return _listJdbFiles(dir);
+      return await _listJdbFiles(dir);
     } catch (_) {
       return [];
     }

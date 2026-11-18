@@ -136,23 +136,60 @@ class CallbackMigration extends Migration {
   }
 }
 
+/// Wraps one [MigrationRunner] operation, e.g. to persist the database after
+/// it runs.
+typedef MigrationGuard = Future<T> Function<T>(Future<T> Function() operation);
+
 /// Manages schema versioning and migration execution.
 /// Stores applied versions in a special `_migrations` table.
+///
+/// To migrate an opened `JustDatabase`, use `db.migrate(migrations)` or
+/// `db.migrationRunner(migrations)`, which also save the result to disk.
+/// Construct a runner directly only around a bare [Executor].
 class MigrationRunner {
   static const String _migrationsTable = '_migrations';
 
   final Executor _executor;
   final List<Migration> _migrations;
+  final MigrationGuard _guard;
 
+  /// Creates a runner that applies [migrations] through [executor].
+  ///
+  /// If [guard] is given, every public operation runs inside it.
   MigrationRunner({
     required Executor executor,
     required List<Migration> migrations,
+    MigrationGuard? guard,
   }) : _executor = executor,
        _migrations = List.of(migrations)
-         ..sort((a, b) => a.version.compareTo(b.version));
+         ..sort((a, b) => a.version.compareTo(b.version)),
+       _guard = guard ?? _unguarded;
+
+  static Future<T> _unguarded<T>(Future<T> Function() operation) =>
+      operation();
 
   /// Creates the internal migrations table if it doesn't exist.
-  Future<void> initialize() async {
+  Future<void> initialize() => _guard(_initialize);
+
+  /// Returns the highest applied migration version (0 if none).
+  Future<int> currentVersion() => _guard(_currentVersion);
+
+  /// Applies all pending migrations up to [targetVersion] (or all, if null).
+  Future<List<MigrationResult>> migrate({int? targetVersion}) =>
+      _guard(() => _migrate(targetVersion: targetVersion));
+
+  /// Rolls back migrations down to (but not including) [targetVersion].
+  Future<List<MigrationResult>> rollback({int targetVersion = 0}) =>
+      _guard(() => _rollback(targetVersion: targetVersion));
+
+  /// Returns the status of all known migrations relative to current version.
+  Future<List<MigrationResult>> status() => _guard(_status);
+
+  // ---------------------------------------------------------------------------
+  // Private implementation (already running inside the guard)
+  // ---------------------------------------------------------------------------
+
+  Future<void> _initialize() async {
     final result = await _executor.executeSQL('''
       CREATE TABLE IF NOT EXISTS $_migrationsTable (
         version INTEGER PRIMARY KEY,
@@ -168,8 +205,7 @@ class MigrationRunner {
     }
   }
 
-  /// Returns the highest applied migration version (0 if none).
-  Future<int> currentVersion() async {
+  Future<int> _currentVersion() async {
     await _ensureInitialized();
     final result = await _executor.executeSQL(
       'SELECT MAX(version) AS v FROM $_migrationsTable',
@@ -179,10 +215,9 @@ class MigrationRunner {
     return v == null ? 0 : (v as num).toInt();
   }
 
-  /// Applies all pending migrations up to [targetVersion] (or all, if null).
-  Future<List<MigrationResult>> migrate({int? targetVersion}) async {
+  Future<List<MigrationResult>> _migrate({int? targetVersion}) async {
     await _ensureInitialized();
-    final current = await currentVersion();
+    final current = await _currentVersion();
     final results = <MigrationResult>[];
     for (final migration in _migrations) {
       if (migration.version <= current) {
@@ -202,10 +237,9 @@ class MigrationRunner {
     return results;
   }
 
-  /// Rolls back migrations down to (but not including) [targetVersion].
-  Future<List<MigrationResult>> rollback({int targetVersion = 0}) async {
+  Future<List<MigrationResult>> _rollback({int targetVersion = 0}) async {
     await _ensureInitialized();
-    final current = await currentVersion();
+    final current = await _currentVersion();
     final toRollback =
         _migrations
             .where((m) => m.version <= current && m.version > targetVersion)
@@ -220,10 +254,9 @@ class MigrationRunner {
     return results;
   }
 
-  /// Returns the status of all known migrations relative to current version.
-  Future<List<MigrationResult>> status() async {
+  Future<List<MigrationResult>> _status() async {
     await _ensureInitialized();
-    final current = await currentVersion();
+    final current = await _currentVersion();
     return _migrations.map((m) {
       final s = m.version <= current
           ? MigrationStatus.applied
@@ -231,10 +264,6 @@ class MigrationRunner {
       return MigrationResult(version: m.version, name: m.name, status: s);
     }).toList();
   }
-
-  // ---------------------------------------------------------------------------
-  // Private implementation
-  // ---------------------------------------------------------------------------
 
   Future<MigrationResult> _applyMigration(Migration migration) async {
     final start = DateTime.now();
@@ -303,7 +332,7 @@ class MigrationRunner {
     );
     // If query fails (unknown table), initialize
     if (!result.success || result.rows.isEmpty) {
-      await initialize();
+      await _initialize();
     }
   }
 

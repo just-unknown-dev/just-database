@@ -109,34 +109,32 @@ class Table {
 
   /// Returns a deep clone of this table — used by the WAL transaction system
   /// to snapshot state before a transaction begins.
-  Table clone() {
-    final copy = Table(schema: _schema);
-    copy._nextRowId = _nextRowId;
-    copy._autoIncrementValue = _autoIncrementValue;
-    for (final row in _rows) {
-      // DatabaseRow is already immutable: values map is copied by DatabaseRow.copyWith semantics
-      // but we can share the same DatabaseRow instances since DatabaseRow is immutable.
-      copy._rows.add(row);
-      copy._rowIdToIndex[row.rowId] = copy._rows.length - 1;
-    }
-    return copy;
-  }
+  Table clone() => Table(schema: _schema).._copyStateFrom(this);
 
   /// Restores this table's mutable state from a previously cloned snapshot.
-  /// Called during ROLLBACK to undo changes.
-  void restoreFrom(Table snapshot) {
-    _schema = snapshot._schema;
-    _nextRowId = snapshot._nextRowId;
-    _autoIncrementValue = snapshot._autoIncrementValue;
+  /// Called during ROLLBACK to undo changes. The snapshot is left untouched,
+  /// so it can be restored again (e.g. ROLLBACK TO the same SAVEPOINT twice).
+  void restoreFrom(Table snapshot) => _copyStateFrom(snapshot);
+
+  /// Replaces this table's schema, counters, rows and indices with
+  /// independent copies of [source]'s. Every index is copied — automatic,
+  /// CREATE INDEX, auto-created and loaded-from-disk ones alike — together
+  /// with its contents, so constraints keep being enforced.
+  void _copyStateFrom(Table source) {
+    _schema = source._schema;
+    _nextRowId = source._nextRowId;
+    _autoIncrementValue = source._autoIncrementValue;
+    // DatabaseRow is immutable, so the row instances can be shared.
     _rows
       ..clear()
-      ..addAll(snapshot._rows);
-    _rowIdToIndex
+      ..addAll(source._rows);
+    _rowIdToIndex.clear();
+    for (int i = 0; i < _rows.length; i++) {
+      _rowIdToIndex[_rows[i].rowId] = i;
+    }
+    _indices
       ..clear()
-      ..addAll(snapshot._rowIdToIndex);
-    // Re-initialise indices from the restored schema
-    _indices.clear();
-    _initializeIndices();
+      ..addAll(source._indices.map((key, idx) => MapEntry(key, idx.copy())));
   }
 
   // ---------------------------------------------------------------------------

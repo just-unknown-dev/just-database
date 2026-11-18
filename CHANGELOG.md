@@ -1,5 +1,82 @@
 ﻿# Changelog
 
+## [1.5.0] - Unreleased
+
+### Added
+
+- **Migrations on an opened database** — `JustDatabase.migrate(migrations)`
+  applies pending migrations, and `JustDatabase.migrationRunner(migrations)`
+  returns a runner for `migrate`, `rollback`, `status` and `currentVersion`.
+  Previously `MigrationRunner` needed an `Executor` that `JustDatabase` kept
+  private, so migrations could not run against an opened database. Persistent
+  databases are saved after every runner operation. On web this works with the
+  IndexedDB and in-memory backends; OPFS worker mode throws `UnsupportedError`.
+  `MigrationRunner` gains an optional `guard` parameter (`MigrationGuard`)
+  that wraps each operation.
+- **`ON DELETE` / `ON UPDATE` foreign key actions** — `CASCADE`, `SET NULL`,
+  `SET DEFAULT`, `RESTRICT` and `NO ACTION`, on both column-level
+  `REFERENCES` and table-level `FOREIGN KEY` clauses. These previously failed
+  to parse (`Expected rparen but got ON`). Cascaded changes fire the child
+  table's triggers and are undone by `ROLLBACK`. A `DELETE` checks every
+  `RESTRICT` / `NOT NULL` violation before changing any row. The actions are
+  stored in `ConstraintDefinition.onDelete` / `onUpdate` (new
+  `ForeignKeyAction` enum), persisted, and kept by the SQL and JSON backups.
+  Actions on composite foreign keys are rejected.
+- **Async introspection on native** — `tableNamesAsync()`, `viewNamesAsync()`,
+  `triggerNamesAsync()`, `indexNamesForTableAsync()`, `getTableSchemaAsync()`,
+  `totalRowsAsync()` and `estimatedSizeBytesAsync()`, plus the static
+  `onStorageDowngrade` callback (never called on native), now exist on the
+  native `JustDatabase` too. The README already listed them, so
+  cross-platform code using them now compiles everywhere.
+- **`JustDatabase.flush()`** — waits until every write made so far is saved,
+  and throws if that save fails (background saves still fail silently).
+  Completes at once when nothing is unsaved, for in-memory databases, and in
+  OPFS worker mode, where the worker logs each statement to its WAL before
+  replying.
+
+### Changed
+
+- **`JustDatabase.open` no longer starts empty over an unreadable file** —
+  when the database file exists but cannot be read or decoded (corrupt,
+  truncated, or a secure-mode database opened without its key), `open` now
+  throws a `StateError` that names the file, and leaves the file untouched.
+  It used to start with an empty database, and the next save overwrote the
+  file. A wrong `encryptionKey` already threw. On web, the IndexedDB backend
+  does the same for a snapshot it cannot decode. Catch the error to offer
+  restoring, moving or deleting the file.
+
+### Fixed
+
+- **Lost writes on persistent databases** — every write starts a background
+  save, and those saves wrote the same `.jdb` file at the same time, so the
+  file could end up truncated or holding an older state, and `close()` did not
+  wait for them. Data was lost in about 1 in 4 write → close → reopen cycles on
+  Windows. Saves now run one at a time per database and coalesce, so the newest
+  state always lands last, and `close()` waits for them. Each save writes a
+  uniquely named `.tmp` file and renames it over the database file (retrying
+  briefly on Windows while another process holds the file open), so a crash
+  mid-save leaves the previous version intact. `PersistenceManager` runs its
+  save, load, `peekMode` and delete calls for one database in call order. The
+  IndexedDB backend on web uses the same save queue.
+
+- **UNIQUE and PRIMARY KEY constraints after `ROLLBACK`** — after any
+  `ROLLBACK` or `ROLLBACK TO SAVEPOINT`, duplicate UNIQUE values and duplicate
+  primary keys (single-column and composite) were accepted, because
+  `Table.clone()` and `Table.restoreFrom()` rebuilt the automatic indexes empty.
+  Indexes from `CREATE INDEX`, query-pattern auto-indexes and indexes loaded
+  from disk were dropped by the rollback as well. Snapshots now copy every
+  index with its contents, and restoring leaves the snapshot intact, so rolling
+  back to the same savepoint twice also works. New `TableIndex.copy()` and
+  `IndexMetadata.copy()` return independent copies.
+- **README** — the migrations example now compiles (it called a
+  `MigrationRunner(db, ...)` constructor and `up:` / `down:` / `toVersion:`
+  parameters that do not exist), and the constraints section documents what
+  foreign keys do and do not enforce.
+- **ARCHITECTURE.md** — no longer claims that migrations run in a transaction
+  or that checksums are validated.
+- **`OpfsStorageDriver.listDatabases`** — errors while listing files are now caught
+  and return `[]` as intended (the inner future was returned without `await`).
+
 ## [1.4.2] - 2026-05-05
 
 ### Fixed

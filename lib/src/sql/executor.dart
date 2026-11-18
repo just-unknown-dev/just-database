@@ -784,41 +784,77 @@ class Executor {
       }
     }
 
-    int count = 0;
+    final pending = <(DatabaseRow, Map<String, dynamic>)>[];
     for (final row in matchingRows) {
       final ctx = _rowToContext(row, tableAlias);
       final resolved = <String, dynamic>{};
       for (final assign in stmt.assignments) {
         resolved[assign.columnName] = await _evaluate(assign.value, ctx);
       }
-      // Build old/new row maps for triggers
-      final oldRow = _rowToRawMap(row);
-      final newRow = {...oldRow, ...resolved};
-      // Fire BEFORE UPDATE triggers
-      await _fireTriggers(
-        stmt.tableName,
-        TriggerEvent.update_,
-        TriggerTiming.before,
-        oldRow: oldRow,
-        newRow: newRow,
-      );
-      try {
-        final updated = table.update((r) => r.rowId == row.rowId, resolved);
-        count += updated;
-      } catch (e) {
-        return QueryResult.error('Update error: $e');
-      }
-      // Fire AFTER UPDATE triggers
-      await _fireTriggers(
-        stmt.tableName,
-        TriggerEvent.update_,
-        TriggerTiming.after,
-        oldRow: oldRow,
-        newRow: newRow,
-      );
+      pending.add((row, resolved));
+    }
+
+    // Fail before changing any row if an ON UPDATE RESTRICT (or a SET NULL
+    // on a NOT NULL column) would be violated.
+    for (final (row, resolved) in pending) {
+      _planUpdateActions(tableKey, row, resolved);
+    }
+
+    int count = 0;
+    for (final (row, resolved) in pending) {
+      count += await _updateRow(tableKey, stmt.tableName, row, resolved);
     }
 
     return QueryResult.success(affectedRows: count);
+  }
+
+  /// Updates one row, firing its UPDATE triggers and applying the
+  /// ON UPDATE actions of foreign keys that reference a changed column.
+  Future<int> _updateRow(
+    String tableKey,
+    String tableName,
+    DatabaseRow row,
+    Map<String, dynamic> changes, {
+    int depth = 0,
+  }) async {
+    if (depth > _maxForeignKeyDepth) {
+      throw ExecutorException(
+        'Too many levels of foreign key actions (more than '
+        '$_maxForeignKeyDepth) while updating "$tableName"',
+      );
+    }
+    final table = _tables[tableKey]!;
+    final actions = _planUpdateActions(tableKey, row, changes);
+
+    // Build old/new row maps for triggers
+    final oldRow = _rowToRawMap(row);
+    final newRow = {...oldRow, ...changes};
+    // Fire BEFORE UPDATE triggers
+    await _fireTriggers(
+      tableName,
+      TriggerEvent.update_,
+      TriggerTiming.before,
+      oldRow: oldRow,
+      newRow: newRow,
+    );
+    int updated;
+    try {
+      updated = table.update((r) => r.rowId == row.rowId, changes);
+    } catch (e) {
+      throw ExecutorException('Update error: $e');
+    }
+    for (final action in actions) {
+      await _applyChildUpdates(action.ref, action.rowIds, action.value, depth);
+    }
+    // Fire AFTER UPDATE triggers
+    await _fireTriggers(
+      tableName,
+      TriggerEvent.update_,
+      TriggerTiming.after,
+      oldRow: oldRow,
+      newRow: newRow,
+    );
+    return updated;
   }
 
   // ===========================================================================
@@ -833,64 +869,265 @@ class Executor {
     final table = _tables[tableKey]!;
     final tableAlias = stmt.tableName;
 
-    // Collect matching row IDs first
+    // Collect matching rows first
     final allRows = table.scan().toList();
-    final toDelete = <int>[];
+    final toDelete = <DatabaseRow>[];
     for (final row in allRows) {
       if (stmt.whereClause == null) {
-        toDelete.add(row.rowId);
+        toDelete.add(row);
       } else {
         if (await _evaluateAsBool(
           stmt.whereClause!,
           _rowToContext(row, tableAlias),
         )) {
-          toDelete.add(row.rowId);
+          toDelete.add(row);
         }
       }
     }
 
-    // Delete by rowId
-    int count = 0;
-    // Save full old row data before deletion, then fire BEFORE DELETE triggers
-    final table2 = _tables[tableKey]!;
-    // Build a map from rowId → full row data for use in AFTER triggers too
-    final oldRowData = <int, Map<String, dynamic>>{};
-    for (final rowId in toDelete) {
-      final matchingRow = table2
-          .scan()
-          .where((r) => r.rowId == rowId)
-          .firstOrNull;
-      if (matchingRow != null) {
-        oldRowData[rowId] = _rowToRawMap(matchingRow);
-      }
-    }
-    for (final rowId in toDelete) {
-      final oldRow = oldRowData[rowId];
-      if (oldRow != null) {
+    // Work out every ON DELETE action before changing anything, so a
+    // RESTRICT (or a SET NULL on a NOT NULL column) fails the whole statement.
+    final plan = _DeletePlan()..addRows(tableKey, toDelete);
+    _planDeleteActions(plan, tableKey, toDelete);
+
+    // Fire BEFORE DELETE triggers with full old row data: the statement's own
+    // rows first, then rows removed by ON DELETE CASCADE.
+    final oldRowData = <String, Map<int, Map<String, dynamic>>>{
+      for (final MapEntry(key: key, value: rows) in plan.deletes.entries)
+        key: {for (final row in rows.values) row.rowId: _rowToRawMap(row)},
+    };
+    for (final MapEntry(key: key, value: rows) in oldRowData.entries) {
+      final name = key == tableKey ? stmt.tableName : key;
+      for (final oldRow in rows.values) {
         await _fireTriggers(
-          stmt.tableName,
+          name,
           TriggerEvent.delete_,
           TriggerTiming.before,
           oldRow: oldRow,
         );
       }
     }
+
+    // ON DELETE SET NULL / SET DEFAULT, skipping rows that a cascade removes
+    for (final update in plan.updates) {
+      final rowIds = update.rowIds
+          .where((id) => !plan.isDeleted(update.ref.childKey, id))
+          .toList();
+      await _applyChildUpdates(update.ref, rowIds, update.value, 0);
+    }
+
+    // Delete by rowId
+    int count = 0;
     try {
-      count = table.delete((row) => toDelete.contains(row.rowId));
+      for (final MapEntry(key: key, value: rows) in plan.deletes.entries) {
+        final deleted = _tables[key]?.delete(
+          (row) => rows.containsKey(row.rowId),
+        );
+        if (key == tableKey) count = deleted ?? 0;
+      }
     } catch (e) {
       return QueryResult.error('Delete error: $e');
     }
     // Fire AFTER DELETE triggers with full old row data
-    for (final rowId in toDelete) {
-      final oldRow = oldRowData[rowId] ?? {'rowid': rowId};
-      await _fireTriggers(
-        stmt.tableName,
-        TriggerEvent.delete_,
-        TriggerTiming.after,
-        oldRow: oldRow,
-      );
+    for (final MapEntry(key: key, value: rows) in oldRowData.entries) {
+      final name = key == tableKey ? stmt.tableName : key;
+      for (final oldRow in rows.values) {
+        await _fireTriggers(
+          name,
+          TriggerEvent.delete_,
+          TriggerTiming.after,
+          oldRow: oldRow,
+        );
+      }
     }
     return QueryResult.success(affectedRows: count);
+  }
+
+  // ===========================================================================
+  // FOREIGN KEY ACTIONS
+  // ===========================================================================
+
+  /// Cascades deeper than this are treated as a runaway cycle.
+  static const int _maxForeignKeyDepth = 64;
+
+  /// Foreign key columns (in any table) that reference [parentKey] and whose
+  /// action, as picked by [actionOf], is not NO ACTION.
+  List<_ForeignKeyRef> _referencingForeignKeys(
+    String parentKey,
+    ForeignKeyAction Function(ConstraintDefinition constraints) actionOf,
+  ) {
+    final parent = _tables[parentKey];
+    if (parent == null) return const [];
+    final refs = <_ForeignKeyRef>[];
+    for (final MapEntry(key: childKey, value: child) in _tables.entries) {
+      for (final column in child.schema.columns) {
+        final constraints = column.constraints;
+        final action = actionOf(constraints);
+        if (action == ForeignKeyAction.noAction) continue;
+        if (constraints.foreignKeyTable?.toLowerCase() !=
+            parentKey.toLowerCase()) {
+          continue;
+        }
+        final referenced =
+            constraints.foreignKeyColumn ??
+            parent.schema.primaryKeyColumn?.name;
+        final parentColumn = referenced == null
+            ? null
+            : parent.schema.getColumn(referenced)?.name;
+        if (parentColumn == null) continue;
+        refs.add(
+          _ForeignKeyRef(
+            childKey: childKey,
+            childTableName: child.schema.tableName,
+            column: column,
+            parentColumn: parentColumn,
+            action: action,
+          ),
+        );
+      }
+    }
+    return refs;
+  }
+
+  /// Rows of [ref]'s child table whose foreign key equals one of [keys].
+  List<DatabaseRow> _childRows(_ForeignKeyRef ref, Iterable<dynamic> keys) {
+    final wanted = keys.where((k) => k != null).map(_keyOf).toSet();
+    if (wanted.isEmpty) return const [];
+    return _tables[ref.childKey]!
+        .scan()
+        .where((row) => wanted.contains(_keyOf(row[ref.column.name])))
+        .toList();
+  }
+
+  /// Normalises a key so that `1` and `1.0` match, as in [_eq].
+  static Object? _keyOf(dynamic value) =>
+      value is num ? value.toDouble() : value;
+
+  /// The value a SET NULL / SET DEFAULT action writes into [ref]'s column.
+  dynamic _setActionValue(_ForeignKeyRef ref, String event) {
+    final constraints = ref.column.constraints;
+    final value =
+        ref.action == ForeignKeyAction.setDefault && constraints.hasDefault
+        ? constraints.defaultValue
+        : null;
+    if (value == null && constraints.notNull) {
+      throw ExecutorException(
+        'NOT NULL constraint failed: '
+        '${ref.childTableName}.${ref.column.name} '
+        '(ON $event ${ref.action.sql})',
+      );
+    }
+    return value;
+  }
+
+  ExecutorException _restrictFailure(_ForeignKeyRef ref, String event) {
+    return ExecutorException(
+      'FOREIGN KEY constraint failed: rows in "${ref.childTableName}" '
+      'still reference this row through "${ref.column.name}" '
+      '(ON $event RESTRICT)',
+    );
+  }
+
+  /// Adds to [plan] every row that ON DELETE actions touch when [rows] are
+  /// deleted from [parentKey]. Throws [ExecutorException] on a violation.
+  void _planDeleteActions(
+    _DeletePlan plan,
+    String parentKey,
+    List<DatabaseRow> rows, {
+    int depth = 0,
+  }) {
+    if (depth > _maxForeignKeyDepth) {
+      throw ExecutorException(
+        'Too many levels of ON DELETE CASCADE (more than '
+        '$_maxForeignKeyDepth) while deleting from "$parentKey"',
+      );
+    }
+    for (final ref in _referencingForeignKeys(parentKey, (c) => c.onDelete)) {
+      final children = _childRows(
+        ref,
+        rows.map((r) => r[ref.parentColumn]),
+      ).where((child) => !plan.isDeleted(ref.childKey, child.rowId)).toList();
+      if (children.isEmpty) continue;
+      switch (ref.action) {
+        case ForeignKeyAction.restrict:
+          throw _restrictFailure(ref, 'DELETE');
+        case ForeignKeyAction.cascade:
+          plan.addRows(ref.childKey, children);
+          _planDeleteActions(plan, ref.childKey, children, depth: depth + 1);
+        case ForeignKeyAction.setNull:
+        case ForeignKeyAction.setDefault:
+          plan.updates.add((
+            ref: ref,
+            rowIds: [for (final child in children) child.rowId],
+            value: _setActionValue(ref, 'DELETE'),
+          ));
+        case ForeignKeyAction.noAction:
+          break;
+      }
+    }
+  }
+
+  /// Works out the ON UPDATE actions that updating [row] of [tableKey] with
+  /// [changes] triggers. Throws [ExecutorException] on a violation.
+  List<_ChildUpdate> _planUpdateActions(
+    String tableKey,
+    DatabaseRow row,
+    Map<String, dynamic> changes,
+  ) {
+    if (changes.isEmpty) return const [];
+    final actions = <_ChildUpdate>[];
+    for (final ref in _referencingForeignKeys(tableKey, (c) => c.onUpdate)) {
+      final change = changes.entries
+          .where((e) => e.key.toLowerCase() == ref.parentColumn.toLowerCase())
+          .firstOrNull;
+      if (change == null) continue;
+      final oldKey = row[ref.parentColumn];
+      final newKey = change.value;
+      if (oldKey == null || _eq(oldKey, newKey)) continue;
+      final children = _childRows(ref, [oldKey]);
+      if (children.isEmpty) continue;
+      final dynamic value;
+      switch (ref.action) {
+        case ForeignKeyAction.restrict:
+          throw _restrictFailure(ref, 'UPDATE');
+        case ForeignKeyAction.cascade:
+          value = newKey;
+        case ForeignKeyAction.setNull:
+        case ForeignKeyAction.setDefault:
+          value = _setActionValue(ref, 'UPDATE');
+        case ForeignKeyAction.noAction:
+          continue;
+      }
+      actions.add((
+        ref: ref,
+        rowIds: [for (final child in children) child.rowId],
+        value: value,
+      ));
+    }
+    return actions;
+  }
+
+  /// Sets [ref]'s column to [value] on the child rows [rowIds] that still
+  /// exist, firing their UPDATE triggers and any further ON UPDATE actions.
+  Future<void> _applyChildUpdates(
+    _ForeignKeyRef ref,
+    List<int> rowIds,
+    dynamic value,
+    int depth,
+  ) async {
+    final child = _tables[ref.childKey];
+    if (child == null) return;
+    for (final rowId in rowIds) {
+      final current = child.getByRowId(rowId);
+      if (current == null) continue;
+      await _updateRow(
+        ref.childKey,
+        ref.childKey,
+        current,
+        {ref.column.name: value},
+        depth: depth + 1,
+      );
+    }
   }
 
   // ===========================================================================
@@ -921,6 +1158,8 @@ class Executor {
                 : null,
             foreignKeyTable: colNode.foreignKeyTable,
             foreignKeyColumn: colNode.foreignKeyColumn,
+            onDelete: colNode.onDelete,
+            onUpdate: colNode.onUpdate,
           ),
         ),
       );
@@ -928,6 +1167,15 @@ class Executor {
 
     // Also register table-level FOREIGN KEY constraints
     for (final fk in stmt.foreignKeys) {
+      final hasActions =
+          fk.onDelete != ForeignKeyAction.noAction ||
+          fk.onUpdate != ForeignKeyAction.noAction;
+      if (hasActions && fk.columns.length > 1) {
+        return QueryResult.error(
+          'ON DELETE / ON UPDATE actions are only supported on single-column '
+          'foreign keys (FOREIGN KEY (${fk.columns.join(', ')}))',
+        );
+      }
       final colIdx = columns.indexWhere(
         (c) => fk.columns
             .map((fc) => fc.toLowerCase())
@@ -941,6 +1189,8 @@ class Executor {
             foreignKeyColumn: fk.referencedColumns.isNotEmpty
                 ? fk.referencedColumns.first
                 : null,
+            onDelete: fk.onDelete,
+            onUpdate: fk.onUpdate,
           ),
         );
       }
@@ -2070,4 +2320,44 @@ class Executor {
   /// Returns the names of all triggers across all tables.
   List<String> get triggerNames =>
       _triggers.values.expand((list) => list.map((t) => t.name)).toList();
+}
+
+/// A foreign key column in [childKey]'s table that references [parentColumn]
+/// of another table, with the [action] that applies to the event at hand.
+class _ForeignKeyRef {
+  final String childKey;
+  final String childTableName;
+  final ColumnDefinition column;
+  final String parentColumn;
+  final ForeignKeyAction action;
+
+  const _ForeignKeyRef({
+    required this.childKey,
+    required this.childTableName,
+    required this.column,
+    required this.parentColumn,
+    required this.action,
+  });
+}
+
+/// Child rows [rowIds] whose [ref] column must be set to [value].
+typedef _ChildUpdate = ({_ForeignKeyRef ref, List<int> rowIds, dynamic value});
+
+/// Everything one DELETE statement removes or changes, worked out up front.
+class _DeletePlan {
+  /// Table key → rows to delete (by rowId), in the order they were found.
+  final Map<String, Map<int, DatabaseRow>> deletes = {};
+
+  /// ON DELETE SET NULL / SET DEFAULT changes.
+  final List<_ChildUpdate> updates = [];
+
+  void addRows(String tableKey, Iterable<DatabaseRow> rows) {
+    final forTable = deletes.putIfAbsent(tableKey, () => {});
+    for (final row in rows) {
+      forTable[row.rowId] = row;
+    }
+  }
+
+  bool isDeleted(String tableKey, int rowId) =>
+      deletes[tableKey]?.containsKey(rowId) ?? false;
 }

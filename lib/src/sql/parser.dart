@@ -1,3 +1,4 @@
+import '../storage/schema.dart' show ForeignKeyAction;
 import 'ast.dart';
 import 'lexer.dart';
 
@@ -518,6 +519,8 @@ class Parser {
     Expression? defaultValue;
     String? fkTable;
     String? fkColumn;
+    var fkOnDelete = ForeignKeyAction.noAction;
+    var fkOnUpdate = ForeignKeyAction.noAction;
 
     bool loop = true;
     while (loop) {
@@ -544,6 +547,9 @@ class Parser {
           fkColumn = _parseColumnName();
           _consume(TokenType.rparen);
         }
+        final actions = _parseForeignKeyActions();
+        fkOnDelete = actions.onDelete;
+        fkOnUpdate = actions.onUpdate;
       } else {
         loop = false;
       }
@@ -559,6 +565,55 @@ class Parser {
       defaultValue: defaultValue,
       foreignKeyTable: fkTable,
       foreignKeyColumn: fkColumn,
+      onDelete: fkOnDelete,
+      onUpdate: fkOnUpdate,
+    );
+  }
+
+  /// Parses the `ON DELETE action` / `ON UPDATE action` clauses (in any
+  /// order) that may follow a REFERENCES clause.
+  ({ForeignKeyAction onDelete, ForeignKeyAction onUpdate})
+  _parseForeignKeyActions() {
+    var onDelete = ForeignKeyAction.noAction;
+    var onUpdate = ForeignKeyAction.noAction;
+    while (_match(TokenType.kwOn) != null) {
+      if (_match(TokenType.kwDelete) != null) {
+        onDelete = _parseForeignKeyAction();
+      } else if (_match(TokenType.kwUpdate) != null) {
+        onUpdate = _parseForeignKeyAction();
+      } else {
+        throw _error('Expected DELETE or UPDATE after ON in REFERENCES');
+      }
+    }
+    return (onDelete: onDelete, onUpdate: onUpdate);
+  }
+
+  ForeignKeyAction _parseForeignKeyAction() {
+    if (_match(TokenType.kwSet) != null) {
+      if (_match(TokenType.kwNull_) != null) return ForeignKeyAction.setNull;
+      if (_match(TokenType.kwDefault) != null) {
+        return ForeignKeyAction.setDefault;
+      }
+      throw _error('Expected NULL or DEFAULT after SET');
+    }
+    switch (_peek().lexeme.toUpperCase()) {
+      case 'CASCADE':
+        _advance();
+        return ForeignKeyAction.cascade;
+      case 'RESTRICT':
+        _advance();
+        return ForeignKeyAction.restrict;
+      case 'NO':
+        _advance();
+        if (_peek().lexeme.toUpperCase() != 'ACTION') {
+          throw _error('Expected ACTION after NO');
+        }
+        _advance();
+        return ForeignKeyAction.noAction;
+    }
+    throw _error(
+      'Expected CASCADE, RESTRICT, SET NULL, SET DEFAULT or NO ACTION but '
+      'got "${_peek().lexeme}"',
     );
   }
 
@@ -584,10 +639,13 @@ class Parser {
       refCols.add(_parseColumnName());
     }
     _consume(TokenType.rparen);
+    final actions = _parseForeignKeyActions();
     return ForeignKeyConstraintNode(
       columns: cols,
       referencedTable: refTable,
       referencedColumns: refCols,
+      onDelete: actions.onDelete,
+      onUpdate: actions.onUpdate,
     );
   }
 

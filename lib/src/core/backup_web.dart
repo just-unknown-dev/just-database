@@ -80,6 +80,12 @@ class BackupManager {
         if (c.constraints.foreignKeyTable != null) {
           def['fkTable'] = c.constraints.foreignKeyTable;
           def['fkColumn'] = c.constraints.foreignKeyColumn;
+          if (c.constraints.onDelete != ForeignKeyAction.noAction) {
+            def['fkOnDelete'] = c.constraints.onDelete.name;
+          }
+          if (c.constraints.onUpdate != ForeignKeyAction.noAction) {
+            def['fkOnUpdate'] = c.constraints.onUpdate.name;
+          }
         }
         return def;
       }).toList();
@@ -128,6 +134,8 @@ class BackupManager {
               defaultValue: c['default'],
               foreignKeyTable: c['fkTable'] as String?,
               foreignKeyColumn: c['fkColumn'] as String?,
+              onDelete: ForeignKeyAction.fromName(c['fkOnDelete'] as String?),
+              onUpdate: ForeignKeyAction.fromName(c['fkOnUpdate'] as String?),
             ),
           );
         }).toList();
@@ -216,6 +224,12 @@ class BackupManager {
         parts.add(
           'REFERENCES ${c.constraints.foreignKeyTable}(${c.constraints.foreignKeyColumn ?? 'id'})',
         );
+        if (c.constraints.onDelete != ForeignKeyAction.noAction) {
+          parts.add('ON DELETE ${c.constraints.onDelete.sql}');
+        }
+        if (c.constraints.onUpdate != ForeignKeyAction.noAction) {
+          parts.add('ON UPDATE ${c.constraints.onUpdate.sql}');
+        }
       }
       return parts.join(' ');
     });
@@ -263,6 +277,8 @@ class BackupManager {
             hasDefault: col.defaultValue != null,
             foreignKeyTable: col.foreignKeyTable,
             foreignKeyColumn: col.foreignKeyColumn,
+            onDelete: col.onDelete,
+            onUpdate: col.onUpdate,
           ),
         );
       }).toList();

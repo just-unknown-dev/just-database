@@ -56,6 +56,8 @@ static Future<JustDatabase> open(
 - `persist` - Write database to local storage. Pass `false` for in-memory only.
 - `encryptionKey` - 64-hex-character AES-256 key for `DatabaseMode.secure`. In the Admin UI and most app flows this is supplied automatically by `SecureKeyManager.resolveAutoKey`. For password-protected flows use `SecureKeyManager.resolveKey`. The raw key bytes are never written to disk.
 
+**Throws:** `StateError` if the persisted file exists but cannot be read, decrypted (wrong key, or a secure database opened without one) or decoded. The file is left untouched instead of being replaced by an empty database; restore, move or delete it to recover.
+
 #### Methods
 
 ##### execute
@@ -100,11 +102,37 @@ Lists all table names in the database.
 
 **Returns:** List of table name strings
 
+##### flush
+```dart
+Future<void> flush()
+```
+Waits until every write made so far is saved. `execute()` returns before its
+change is saved, so await this after critical writes. Throws if the save fails;
+background saves fail silently. Completes at once when nothing is unsaved, when
+`persist` is false, and in OPFS worker mode on web.
+
 ##### close
 ```dart
 Future<void> close()
 ```
-Closes the database and flushes to disk if `persist` is true.
+Closes the database. If `persist` is true, waits for pending saves and saves
+the final state first. Save errors are not thrown; call `flush()` before
+`close()` to observe them.
+
+##### migrate / migrationRunner
+```dart
+Future<List<MigrationResult>> migrate(List<Migration> migrations, {int? targetVersion})
+MigrationRunner migrationRunner(List<Migration> migrations)
+```
+Applies schema migrations to this database. `migrate` runs every pending
+migration (up to `targetVersion`); `migrationRunner` returns a runner for
+`migrate`, `rollback(targetVersion:)`, `status()` and `currentVersion()`.
+Applied versions are recorded in a `_migrations` table, and persistent
+databases are saved when each operation finishes. Run migrations right after
+`open`, before the rest of the app uses the database.
+
+On web, migrations work with the IndexedDB and in-memory backends; in OPFS
+worker mode `migrationRunner` throws `UnsupportedError`.
 
 #### Additional getters
 
@@ -115,6 +143,22 @@ List<String> indexNamesForTable(String tableName)  // Index names for a table
 int          totalRows             // Sum of row counts across all tables
 int          estimatedSizeBytes    // Estimated in-memory + persisted size in bytes
 ```
+
+#### Async introspection (all platforms)
+
+```dart
+Future<List<String>> tableNamesAsync()
+Future<List<String>> viewNamesAsync()
+Future<List<String>> triggerNamesAsync()
+Future<List<String>> indexNamesForTableAsync(String tableName)
+Future<TableSchema?> getTableSchemaAsync(String name)
+Future<int>          totalRowsAsync()
+Future<int>          estimatedSizeBytesAsync()
+```
+
+On web in OPFS worker mode the sync getters return empty values, so prefer
+these in cross-platform code. On native they complete immediately with the
+sync values.
 
 #### Web-only: storage backend
 
@@ -610,8 +654,13 @@ bool isUnique                  // Has unique constraint
 bool isNotNull                 // NOT NULL constraint
 dynamic defaultValue           // Default value
 String? foreignKeyTable        // Foreign key table
-String? foreignKeyColumn       // Foreign key column
+String? foreignKeyColumn       // Foreign key column (null = referenced table's primary key)
+ForeignKeyAction onDelete      // ON DELETE action (default noAction)
+ForeignKeyAction onUpdate      // ON UPDATE action (default noAction)
 ```
+
+`ForeignKeyAction` values: `noAction`, `restrict`, `cascade`, `setNull`,
+`setDefault`.
 
 ---
 
@@ -991,7 +1040,8 @@ await db.execute('ALTER TABLE users RENAME COLUMN name TO full_name');
 
 - **PRIMARY KEY** - Single or composite
 - **UNIQUE** - Single or composite
-- **FOREIGN KEY** - With automatic indexing
+- **FOREIGN KEY** - With automatic indexing and `ON DELETE` / `ON UPDATE`
+  `CASCADE | SET NULL | SET DEFAULT | RESTRICT | NO ACTION` (single-column keys)
 - **NOT NULL** - Required fields
 - **DEFAULT** - Default values
 - **AUTOINCREMENT** - Auto-incrementing integers

@@ -1,3 +1,5 @@
+import '../storage/schema.dart' show ForeignKeyAction;
+
 // SQL Lexer token types
 enum TokenType {
   // --- DDL Keywords ---
@@ -246,6 +248,8 @@ class ColumnDefinitionNode extends AstNode {
   final Expression? defaultValue;
   final String? foreignKeyTable;
   final String? foreignKeyColumn;
+  final ForeignKeyAction onDelete;
+  final ForeignKeyAction onUpdate;
 
   const ColumnDefinitionNode({
     required this.name,
@@ -257,6 +261,8 @@ class ColumnDefinitionNode extends AstNode {
     this.defaultValue,
     this.foreignKeyTable,
     this.foreignKeyColumn,
+    this.onDelete = ForeignKeyAction.noAction,
+    this.onUpdate = ForeignKeyAction.noAction,
   });
 }
 
@@ -264,11 +270,15 @@ class ForeignKeyConstraintNode extends AstNode {
   final List<String> columns;
   final String referencedTable;
   final List<String> referencedColumns;
+  final ForeignKeyAction onDelete;
+  final ForeignKeyAction onUpdate;
 
   const ForeignKeyConstraintNode({
     required this.columns,
     required this.referencedTable,
     required this.referencedColumns,
+    this.onDelete = ForeignKeyAction.noAction,
+    this.onUpdate = ForeignKeyAction.noAction,
   });
 }
 

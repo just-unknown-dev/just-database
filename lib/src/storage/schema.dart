@@ -35,6 +35,35 @@ DataType parseDataType(String typeName) {
   }
 }
 
+/// What happens to child rows when the parent row they reference is deleted
+/// (`ON DELETE`) or its referenced key changes (`ON UPDATE`).
+enum ForeignKeyAction {
+  /// No action (the default). The reference is not checked.
+  noAction('NO ACTION'),
+
+  /// The parent change fails while child rows still reference it.
+  restrict('RESTRICT'),
+
+  /// Child rows are deleted (`ON DELETE`) or take the new key (`ON UPDATE`).
+  cascade('CASCADE'),
+
+  /// The child's foreign key column is set to NULL.
+  setNull('SET NULL'),
+
+  /// The child's foreign key column is set to its DEFAULT value.
+  setDefault('SET DEFAULT');
+
+  const ForeignKeyAction(this.sql);
+
+  /// The action as written in SQL, e.g. `SET NULL`.
+  final String sql;
+
+  /// Parses an action from its [name] (as stored in JSON), falling back to
+  /// [noAction] for null or unknown values.
+  static ForeignKeyAction fromName(String? name) => ForeignKeyAction.values
+      .firstWhere((a) => a.name == name, orElse: () => noAction);
+}
+
 /// Constraint definitions for a column.
 class ConstraintDefinition {
   final bool notNull;
@@ -44,7 +73,15 @@ class ConstraintDefinition {
   final bool hasDefault;
   final dynamic defaultValue;
   final String? foreignKeyTable;
+
+  /// The referenced column. `null` means the referenced table's primary key.
   final String? foreignKeyColumn;
+
+  /// Action applied to this (child) row when the referenced row is deleted.
+  final ForeignKeyAction onDelete;
+
+  /// Action applied to this (child) row when the referenced key changes.
+  final ForeignKeyAction onUpdate;
 
   const ConstraintDefinition({
     this.notNull = false,
@@ -55,6 +92,8 @@ class ConstraintDefinition {
     this.defaultValue,
     this.foreignKeyTable,
     this.foreignKeyColumn,
+    this.onDelete = ForeignKeyAction.noAction,
+    this.onUpdate = ForeignKeyAction.noAction,
   });
 
   ConstraintDefinition copyWith({
@@ -66,6 +105,8 @@ class ConstraintDefinition {
     dynamic defaultValue,
     String? foreignKeyTable,
     String? foreignKeyColumn,
+    ForeignKeyAction? onDelete,
+    ForeignKeyAction? onUpdate,
   }) {
     return ConstraintDefinition(
       notNull: notNull ?? this.notNull,
@@ -76,6 +117,8 @@ class ConstraintDefinition {
       defaultValue: defaultValue ?? this.defaultValue,
       foreignKeyTable: foreignKeyTable ?? this.foreignKeyTable,
       foreignKeyColumn: foreignKeyColumn ?? this.foreignKeyColumn,
+      onDelete: onDelete ?? this.onDelete,
+      onUpdate: onUpdate ?? this.onUpdate,
     );
   }
 
@@ -88,6 +131,9 @@ class ConstraintDefinition {
     'defaultValue': defaultValue,
     'foreignKeyTable': foreignKeyTable,
     'foreignKeyColumn': foreignKeyColumn,
+    // Omitted when unset so files written before these existed stay identical.
+    if (onDelete != ForeignKeyAction.noAction) 'onDelete': onDelete.name,
+    if (onUpdate != ForeignKeyAction.noAction) 'onUpdate': onUpdate.name,
   };
 
   factory ConstraintDefinition.fromJson(Map<String, dynamic> json) {
@@ -100,6 +146,8 @@ class ConstraintDefinition {
       defaultValue: json['defaultValue'],
       foreignKeyTable: json['foreignKeyTable'] as String?,
       foreignKeyColumn: json['foreignKeyColumn'] as String?,
+      onDelete: ForeignKeyAction.fromName(json['onDelete'] as String?),
+      onUpdate: ForeignKeyAction.fromName(json['onUpdate'] as String?),
     );
   }
 }

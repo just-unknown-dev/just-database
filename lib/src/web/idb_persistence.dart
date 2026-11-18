@@ -60,6 +60,9 @@ class IdbPersistenceManager {
   }
 
   /// Loads a database from IndexedDB. Returns `null` if not found.
+  ///
+  /// Throws a [StateError] if the stored snapshot cannot be decoded; it is
+  /// left untouched.
   static Future<DatabaseSnapshot?> load(String name) async {
     final db = await _openDb();
     try {
@@ -69,20 +72,28 @@ class IdbPersistenceManager {
       final result = await _requestToFuture(request);
       if (result == null || result.isUndefinedOrNull) return null;
 
-      final jsonString = (result as JSString).toDart;
-      final json = jsonDecode(jsonString) as Map<String, dynamic>;
+      try {
+        final jsonString = (result as JSString).toDart;
+        final json = jsonDecode(jsonString) as Map<String, dynamic>;
 
-      final modeStr = json['mode'] as String? ?? 'standard';
-      final mode = DatabaseMode.values.firstWhere(
-        (m) => m.name == modeStr,
-        orElse: () => DatabaseMode.standard,
-      );
+        final modeStr = json['mode'] as String? ?? 'standard';
+        final mode = DatabaseMode.values.firstWhere(
+          (m) => m.name == modeStr,
+          orElse: () => DatabaseMode.standard,
+        );
 
-      final tables = DatabaseSerializer.decodeTables(
-        json['tables'] as Map<String, dynamic>? ?? {},
-      );
+        final tables = DatabaseSerializer.decodeTables(
+          json['tables'] as Map<String, dynamic>? ?? {},
+        );
 
-      return DatabaseSnapshot(name: name, mode: mode, tables: tables);
+        return DatabaseSnapshot(name: name, mode: mode, tables: tables);
+      } catch (e) {
+        throw StateError(
+          'Cannot load database "$name" from IndexedDB: it is corrupt ($e). '
+          'The stored snapshot was left untouched; delete it to start with '
+          'an empty database.',
+        );
+      }
     } finally {
       db.close();
     }

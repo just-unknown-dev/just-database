@@ -35,6 +35,17 @@ class IndexMetadata {
     lastUsedAt = DateTime.now();
   }
 
+  /// Returns an independent copy, including the usage statistics.
+  IndexMetadata copy() => IndexMetadata(
+    name: name,
+    columns: List.of(columns),
+    type: type,
+    unique: unique,
+    createdAt: createdAt,
+    usageCount: usageCount,
+    lastUsedAt: lastUsedAt,
+  );
+
   Map<String, dynamic> toJson() => {
     'name': name,
     'columns': columns,
@@ -102,6 +113,18 @@ class TableIndex {
          type: type,
          unique: unique,
        );
+
+  TableIndex._copyOf(TableIndex other)
+    : columns = other.columns,
+      metadata = other.metadata.copy() {
+    for (final entry in other._buckets.entries) {
+      _buckets[entry.key] = List.of(entry.value);
+    }
+  }
+
+  /// Returns an independent copy of this index — same definition, metadata
+  /// and contents. Used when a table is snapshotted or restored.
+  TableIndex copy() => TableIndex._copyOf(this);
 
   /// Legacy getter for backward compatibility with single-column indexes.
   String get columnName => columns.first;

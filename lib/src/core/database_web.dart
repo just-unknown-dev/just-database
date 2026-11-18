@@ -12,6 +12,7 @@ import '../web/worker_client_stub.dart'
 import '../web/idb_persistence.dart' as idb;
 import '../web/opfs_support.dart';
 import 'database_mode.dart';
+import 'migration.dart';
 
 /// The storage backend selected for this web database instance.
 enum WebStorageBackend {
@@ -135,6 +136,14 @@ class JustDatabase {
   QueryTracker? _queryTracker;
   Executor? _executor;
 
+  // IndexedDB saves run one at a time, in order. Writes made while a save
+  // waits to start share that save, which snapshots the tables when it
+  // starts, so the newest state is always written last. See [_scheduleSave].
+  Future<void> _saveTail = Future<void>.value();
+  Future<void>? _queuedSave;
+  int _changes = 0; // successful writes so far
+  int _savedChanges = 0; // writes covered by the last successful save
+
   bool _isOpen = false;
 
   /// Optional callback invoked when a database opened with `persist: true`
@@ -164,6 +173,10 @@ class JustDatabase {
   /// - OPFS with Web Worker if available
   /// - IndexedDB if OPFS is unavailable
   /// - In-memory if neither is available
+  ///
+  /// With IndexedDB, throws a [StateError] if a stored snapshot exists but
+  /// cannot be decoded. It is left untouched rather than replaced by an empty
+  /// database.
   static Future<JustDatabase> open(
     String name, {
     DatabaseMode mode = DatabaseMode.standard,
@@ -251,8 +264,12 @@ class JustDatabase {
           _tables[entry.key.toLowerCase()] = entry.value;
         }
       }
+    } on StateError {
+      // A stored snapshot that cannot be decoded. Starting empty would let
+      // the next save overwrite it, so tell the caller.
+      rethrow;
     } catch (_) {
-      // Start fresh on error
+      // IndexedDB itself failed → start fresh.
     }
     _isOpen = true;
   }
@@ -349,8 +366,26 @@ class JustDatabase {
     }
   }
 
+  /// Waits until every write made so far is saved.
+  ///
+  /// With IndexedDB, [execute] returns before its change is saved: saves run
+  /// in the background, one at a time. Await this after critical writes. It
+  /// throws if the save fails, whereas background saves fail silently.
+  /// Completes at once in OPFS worker mode (the worker logs each statement to
+  /// its WAL before replying), in memory, or when nothing is unsaved.
+  Future<void> flush() async {
+    _ensureOpen();
+    if (!persist || storageBackend != WebStorageBackend.indexedDb) return;
+    await _saveTail;
+    if (_savedChanges < _changes) await _scheduleSave();
+  }
+
+  /// Closes the database. With IndexedDB, waits for pending saves and saves
+  /// the final state first. Save errors are not thrown here; call [flush]
+  /// before closing to observe them.
   Future<void> close() async {
     _ensureOpen();
+    _isOpen = false;
     if (_worker != null) {
       await _worker!.close();
       _worker!.dispose();
@@ -360,7 +395,52 @@ class JustDatabase {
         await _saveToIdb();
       }
     }
-    _isOpen = false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Schema migrations
+  // ---------------------------------------------------------------------------
+
+  /// Returns a [MigrationRunner] that applies [migrations] to this database.
+  ///
+  /// Migrations run straight on the SQL engine, so run them before the rest
+  /// of the app uses the database (e.g. right after [open]). With the
+  /// IndexedDB backend, every runner operation saves before it returns.
+  ///
+  /// Throws [UnsupportedError] when [storageBackend] is
+  /// [WebStorageBackend.opfsWorker]: the SQL engine then lives in the worker,
+  /// and migrations cannot be sent to it yet.
+  MigrationRunner migrationRunner(List<Migration> migrations) {
+    _ensureOpen();
+    if (_executor == null) {
+      throw UnsupportedError(
+        'Migrations are not supported in OPFS worker mode yet.',
+      );
+    }
+    return MigrationRunner(
+      executor: _executor!,
+      migrations: migrations,
+      guard: _guardMigration,
+    );
+  }
+
+  /// Applies every pending migration in [migrations], up to [targetVersion]
+  /// if given. Shorthand for `migrationRunner(migrations).migrate()`.
+  Future<List<MigrationResult>> migrate(
+    List<Migration> migrations, {
+    int? targetVersion,
+  }) => migrationRunner(migrations).migrate(targetVersion: targetVersion);
+
+  Future<T> _guardMigration<T>(Future<T> Function() operation) async {
+    _ensureOpen();
+    try {
+      return await operation();
+    } finally {
+      if (persist && storageBackend == WebStorageBackend.indexedDb) {
+        _changes++;
+        await _saveToIdb();
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -512,10 +592,12 @@ class JustDatabase {
         if (persist &&
             result.success &&
             storageBackend == WebStorageBackend.indexedDb) {
-          // Best-effort persistence: query returns before IndexedDB write
-          // completes. A page crash in this window loses at most one write.
-          // OPFS-worker mode is unaffected — WAL durability is handled there.
-          unawaited(_saveToIdb());
+          // The statement returns before its save lands; a page crash in
+          // that window loses the unsaved writes. Await flush() for
+          // durability. OPFS-worker mode is unaffected — WAL durability is
+          // handled there.
+          _changes++;
+          unawaited(_scheduleSave());
         }
         return result;
       } finally {
@@ -531,9 +613,33 @@ class JustDatabase {
     }
   }
 
+  /// Queues an IndexedDB save of the tables after the saves already queued,
+  /// and returns it. Fails if the save does.
+  ///
+  /// At most one save waits to start: callers share it until it starts. It
+  /// snapshots the tables as it starts, so it includes every write made while
+  /// it waited, and a write made after it started queues the next save.
+  Future<void> _scheduleSave() {
+    final queued = _queuedSave;
+    if (queued != null) return queued;
+    final save = _saveTail.then((_) async {
+      _queuedSave = null;
+      final changes = _changes;
+      // Takes its snapshot synchronously, before its first await.
+      await idb.IdbPersistenceManager.save(name, _tables, mode);
+      _savedChanges = changes;
+    });
+    _queuedSave = save;
+    // Keeps the chain going past a failed save; this also marks the failure
+    // as handled, so un-awaited saves never report it as uncaught.
+    _saveTail = save.then<void>((_) {}, onError: (Object _) {});
+    return save;
+  }
+
+  /// Saves after any pending saves, ignoring failures (see [flush]).
   Future<void> _saveToIdb() async {
     try {
-      await idb.IdbPersistenceManager.save(name, _tables, mode);
+      await _scheduleSave();
     } catch (_) {
       // Ignore IDB persistence errors silently
     }

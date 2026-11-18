@@ -326,7 +326,7 @@ export 'persistence_native.dart'
 
 Full implementation for Android, iOS, macOS, Linux, Windows:
 
-- **Storage format** — JSON-serialised `DatabaseSnapshot` containing table schemas and row data. Written to `<app_documents>/<name>.jdb`.
+- **Storage format** — JSON-serialised `DatabaseSnapshot` containing table schemas and row data. Written to `<app_documents>/just_database/<name>.jdb` through a uniquely named `.tmp` file and a rename, so the file always holds a complete snapshot.
 - **Encryption** — When `DatabaseMode.secure` is used, the JSON bytes are AES-256-GCM encrypted before writing. The IV is prepended to the ciphertext and stored together.
 - **API** — `save(snapshot, name, key)`, `load(name, key)`, `delete(name)`, `listPersistedNames()`, `getFileSize(name)`, `peekMode(name)`.
 
@@ -547,19 +547,28 @@ The concurrency model is selected once at `JustDatabase.open` time and cannot be
 ## Persistence & Encryption
 
 ```
-JustDatabase.close()
+successful write / migration step / flush() / close()
       │
+      ▼
+JustDatabase save queue — one save at a time per database; writes made
+      │                   while a save waits share it (it snapshots on start)
       ▼
 PersistenceManager.save(snapshot, name, encryptionKey)
       │
-      ├── serialize to DatabaseSnapshot JSON
+      ├── serialize to DatabaseSnapshot JSON (synchronously, at call time)
       │
       ├── [secure mode] AES-256-GCM encrypt
       │     key  → supplied at open() / auto-managed by SecureKeyManager
-      │     IV   → 16 random bytes prepended to ciphertext
+      │     IV   → 12 random bytes prepended to ciphertext
       │
-      └── write to <app_documents>/<name>.jdb
+      ├── wait for earlier save/load/peekMode/delete calls on <name>
+      │
+      └── write <name>.jdb.<pid>-<µs>-<n>.tmp (flushed), rename over
+          <app_documents>/just_database/<name>.jdb
 ```
+
+Writes return before their save lands; `flush()` waits for it and throws if
+it fails, while `close()` waits for pending saves but ignores failures.
 
 On load (`JustDatabase.open` with `persist: true`):
 
@@ -571,6 +580,10 @@ PersistenceManager.load(name, encryptionKey)
       ├── JSON-decode → DatabaseSnapshot
       └── reconstruct Table objects + re-instantiate indices
 ```
+
+If the file exists but cannot be read, decrypted or decoded, `load` throws a
+`StateError` and `open` passes it on, leaving the file untouched. Starting
+empty instead would let the next save overwrite it.
 
 **Key management** for `DatabaseMode.secure`:
 
@@ -648,9 +661,10 @@ Persistence is deferred while a transaction is active; `close()` or an explicit 
 
 1. Ensures a `_migrations` meta-table exists.
 2. Skips any migration whose version is already recorded in `_migrations`.
-3. Optionally validates a `checksum` field (SHA-256 of the SQL) to detect tampering.
-4. Executes `up(executor)` inside a transaction; records the migration on success.
-5. Returns a `List<MigrationResult>` with per-step status (`applied`, `skipped`, `failed`).
+3. Executes `up(executor)` and records the version, name and `checksum` (SHA-256 of the SQL for `SqlMigration`) on success. Migrations are not wrapped in a transaction, and checksums are recorded but not validated.
+4. Stops at the first failure and returns a `List<MigrationResult>` with per-step status (`applied`, `skipped`, `failed`).
+
+`JustDatabase.migrationRunner(migrations)` builds a runner over the database's own `Executor` with a guard that saves persistent databases after every operation; `JustDatabase.migrate(migrations)` is the shorthand for applying them.
 
 ---
 

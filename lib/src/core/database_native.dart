@@ -9,6 +9,7 @@ import '../sql/parser.dart';
 import '../concurrency/lock_manager.dart';
 import '../benchmark/benchmark.dart';
 import 'database_mode.dart';
+import 'migration.dart';
 
 /// Fluent query builder for convenience wrapping of SQL operations.
 class QueryBuilder {
@@ -110,6 +111,21 @@ class JustDatabase {
   late final Executor _executor;
   bool _isOpen = false;
 
+  // Saves run one at a time, in order. Writes made while a save waits to
+  // start share that save, which snapshots the tables when it starts, so the
+  // newest state is always written last. See [_scheduleSave].
+  Future<void> _saveTail = Future<void>.value();
+  Future<void>? _queuedSave;
+  int _changes = 0; // successful writes so far
+  int _savedChanges = 0; // writes covered by the last successful save
+
+  /// Callback invoked on web when a database opened with `persist: true`
+  /// falls back to in-memory storage.
+  ///
+  /// Native platforms always have durable storage, so this is never called
+  /// here. It exists so cross-platform code that sets it compiles everywhere.
+  static void Function(String dbName, String reason)? onStorageDowngrade;
+
   JustDatabase._({
     required this.name,
     required this.mode,
@@ -119,6 +135,11 @@ class JustDatabase {
 
   /// Opens or creates a database.
   /// If [persist] is true and a file exists on disk, loads tables from disk.
+  ///
+  /// Throws a [StateError] if that file exists but cannot be read, decrypted
+  /// (wrong [encryptionKey], or a secure database opened without one) or
+  /// decoded. The file is left untouched rather than replaced by an empty
+  /// database; restore, move or delete it to recover.
   static Future<JustDatabase> open(
     String name, {
     DatabaseMode mode = DatabaseMode.standard,
@@ -154,10 +175,12 @@ class JustDatabase {
       try {
         await db._loadFromDisk();
       } on StateError {
-        // Wrong encryption key or corrupted file — propagate so the caller knows.
+        // The file exists but cannot be read, decrypted or decoded. Starting
+        // empty would let the next save overwrite it, so tell the caller.
         rethrow;
       } catch (_) {
-        // Other load errors (file missing, JSON parse) → start fresh.
+        // No usable documents directory (e.g. path_provider unavailable) →
+        // start fresh. Saves fail the same way, so nothing is overwritten.
       }
     }
     db._isOpen = true;
@@ -239,10 +262,73 @@ class JustDatabase {
     }
   }
 
+  /// Waits until every write made so far is saved to disk.
+  ///
+  /// [execute] returns before its change is saved: saves run in the
+  /// background, one at a time. Await this after critical writes. It throws
+  /// if the save fails, whereas background saves fail silently.
+  /// Completes at once when nothing is unsaved or [persist] is false.
+  Future<void> flush() async {
+    _ensureOpen();
+    if (!persist) return;
+    await _saveTail;
+    if (_savedChanges < _changes) await _scheduleSave();
+  }
+
+  /// Closes the database. With [persist], waits for pending saves and saves
+  /// the final state first. Save errors are not thrown here; call [flush]
+  /// before closing to observe them.
   Future<void> close() async {
     _ensureOpen();
-    if (persist) await _saveToDisk();
     _isOpen = false;
+    if (persist) await _saveToDisk();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Schema migrations
+  // ---------------------------------------------------------------------------
+
+  /// Returns a [MigrationRunner] that applies [migrations] to this database.
+  ///
+  /// Migrations run straight on the SQL engine, so run them before the rest
+  /// of the app uses the database (e.g. right after [open]). For persistent
+  /// databases, every runner operation saves to disk before it returns.
+  ///
+  /// ```dart
+  /// final runner = db.migrationRunner(migrations);
+  /// await runner.migrate();
+  /// await runner.rollback(targetVersion: 1);
+  /// final status = await runner.status();
+  /// ```
+  MigrationRunner migrationRunner(List<Migration> migrations) {
+    _ensureOpen();
+    return MigrationRunner(
+      executor: _executor,
+      migrations: migrations,
+      guard: _guardMigration,
+    );
+  }
+
+  /// Applies every pending migration in [migrations], up to [targetVersion]
+  /// if given. Shorthand for `migrationRunner(migrations).migrate()`.
+  ///
+  /// Applied versions are recorded in the `_migrations` table, so calling
+  /// this on every app start only runs the new ones.
+  Future<List<MigrationResult>> migrate(
+    List<Migration> migrations, {
+    int? targetVersion,
+  }) => migrationRunner(migrations).migrate(targetVersion: targetVersion);
+
+  Future<T> _guardMigration<T>(Future<T> Function() operation) async {
+    _ensureOpen();
+    try {
+      return await operation();
+    } finally {
+      if (persist) {
+        _changes++;
+        await _saveToDisk();
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -274,6 +360,28 @@ class JustDatabase {
       _tables.values.fold(0, (s, t) => s + t.estimatedSizeBytes);
 
   bool get isOpen => _isOpen;
+
+  // ---------------------------------------------------------------------------
+  // Async introspection — same API as on web, where the OPFS worker backend
+  // can only answer asynchronously. On native these complete immediately
+  // with the sync getters' values.
+  // ---------------------------------------------------------------------------
+
+  Future<List<String>> tableNamesAsync() => Future.value(tableNames);
+
+  Future<List<String>> viewNamesAsync() => Future.value(viewNames);
+
+  Future<List<String>> triggerNamesAsync() => Future.value(triggerNames);
+
+  Future<List<String>> indexNamesForTableAsync(String tableName) =>
+      Future.value(indexNamesForTable(tableName));
+
+  Future<TableSchema?> getTableSchemaAsync(String name) =>
+      Future.value(getTableSchema(name));
+
+  Future<int> totalRowsAsync() => Future.value(totalRows);
+
+  Future<int> estimatedSizeBytesAsync() => Future.value(estimatedSizeBytes);
 
   // ---------------------------------------------------------------------------
   // Benchmarking
@@ -332,11 +440,10 @@ class JustDatabase {
       try {
         final result = await _executor.execute(stmt);
         if (persist && result.success) {
-          // Best-effort, fire-and-forget persistence: the query returns before
-          // the write reaches disk. A crash in this window loses at most one
-          // committed write. For strict durability use DatabaseMode.standard
-          // and await db.flush() after critical operations (not yet exposed).
-          unawaited(_saveToDisk());
+          // The statement returns before its save lands; a crash in that
+          // window loses the unsaved writes. Await flush() for durability.
+          _changes++;
+          unawaited(_scheduleSave());
         }
         return result;
       } finally {
@@ -364,14 +471,38 @@ class JustDatabase {
     }
   }
 
-  Future<void> _saveToDisk() async {
-    try {
+  /// Queues a save of the tables after the saves already queued, and returns
+  /// it. Fails if the save does.
+  ///
+  /// At most one save waits to start: callers share it until it starts. It
+  /// snapshots the tables as it starts, so it includes every write made while
+  /// it waited, and a write made after it started queues the next save.
+  Future<void> _scheduleSave() {
+    final queued = _queuedSave;
+    if (queued != null) return queued;
+    final save = _saveTail.then((_) async {
+      _queuedSave = null;
+      final changes = _changes;
+      // Takes its snapshot synchronously, before its first await.
       await PersistenceManager.save(
         name,
         _tables,
         mode,
         encryptionKey: encryptionKey,
       );
+      _savedChanges = changes;
+    });
+    _queuedSave = save;
+    // Keeps the chain going past a failed save; this also marks the failure
+    // as handled, so un-awaited saves never report it as uncaught.
+    _saveTail = save.then<void>((_) {}, onError: (Object _) {});
+    return save;
+  }
+
+  /// Saves after any pending saves, ignoring failures (see [flush]).
+  Future<void> _saveToDisk() async {
+    try {
+      await _scheduleSave();
     } catch (_) {
       // Ignore persistence errors silently
     }
