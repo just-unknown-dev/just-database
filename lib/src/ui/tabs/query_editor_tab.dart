@@ -1,129 +1,221 @@
+import 'dart:math' as math;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:just_signals/just_signals.dart';
-import 'package:just_database/just_database.dart';
+
+import '../../core/query_result.dart';
+import '../admin_utils.dart';
+import '../database_provider.dart';
+import '../widgets/admin_widgets.dart';
+import '../widgets/result_grid.dart';
 
 const List<String> _exampleQueries = [
-  'SELECT * FROM users',
+  'SELECT * FROM users LIMIT 100',
   'SELECT * FROM users WHERE age > 25 ORDER BY name',
-  'SELECT * FROM products WHERE category = \'Electronics\' ORDER BY price DESC',
-  'SELECT * FROM orders WHERE status = \'delivered\'',
-  'SELECT u.name, COUNT(o.id) AS order_count FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id ORDER BY order_count DESC',
-  'SELECT category, COUNT(*) AS count, AVG(price) AS avg_price, MIN(price) AS min_price, MAX(price) AS max_price FROM products GROUP BY category',
-  'SELECT o.id, u.name, o.total, o.status FROM orders o INNER JOIN users u ON o.user_id = u.id ORDER BY o.id',
-  'SELECT p.name, SUM(oi.quantity) AS units_sold FROM products p INNER JOIN order_items oi ON p.id = oi.product_id GROUP BY p.id ORDER BY units_sold DESC',
-  'SELECT * FROM users WHERE active = true AND age BETWEEN 25 AND 40',
-  'SELECT * FROM products WHERE name LIKE \'%Pro%\'',
+  'SELECT category, COUNT(*) AS count, AVG(price) AS avg_price FROM products GROUP BY category',
+  'SELECT u.name, COUNT(o.id) AS orders FROM users u LEFT JOIN orders o ON o.user_id = u.id GROUP BY u.id ORDER BY orders DESC',
+  "SELECT * FROM products WHERE name LIKE '%Pro%'",
+  'CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL, created_at DATETIME DEFAULT CURRENT_TIMESTAMP)',
+  "INSERT INTO notes (body) VALUES ('Hello'), ('World')",
+  "UPDATE notes SET body = body || '!' WHERE id = 1",
+  'DELETE FROM notes WHERE id = 2',
+  "BEGIN; INSERT INTO notes (body) VALUES ('a'); INSERT INTO notes (body) VALUES ('b'); COMMIT;",
 ];
 
+/// Runs SQL on the selected database and shows the result a page at a
+/// time.
 class QueryEditorTab extends StatefulWidget {
-  final DatabaseProvider provider;
-
+  /// Creates the tab.
   const QueryEditorTab({super.key, required this.provider});
+
+  /// The admin state.
+  final DatabaseProvider provider;
 
   @override
   State<QueryEditorTab> createState() => _QueryEditorTabState();
 }
 
+enum _Panel { results, history, examples }
+
 class _QueryEditorTabState extends State<QueryEditorTab> {
-  final TextEditingController _sqlController = TextEditingController();
-  bool _showHistory = false;
-  bool _showExamples = false;
+  final TextEditingController _sql = TextEditingController();
+  _Panel _panel = _Panel.results;
+  QueryResult? _shown;
+  int _offset = 0;
+  int _pageSize = 100;
 
   @override
   void dispose() {
-    _sqlController.dispose();
+    _sql.dispose();
     super.dispose();
   }
 
-  void _runQuery() {
-    if (widget.provider.isLoading) return;
-    setState(() {
-      _showHistory = false;
-      _showExamples = false;
-    });
-    widget.provider.runQuery(_sqlController.text);
+  Future<void> _run() async {
+    final provider = widget.provider;
+    if (provider.isLoading) return;
+    setState(() => _panel = _Panel.results);
+    await provider.runQuery(_sql.text);
+  }
+
+  void _pick(String sql) {
+    _sql.text = sql;
+    setState(() => _panel = _Panel.results);
   }
 
   @override
   Widget build(BuildContext context) {
     return SignalBuilder<int>(
       signal: widget.provider.revision,
-      builder: (context, value, child) => Column(
+      builder: (context, _, _) {
+        final provider = widget.provider;
+        final result = provider.lastQueryResult;
+        if (!identical(result, _shown)) {
+          _shown = result;
+          _offset = 0;
+        }
+        final db = provider.currentDatabase;
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (db == null)
+              const MessageBanner(
+                message: 'No database selected. Open one on the Databases tab.',
+                margin: EdgeInsets.fromLTRB(8, 8, 8, 0),
+              ),
+            _SqlInput(controller: _sql, onRun: _run),
+            _ActionBar(
+              running: provider.isLoading,
+              canRun: db != null,
+              panel: _panel,
+              onRun: _run,
+              onClear: () {
+                _sql.clear();
+                provider.clearQueryResult();
+              },
+              onPanel: (p) =>
+                  setState(() => _panel = _panel == p ? _Panel.results : p),
+            ),
+            if (provider.lastQueryError != null)
+              MessageBanner(
+                key: const ValueKey('jdb-query-error'),
+                message: provider.lastQueryError!,
+                tone: BannerTone.error,
+                margin: const EdgeInsets.fromLTRB(8, 0, 8, 8),
+              ),
+            if (db != null && db.inTransaction)
+              const MessageBanner(
+                message:
+                    'A transaction is open: its changes are saved after '
+                    'COMMIT (or undone by ROLLBACK).',
+                margin: EdgeInsets.fromLTRB(8, 0, 8, 8),
+              ),
+            Expanded(
+              child: switch (_panel) {
+                _Panel.history => _SqlList(
+                  items: provider.queryHistory,
+                  icon: Icons.history,
+                  empty: 'No statements run yet.',
+                  onSelect: _pick,
+                ),
+                _Panel.examples => _SqlList(
+                  items: _exampleQueries,
+                  icon: Icons.lightbulb_outline,
+                  empty: '',
+                  onSelect: _pick,
+                ),
+                _Panel.results => _results(context, provider),
+              },
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _results(BuildContext context, DatabaseProvider provider) {
+    final cs = Theme.of(context).colorScheme;
+    final qr = provider.lastQueryResult;
+    if (qr == null) {
+      return const EmptyState(
+        icon: Icons.table_view,
+        title: 'Run a statement to see its result',
+        message:
+            'Ctrl+Enter (Shift+Enter on Android) runs it. Several '
+            'statements separated by ";" run as a script.',
+      );
+    }
+    if (!qr.success) return const SizedBox.shrink();
+    final scriptNote = provider.lastStatementCount > 1
+        ? 'Ran ${provider.lastStatementCount} statements; the last one returned this.'
+        : null;
+    if (qr.columns.isEmpty) {
+      return EmptyState(
+        icon: Icons.check_circle_outline,
+        title: '${qr.affectedRows} row(s) affected.',
+        message: [
+          if (qr.lastInsertRowId != null)
+            'Last inserted rowid: ${qr.lastInsertRowId}.',
+          ?scriptNote,
+        ].join('\n'),
+      );
+    }
+    final total = qr.values.length;
+    final start = math.min(_offset, total);
+    final end = math.min(start + _pageSize, total);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-          // SQL input area
-          _SqlInputArea(controller: _sqlController, onRun: _runQuery),
-
-          // Action bar
-          _ActionBar(
-            onRun: _runQuery,
-            onClear: () => _sqlController.clear(),
-            onToggleHistory: () => setState(() {
-              _showHistory = !_showHistory;
-              _showExamples = false;
-            }),
-            onToggleExamples: () => setState(() {
-              _showExamples = !_showExamples;
-              _showHistory = false;
-            }),
-            isLoading: widget.provider.isLoading,
-            showHistory: _showHistory,
-            showExamples: _showExamples,
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 4),
+          child: Text(
+            [plural(total, 'row'), ?scriptNote].join(' · '),
+            style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
           ),
-
-          // Error banner
-          if (widget.provider.lastError != null)
-            _ErrorBanner(message: widget.provider.lastError!),
-
-          // Results / History / Examples
-          Expanded(
-            child: _showHistory
-                ? _HistoryPanel(
-                    history: widget.provider.queryHistory,
-                    onSelect: (sql) {
-                      _sqlController.text = sql;
-                      setState(() => _showHistory = false);
-                    },
-                  )
-                : _showExamples
-                ? _ExamplesPanel(
-                    onSelect: (sql) {
-                      _sqlController.text = sql;
-                      setState(() => _showExamples = false);
-                    },
-                  )
-                : SizedBox(
-                    width: double.infinity,
-                    child: _ResultsPanel(
-                      result: widget.provider.lastQueryResult,
-                    ),
-                  ),
+        ),
+        Expanded(
+          child: ResultGrid(
+            columns: qr.columns,
+            rows: qr.values.sublist(start, end),
           ),
-        ],
-      ),
+        ),
+        PageBar(
+          offset: start,
+          pageSize: _pageSize,
+          total: total,
+          pageSizes: const [50, 100, 250, 1000],
+          onOffsetChanged: (o) => setState(() => _offset = o),
+          onPageSizeChanged: (s) => setState(() {
+            _pageSize = s;
+            _offset = (_offset ~/ s) * s;
+          }),
+        ),
+      ],
     );
   }
 }
 
-class _SqlInputArea extends StatefulWidget {
+class _SqlInput extends StatefulWidget {
+  const _SqlInput({required this.controller, required this.onRun});
+
   final TextEditingController controller;
   final VoidCallback onRun;
-  const _SqlInputArea({required this.controller, required this.onRun});
 
   @override
-  State<_SqlInputArea> createState() => _SqlInputAreaState();
+  State<_SqlInput> createState() => _SqlInputState();
 }
 
-class _SqlInputAreaState extends State<_SqlInputArea> {
+class _SqlInputState extends State<_SqlInput> {
   late final FocusNode _focusNode = FocusNode(
     onKeyEvent: (_, event) {
       if (event is! KeyDownEvent) return KeyEventResult.ignored;
       final isAndroid = defaultTargetPlatform == TargetPlatform.android;
-      final modifierHeld = isAndroid
+      final modifier = isAndroid
           ? HardwareKeyboard.instance.isShiftPressed
-          : HardwareKeyboard.instance.isControlPressed;
-      if (modifierHeld && event.logicalKey == LogicalKeyboardKey.enter) {
+          : (HardwareKeyboard.instance.isControlPressed ||
+                HardwareKeyboard.instance.isMetaPressed);
+      if (modifier && event.logicalKey == LogicalKeyboardKey.enter) {
         widget.onRun();
         return KeyEventResult.handled;
       }
@@ -139,25 +231,30 @@ class _SqlInputAreaState extends State<_SqlInputArea> {
 
   @override
   Widget build(BuildContext context) {
-    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final cs = Theme.of(context).colorScheme;
     return Container(
-      constraints: const BoxConstraints(minHeight: 100, maxHeight: 180),
-      color: isDark ? const Color(0xFF1E1E1E) : const Color(0xFF2D2D2D),
-      padding: const EdgeInsets.all(12),
+      margin: const EdgeInsets.fromLTRB(8, 8, 8, 0),
+      constraints: const BoxConstraints(minHeight: 96, maxHeight: 180),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       child: TextField(
+        key: const ValueKey('jdb-sql'),
         controller: widget.controller,
         focusNode: _focusNode,
         maxLines: null,
         expands: true,
-        style: const TextStyle(
+        style: TextStyle(
           fontFamily: 'monospace',
-          color: Colors.white,
           fontSize: 13,
           height: 1.5,
+          color: cs.onSurface,
         ),
-        decoration: const InputDecoration(
-          hintText: 'Enter SQL here...',
-          hintStyle: TextStyle(color: Colors.grey),
+        decoration: InputDecoration(
+          hintText: 'Enter SQL here…',
+          hintStyle: TextStyle(color: cs.onSurfaceVariant),
           border: InputBorder.none,
           isDense: true,
         ),
@@ -169,44 +266,41 @@ class _SqlInputAreaState extends State<_SqlInputArea> {
 }
 
 class _ActionBar extends StatelessWidget {
-  final VoidCallback onRun;
-  final VoidCallback onClear;
-  final VoidCallback onToggleHistory;
-  final VoidCallback onToggleExamples;
-  final bool isLoading;
-  final bool showHistory;
-  final bool showExamples;
-
   const _ActionBar({
+    required this.running,
+    required this.canRun,
+    required this.panel,
     required this.onRun,
     required this.onClear,
-    required this.onToggleHistory,
-    required this.onToggleExamples,
-    required this.isLoading,
-    required this.showHistory,
-    required this.showExamples,
+    required this.onPanel,
   });
+
+  final bool running;
+  final bool canRun;
+  final _Panel panel;
+  final VoidCallback onRun;
+  final VoidCallback onClear;
+  final ValueChanged<_Panel> onPanel;
 
   @override
   Widget build(BuildContext context) {
+    final shortcut = defaultTargetPlatform == TargetPlatform.android
+        ? 'Shift+Enter'
+        : 'Ctrl+Enter';
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
       child: Row(
         children: [
           Tooltip(
-            message: defaultTargetPlatform == TargetPlatform.android
-                ? 'Shift+Enter'
-                : 'Ctrl+Enter',
+            message: shortcut,
             child: FilledButton.icon(
-              onPressed: isLoading ? null : onRun,
-              icon: isLoading
+              key: const ValueKey('jdb-run'),
+              onPressed: running || !canRun ? null : onRun,
+              icon: running
                   ? const SizedBox(
                       width: 14,
                       height: 14,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        color: Colors.white,
-                      ),
+                      child: CircularProgressIndicator(strokeWidth: 2),
                     )
                   : const Icon(Icons.play_arrow, size: 18),
               label: const Text('Run'),
@@ -215,35 +309,18 @@ class _ActionBar extends StatelessWidget {
           const SizedBox(width: 8),
           OutlinedButton(onPressed: onClear, child: const Text('Clear')),
           const Spacer(),
-          ToggleButtons(
-            isSelected: [showHistory, showExamples],
-            onPressed: (i) {
-              if (i == 0) onToggleHistory();
-              if (i == 1) onToggleExamples();
-            },
-            borderRadius: BorderRadius.circular(8),
-            children: const [
-              Padding(
-                padding: EdgeInsets.symmetric(horizontal: 10),
-                child: Row(
-                  children: [
-                    Icon(Icons.history, size: 16),
-                    SizedBox(width: 4),
-                    Text('History'),
-                  ],
-                ),
-              ),
-              Padding(
-                padding: EdgeInsets.symmetric(horizontal: 10),
-                child: Row(
-                  children: [
-                    Icon(Icons.lightbulb, size: 16),
-                    SizedBox(width: 4),
-                    Text('Examples'),
-                  ],
-                ),
-              ),
-            ],
+          IconButton(
+            tooltip: 'History',
+            isSelected: panel == _Panel.history,
+            icon: const Icon(Icons.history),
+            onPressed: () => onPanel(_Panel.history),
+          ),
+          IconButton(
+            tooltip: 'Examples',
+            isSelected: panel == _Panel.examples,
+            icon: const Icon(Icons.lightbulb_outline),
+            selectedIcon: const Icon(Icons.lightbulb),
+            onPressed: () => onPanel(_Panel.examples),
           ),
         ],
       ),
@@ -251,216 +328,37 @@ class _ActionBar extends StatelessWidget {
   }
 }
 
-class _ErrorBanner extends StatelessWidget {
-  final String message;
-  const _ErrorBanner({required this.message});
+class _SqlList extends StatelessWidget {
+  const _SqlList({
+    required this.items,
+    required this.icon,
+    required this.empty,
+    required this.onSelect,
+  });
+
+  final List<String> items;
+  final IconData icon;
+  final String empty;
+  final ValueChanged<String> onSelect;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      color: Theme.of(context).colorScheme.errorContainer,
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(
-            Icons.error_outline,
-            size: 16,
-            color: Theme.of(context).colorScheme.onErrorContainer,
-          ),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              message,
-              style: TextStyle(
-                fontSize: 12,
-                color: Theme.of(context).colorScheme.onErrorContainer,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ResultsPanel extends StatelessWidget {
-  final QueryResult? result;
-  const _ResultsPanel({required this.result});
-
-  @override
-  Widget build(BuildContext context) {
-    if (result == null) {
-      return const Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.table_view, size: 48, color: Colors.grey),
-            SizedBox(height: 8),
-            Text(
-              'Run a query to see results.',
-              style: TextStyle(color: Colors.grey),
-            ),
-          ],
-        ),
-      );
-    }
-    final qr = result!;
-    if (!qr.success) return const SizedBox.shrink();
-
-    if (qr.columns.isEmpty) {
-      return const Center(
-        child: Text(
-          'Query returned no columns.',
-          style: TextStyle(color: Colors.grey),
-        ),
-      );
-    }
-
-    if (qr.rows.isEmpty && qr.affectedRows == 0) {
-      return const Center(
-        child: Text(
-          'Query returned no rows.',
-          style: TextStyle(color: Colors.grey),
-        ),
-      );
-    }
-
-    if (qr.rows.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const Icon(Icons.check_circle, color: Colors.green, size: 40),
-            const SizedBox(height: 8),
-            Text('${qr.affectedRows} row(s) affected.'),
-          ],
-        ),
-      );
-    }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-          child: Text(
-            '${qr.rows.length} row${qr.rows.length != 1 ? 's' : ''}',
-            style: const TextStyle(fontSize: 12, color: Colors.grey),
-          ),
-        ),
-        Expanded(
-          child: SizedBox(
-            width: double.infinity,
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: SingleChildScrollView(
-                child: DataTable(
-                  columnSpacing: 20,
-                  headingRowColor: WidgetStateProperty.all(
-                    Theme.of(context).colorScheme.surfaceContainerHighest,
-                  ),
-                  columns: qr.columns
-                      .map(
-                        (c) => DataColumn(
-                          label: Text(
-                            c,
-                            style: const TextStyle(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 12,
-                            ),
-                          ),
-                        ),
-                      )
-                      .toList(),
-                  rows: qr.rows
-                      .map(
-                        (row) => DataRow(
-                          cells: qr.columns
-                              .map(
-                                (c) => DataCell(
-                                  Text(
-                                    row[c]?.toString() ?? 'NULL',
-                                    style: TextStyle(
-                                      fontSize: 12,
-                                      color: row[c] == null
-                                          ? Colors.grey
-                                          : null,
-                                      fontStyle: row[c] == null
-                                          ? FontStyle.italic
-                                          : null,
-                                    ),
-                                  ),
-                                ),
-                              )
-                              .toList(),
-                        ),
-                      )
-                      .toList(),
-                ),
-              ),
-            ),
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _HistoryPanel extends StatelessWidget {
-  final List<String> history;
-  final void Function(String) onSelect;
-
-  const _HistoryPanel({required this.history, required this.onSelect});
-
-  @override
-  Widget build(BuildContext context) {
-    if (history.isEmpty) {
-      return const Center(
-        child: Text(
-          'No query history yet.',
-          style: TextStyle(color: Colors.grey),
-        ),
-      );
+    if (items.isEmpty) {
+      return EmptyState(icon: icon, title: empty);
     }
     return ListView.separated(
-      itemCount: history.length,
+      itemCount: items.length,
       separatorBuilder: (_, _) => const Divider(height: 1),
       itemBuilder: (_, i) => ListTile(
         dense: true,
-        leading: const Icon(Icons.history, size: 16),
+        leading: Icon(icon, size: 18),
         title: Text(
-          history[i],
+          items[i],
           maxLines: 2,
           overflow: TextOverflow.ellipsis,
           style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
         ),
-        onTap: () => onSelect(history[i]),
-      ),
-    );
-  }
-}
-
-class _ExamplesPanel extends StatelessWidget {
-  final void Function(String) onSelect;
-  const _ExamplesPanel({required this.onSelect});
-
-  @override
-  Widget build(BuildContext context) {
-    return ListView.separated(
-      itemCount: _exampleQueries.length,
-      separatorBuilder: (_, _) => const Divider(height: 1),
-      itemBuilder: (_, i) => ListTile(
-        dense: true,
-        leading: const Icon(Icons.lightbulb_outline, size: 16),
-        title: Text(
-          _exampleQueries[i],
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
-        ),
-        onTap: () => onSelect(_exampleQueries[i]),
+        onTap: () => onSelect(items[i]),
       ),
     );
   }

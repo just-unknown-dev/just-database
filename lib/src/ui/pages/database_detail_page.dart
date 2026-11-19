@@ -1,107 +1,458 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
-import 'package:just_signals/just_signals.dart';
-import 'package:just_database/just_database.dart';
 
-class DatabaseDetailPage extends StatelessWidget {
-  final DatabaseProvider provider;
-  final DatabaseInfo info;
+import '../../core/just_database.dart';
+import '../../core/query_result.dart';
+import '../../storage/schema.dart';
+import '../../storage/values.dart';
+import '../admin_utils.dart';
+import '../database_provider.dart';
+import '../widgets/admin_widgets.dart';
+import '../widgets/column_input.dart';
+import '../widgets/result_grid.dart';
+import 'insert_page.dart';
 
+/// Browses the rows of a database's tables a page at a time, and edits and
+/// deletes them.
+///
+/// Rows are addressed by their `rowid`, so tables without a primary key
+/// (even with identical rows) are edited and deleted one row at a time.
+class DatabaseDetailPage extends StatefulWidget {
+  /// Creates the page for [database].
   const DatabaseDetailPage({
     super.key,
-    required this.provider,
-    required this.info,
+    required this.database,
+    this.provider,
+    this.initialTable,
+    this.pageSize = 50,
   });
+
+  /// The database to browse.
+  final JustDatabase database;
+
+  /// Told about changes, so lists elsewhere stay current.
+  final DatabaseProvider? provider;
+
+  /// The table shown first; the first table when null.
+  final String? initialTable;
+
+  /// Rows per page at first.
+  final int pageSize;
+
+  @override
+  State<DatabaseDetailPage> createState() => _DatabaseDetailPageState();
+}
+
+class _DatabaseDetailPageState extends State<DatabaseDetailPage> {
+  String? _table;
+  late int _pageSize = widget.pageSize;
+  int _offset = 0;
+  int _total = 0;
+  QueryResult? _page;
+  String? _pageTable;
+  bool _loading = false;
+  String? _error;
+  int _loadToken = 0;
+  final Set<int> _selected = {};
+
+  JustDatabase get _db => widget.database;
+
+  @override
+  void initState() {
+    super.initState();
+    final tables = _tablesOrEmpty();
+    final initial = widget.initialTable;
+    _table = initial != null && tables.contains(initial)
+        ? initial
+        : (tables.isEmpty ? null : tables.first);
+    if (_table != null) unawaited(_load());
+  }
+
+  List<String> _tablesOrEmpty() => _db.isOpen ? _db.tableNames : const [];
+
+  TableSchema? get _schema =>
+      _table == null || !_db.isOpen ? null : _db.getTableSchema(_table!);
+
+  /// The visible columns of the current table, in `SELECT *` order.
+  List<ColumnDefinition> get _visibleColumns => [
+    for (final c in _schema?.columns ?? const <ColumnDefinition>[])
+      if (!c.hidden) c,
+  ];
+
+  Future<void> _load() async {
+    final table = _table;
+    if (table == null || !_db.isOpen) return;
+    final token = ++_loadToken;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final total = _db.rowCount(table);
+      var offset = _offset;
+      if (offset >= total) {
+        offset = total == 0 ? 0 : ((total - 1) ~/ _pageSize) * _pageSize;
+      }
+      // A table scan returns rows in rowid order, so pages are stable.
+      final result = await _db.query(
+        'SELECT rowid AS __rowid, * FROM ${quoteIdentifier(table)} LIMIT ? OFFSET ?',
+        [_pageSize, offset],
+      );
+      if (!mounted || token != _loadToken) return;
+      setState(() {
+        _loading = false;
+        if (result.success) {
+          _page = result;
+          _pageTable = table;
+          _total = total;
+          _offset = offset;
+          final onPage = {for (final r in result.values) r.first as int};
+          _selected.retainAll(onPage);
+        } else {
+          _error = result.errorMessage ?? 'The rows could not be read.';
+        }
+      });
+    } catch (e) {
+      if (!mounted || token != _loadToken) return;
+      setState(() {
+        _loading = false;
+        _error = describeError(e);
+      });
+    }
+  }
+
+  void _showTable(String table) {
+    if (table == _table) return;
+    setState(() {
+      _table = table;
+      _offset = 0;
+      _page = null;
+      _selected.clear();
+    });
+    unawaited(_load());
+  }
+
+  void _changed() {
+    unawaited(widget.provider?.refreshDatabases());
+    unawaited(_load());
+  }
+
+  // ---------------------------------------------------------------------------
+  // Actions
+  // ---------------------------------------------------------------------------
+
+  Future<void> _edit(int rowid, List<Object?> values) async {
+    final schema = _schema;
+    final table = _table;
+    if (schema == null || table == null) return;
+    final changed = await showDialog<bool>(
+      context: context,
+      builder: (_) => _EditRowDialog(
+        db: _db,
+        table: table,
+        schema: schema,
+        columns: _visibleColumns,
+        rowid: rowid,
+        values: values,
+      ),
+    );
+    if (!mounted) return;
+    if (changed == true) {
+      showAdminMessage(context, 'Row saved.');
+      _changed();
+    }
+  }
+
+  Future<bool> _confirm(String title, String message) async {
+    final result = await showDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        final cs = Theme.of(ctx).colorScheme;
+        return AlertDialog(
+          title: Text(title),
+          content: Text(message),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: cs.error,
+                foregroundColor: cs.onError,
+              ),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Delete'),
+            ),
+          ],
+        );
+      },
+    );
+    return result == true;
+  }
+
+  Future<void> _deleteRow(int rowid) async {
+    final table = _table;
+    if (table == null) return;
+    if (!await _confirm(
+      'Delete row?',
+      'Row $rowid of "$table" is removed for good.',
+    )) {
+      return;
+    }
+    try {
+      final r = await _db.execute(
+        'DELETE FROM ${quoteIdentifier(table)} WHERE rowid = ?',
+        [rowid],
+      );
+      if (!mounted) return;
+      if (!r.success) {
+        showAdminError(context, 'Delete failed: ${r.errorMessage}');
+      } else if (r.affectedRows != 1) {
+        showAdminError(
+          context,
+          'Expected to delete 1 row but ${r.affectedRows} were deleted. '
+          'The row may have been changed elsewhere; the page was reloaded.',
+        );
+      } else {
+        _selected.remove(rowid);
+        showAdminMessage(context, 'Row deleted.');
+      }
+    } catch (e) {
+      if (mounted) {
+        showAdminError(context, 'Delete failed: ${describeError(e)}');
+      }
+    }
+    if (mounted) _changed();
+  }
+
+  Future<void> _deleteSelected() async {
+    final table = _table;
+    if (table == null || _selected.isEmpty) return;
+    final rowids = List.of(_selected);
+    if (!await _confirm(
+      'Delete ${plural(rowids.length, 'row')}?',
+      'The selected ${plural(rowids.length, 'row')} of "$table" are removed for good.',
+    )) {
+      return;
+    }
+    try {
+      await _db.transaction((tx) async {
+        for (final rowid in rowids) {
+          final r = await tx.execute(
+            'DELETE FROM ${quoteIdentifier(table)} WHERE rowid = ?',
+            [rowid],
+          );
+          if (r.affectedRows != 1) {
+            throw StateError(
+              'row $rowid no longer exists; nothing was deleted',
+            );
+          }
+        }
+      });
+      if (!mounted) return;
+      _selected.clear();
+      showAdminMessage(context, 'Deleted ${plural(rowids.length, 'row')}.');
+    } catch (e) {
+      if (mounted) {
+        showAdminError(context, 'Delete failed: ${describeError(e)}');
+      }
+    }
+    if (mounted) _changed();
+  }
+
+  Future<void> _insert() async {
+    await pushAdminPage<void>(
+      context,
+      InsertPage(
+        database: _db,
+        initialTable: _table,
+        provider: widget.provider,
+      ),
+    );
+    if (mounted) _changed();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Build
+  // ---------------------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
-    return SignalBuilder<int>(
-      signal: provider.revision,
-      builder: (context, _, _) {
-        final db = provider.currentDatabase;
-        return Scaffold(
-          appBar: AppBar(
-            leading: IconButton(
-              onPressed: () => Navigator.of(context).pop(),
-              icon: const Icon(Icons.arrow_back_ios_outlined, size: 18),
+    final tables = _tablesOrEmpty();
+    final table = _table != null && tables.contains(_table) ? _table : null;
+    final Widget body;
+    if (!_db.isOpen) {
+      body = const EmptyState(
+        icon: Icons.storage_outlined,
+        title: 'Database closed',
+        message: 'This database was closed (or deleted) by its owner.',
+      );
+    } else if (tables.isEmpty) {
+      body = const EmptyState(
+        icon: Icons.table_chart_outlined,
+        title: 'No tables yet',
+        message:
+            'Create one on the Query tab, e.g. CREATE TABLE notes (body TEXT).',
+      );
+    } else {
+      body = Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _SummaryBar(db: _db),
+          _TablePicker(tables: tables, selected: table, onSelected: _showTable),
+          const Divider(height: 1),
+          if (_selected.isNotEmpty)
+            _SelectionBar(
+              count: _selected.length,
+              onDelete: _deleteSelected,
+              onClear: () => setState(_selected.clear),
             ),
-            title: Row(
-              children: [
-                Text(info.name),
-                const SizedBox(width: 8),
-                _ModeBadge(mode: info.mode),
-              ],
+          if (_error != null)
+            MessageBanner(
+              message: _error!,
+              tone: BannerTone.error,
+              margin: const EdgeInsets.all(8),
+            ),
+          Expanded(child: _content(table)),
+          if (table != null)
+            PageBar(
+              offset: _offset,
+              pageSize: _pageSize,
+              total: _total,
+              busy: _loading,
+              onOffsetChanged: (o) {
+                setState(() => _offset = o);
+                unawaited(_load());
+              },
+              onPageSizeChanged: (s) {
+                setState(() {
+                  _pageSize = s;
+                  _offset = (_offset ~/ s) * s;
+                });
+                unawaited(_load());
+              },
+            ),
+        ],
+      );
+    }
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(_db.name, overflow: TextOverflow.ellipsis),
+        actions: [
+          if (_db.isOpen && tables.isNotEmpty) ...[
+            IconButton(
+              tooltip: 'Insert row',
+              icon: const Icon(Icons.add_box_outlined),
+              onPressed: _insert,
+            ),
+            IconButton(
+              tooltip: 'Reload',
+              icon: const Icon(Icons.refresh),
+              onPressed: _loading ? null : _load,
+            ),
+          ],
+        ],
+      ),
+      body: body,
+    );
+  }
+
+  Widget _content(String? table) {
+    final page = _page;
+    if (table == null) return const SizedBox.shrink();
+    if (page == null || _pageTable != table) {
+      return _loading
+          ? const Center(child: CircularProgressIndicator())
+          : const SizedBox.shrink();
+    }
+    if (page.isEmpty) {
+      return EmptyState(
+        icon: Icons.inbox_outlined,
+        title: 'No rows in "$table"',
+        action: OutlinedButton.icon(
+          onPressed: _insert,
+          icon: const Icon(Icons.add),
+          label: const Text('Insert row'),
+        ),
+      );
+    }
+    final schema = _schema;
+    final showRowid = schema?.rowidAlias == null;
+    final dataColumns = page.columns.sublist(1);
+    final rows = [for (final r in page.values) showRowid ? r : r.sublist(1)];
+    final cs = Theme.of(context).colorScheme;
+    return Stack(
+      children: [
+        ResultGrid(
+          columns: [if (showRowid) 'rowid', ...dataColumns],
+          rows: rows,
+          leadingWidth: 132,
+          leadingHeader: Padding(
+            padding: const EdgeInsets.only(left: 12),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'Actions',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+              ),
             ),
           ),
-          body: db == null
-              ? const _NoDatabaseView()
-              : db.tableNames.isEmpty
-              ? const _NoTablesView()
-              : Column(
-                  children: [
-                    _SummaryBar(db: db),
-                    Expanded(
-                      child: ListView.builder(
-                        itemCount: db.tableNames.length,
-                        itemBuilder: (_, i) => _TableDataCard(
-                          db: db,
-                          tableName: db.tableNames[i],
-                        ),
-                      ),
-                    ),
-                  ],
+          isSelected: (i) => _selected.contains(page.values[i].first),
+          leadingBuilder: (context, i) {
+            final values = page.values[i];
+            final rowid = values.first as int;
+            return Row(
+              children: [
+                Checkbox(
+                  value: _selected.contains(rowid),
+                  semanticLabel: 'Select row $rowid',
+                  onChanged: (v) => setState(() {
+                    if (v == true) {
+                      _selected.add(rowid);
+                    } else {
+                      _selected.remove(rowid);
+                    }
+                  }),
                 ),
-        );
-      },
+                IconButton(
+                  tooltip: 'Edit row',
+                  visualDensity: VisualDensity.compact,
+                  icon: Icon(Icons.edit_outlined, size: 18, color: cs.primary),
+                  onPressed: () => _edit(rowid, values.sublist(1)),
+                ),
+                IconButton(
+                  tooltip: 'Delete row',
+                  visualDensity: VisualDensity.compact,
+                  icon: Icon(Icons.delete_outline, size: 18, color: cs.error),
+                  onPressed: () => _deleteRow(rowid),
+                ),
+              ],
+            );
+          },
+        ),
+        if (_loading)
+          const Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: LinearProgressIndicator(minHeight: 2),
+          ),
+      ],
     );
   }
 }
 
 class _SummaryBar extends StatelessWidget {
-  final JustDatabase db;
   const _SummaryBar({required this.db});
 
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final tableCount = db.tableNames.length;
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-      color: cs.surfaceContainerLow,
-      child: Wrap(
-        spacing: 16,
-        children: [
-          _InfoChip(
-            icon: Icons.table_chart_outlined,
-            label: '$tableCount table${tableCount != 1 ? 's' : ''}',
-          ),
-          _InfoChip(icon: Icons.grid_on_outlined, label: '${db.totalRows} rows'),
-          _InfoChip(
-            icon: Icons.data_usage_outlined,
-            label: _formatSize(db.estimatedSizeBytes),
-          ),
-        ],
-      ),
-    );
-  }
-
-  String _formatSize(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-  }
-}
-
-class _InfoChip extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  const _InfoChip({required this.icon, required this.label});
+  final JustDatabase db;
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    return Row(
+    Widget item(IconData icon, String label) => Row(
       mainAxisSize: MainAxisSize.min,
       children: [
         Icon(icon, size: 14, color: cs.primary),
@@ -109,419 +460,92 @@ class _InfoChip extends StatelessWidget {
         Text(label, style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
       ],
     );
-  }
-}
-
-class _TableDataCard extends StatefulWidget {
-  final JustDatabase db;
-  final String tableName;
-
-  const _TableDataCard({required this.db, required this.tableName});
-
-  @override
-  State<_TableDataCard> createState() => _TableDataCardState();
-}
-
-class _TableDataCardState extends State<_TableDataCard> {
-  List<Map<String, dynamic>>? _rows;
-  List<String>? _columns;
-  bool _loading = false;
-  String? _error;
-
-  Future<void> _loadData() async {
-    if (_loading) return;
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
-    try {
-      final result = await widget.db.query(
-        'SELECT * FROM ${widget.tableName} LIMIT 500',
-      );
-      if (!mounted) return;
-      if (result.success) {
-        setState(() {
-          _columns = result.columns;
-          _rows = result.rows;
-          _loading = false;
-        });
-      } else {
-        setState(() {
-          _error = result.errorMessage ?? 'Query failed';
-          _loading = false;
-        });
-      }
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _error = e.toString();
-        _loading = false;
-      });
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final schema = widget.db.getTableSchema(widget.tableName);
-    final colCount = schema?.columns.length ?? 0;
-
-    return Card(
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      child: ExpansionTile(
-        leading: const Icon(Icons.table_chart_outlined),
-        title: Text(
-          widget.tableName,
-          style: const TextStyle(fontWeight: FontWeight.bold),
-        ),
-        subtitle: colCount > 0
-            ? Text('$colCount column${colCount != 1 ? 's' : ''}')
-            : null,
-        onExpansionChanged: (expanded) {
-          if (expanded && _rows == null && !_loading) _loadData();
-        },
+    return Container(
+      color: cs.surfaceContainerLow,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      child: Wrap(
+        spacing: 16,
+        runSpacing: 4,
         children: [
-          if (_loading)
-            const Padding(
-              padding: EdgeInsets.all(24),
-              child: Center(child: CircularProgressIndicator()),
-            )
-          else if (_error != null)
-            _ErrorBanner(error: _error!)
-          else if (_rows != null)
-            _TableDataView(
-              tableName: widget.tableName,
-              columns: _columns!,
-              rows: _rows!,
-              db: widget.db,
-              onMutated: _loadData,
-            ),
+          item(
+            Icons.table_chart_outlined,
+            plural(db.tableNames.length, 'table'),
+          ),
+          item(Icons.grid_on_outlined, plural(db.totalRows, 'row')),
+          item(
+            Icons.data_usage_outlined,
+            '~${formatBytes(db.estimatedSizeBytes)} in memory',
+          ),
+          item(modeIcon(db.mode), '${modeLabel(db.mode)} mode'),
+          item(
+            db.persist ? Icons.save_outlined : Icons.memory,
+            db.persist ? 'Saved' : 'In memory only',
+          ),
         ],
       ),
     );
   }
 }
 
-// ---------------------------------------------------------------------------
-// Row data view with edit / delete support
-// ---------------------------------------------------------------------------
-
-class _TableDataView extends StatefulWidget {
-  final String tableName;
-  final List<String> columns;
-  final List<Map<String, dynamic>> rows;
-  final JustDatabase db;
-  final VoidCallback onMutated;
-
-  const _TableDataView({
-    required this.tableName,
-    required this.columns,
-    required this.rows,
-    required this.db,
-    required this.onMutated,
+class _TablePicker extends StatelessWidget {
+  const _TablePicker({
+    required this.tables,
+    required this.selected,
+    required this.onSelected,
   });
 
-  @override
-  State<_TableDataView> createState() => _TableDataViewState();
-}
-
-class _TableDataViewState extends State<_TableDataView> {
-  final Set<int> _selected = {};
-
-  // Build a WHERE clause for the given row. Uses the PK if one exists,
-  // otherwise falls back to matching every column value.
-  String _whereFor(Map<String, dynamic> row) {
-    final schema = widget.db.getTableSchema(widget.tableName);
-    if (schema != null) {
-      for (final col in schema.columns) {
-        if (col.constraints.primaryKey && row.containsKey(col.name)) {
-          return '${col.name} = ${_sqlLiteral(row[col.name])}';
-        }
-      }
-    }
-    return widget.columns.map((col) {
-      final v = row[col];
-      return v == null ? '$col IS NULL' : '$col = ${_sqlLiteral(v)}';
-    }).join(' AND ');
-  }
-
-  String _sqlLiteral(dynamic v) {
-    if (v == null) return 'NULL';
-    if (v is int || v is double) return v.toString();
-    if (v is bool) return v ? '1' : '0';
-    return "'${v.toString().replaceAll("'", "''")}'";
-  }
-
-  Future<void> _deleteRow(Map<String, dynamic> row) async {
-    final result = await widget.db.execute(
-      'DELETE FROM ${widget.tableName} WHERE ${_whereFor(row)}',
-    );
-    if (!mounted) return;
-    if (result.success) {
-      widget.onMutated();
-    } else {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(result.errorMessage ?? 'Delete failed'),
-          backgroundColor: Theme.of(context).colorScheme.error,
-        ),
-      );
-    }
-  }
-
-  Future<void> _deleteSelected() async {
-    final toDelete = _selected.map((i) => widget.rows[i]).toList();
-    String? firstError;
-    for (final row in toDelete) {
-      final result = await widget.db.execute(
-        'DELETE FROM ${widget.tableName} WHERE ${_whereFor(row)}',
-      );
-      firstError ??= result.success ? null : (result.errorMessage ?? 'Delete failed');
-    }
-    if (!mounted) return;
-    setState(() => _selected.clear());
-    if (firstError != null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(firstError),
-          backgroundColor: Theme.of(context).colorScheme.error,
-        ),
-      );
-    }
-    widget.onMutated();
-  }
-
-  Future<void> _confirmDeleteRow(Map<String, dynamic> row) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Delete row?'),
-        content: const Text('This will permanently remove the row.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(ctx).colorScheme.error,
-              foregroundColor: Theme.of(ctx).colorScheme.onError,
-            ),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed == true) await _deleteRow(row);
-  }
-
-  Future<void> _confirmDeleteSelected() async {
-    final count = _selected.length;
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text('Delete $count row${count != 1 ? 's' : ''}?'),
-        content: Text(
-          'Permanently remove $count selected row${count != 1 ? 's' : ''}.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Cancel'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(ctx).colorScheme.error,
-              foregroundColor: Theme.of(ctx).colorScheme.onError,
-            ),
-            child: const Text('Delete'),
-          ),
-        ],
-      ),
-    );
-    if (confirmed == true) await _deleteSelected();
-  }
-
-  Future<void> _openEditDialog(Map<String, dynamic> row) async {
-    final schema = widget.db.getTableSchema(widget.tableName);
-    if (schema == null) return;
-    final updated = await showDialog<bool>(
-      context: context,
-      builder: (_) => _EditRowDialog(
-        db: widget.db,
-        tableName: widget.tableName,
-        schema: schema,
-        row: row,
-        whereClause: _whereFor(row),
-      ),
-    );
-    if (updated == true) widget.onMutated();
-  }
+  final List<String> tables;
+  final String? selected;
+  final ValueChanged<String> onSelected;
 
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-
-    if (widget.columns.isEmpty) {
-      return Padding(
-        padding: const EdgeInsets.all(16),
-        child: Text('No columns defined', style: TextStyle(color: cs.outline)),
-      );
-    }
-
-    if (widget.rows.isEmpty) {
-      return Padding(
-        padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-        child: Row(
-          children: [
-            Icon(Icons.inbox_outlined, size: 16, color: cs.outline),
-            const SizedBox(width: 8),
-            Text(
-              'No rows in ${widget.tableName}',
-              style: TextStyle(color: cs.outline, fontSize: 13),
-            ),
-          ],
+    return SizedBox(
+      height: 52,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        itemCount: tables.length,
+        separatorBuilder: (_, _) => const SizedBox(width: 8),
+        itemBuilder: (context, i) => ChoiceChip(
+          avatar: const Icon(Icons.table_chart_outlined, size: 16),
+          label: Text(tables[i]),
+          selected: tables[i] == selected,
+          onSelected: (_) => onSelected(tables[i]),
         ),
-      );
-    }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Divider(height: 1, color: cs.outlineVariant),
-        if (_selected.isNotEmpty)
-          _SelectionBar(
-            count: _selected.length,
-            onDelete: _confirmDeleteSelected,
-            onClear: () => setState(() => _selected.clear()),
-          ),
-        SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: DataTable(
-            headingRowColor: WidgetStatePropertyAll(cs.surfaceContainerLow),
-            columnSpacing: 20,
-            horizontalMargin: 16,
-            columns: [
-              const DataColumn(label: SizedBox(width: 72, child: Text(''))),
-              ...widget.columns.map(
-                (col) => DataColumn(
-                  label: Text(
-                    col,
-                    style: const TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                ),
-              ),
-            ],
-            rows: List.generate(widget.rows.length, (i) {
-              final row = widget.rows[i];
-              return DataRow(
-                selected: _selected.contains(i),
-                onSelectChanged: (v) => setState(() {
-                  if (v == true) {
-                    _selected.add(i);
-                  } else {
-                    _selected.remove(i);
-                  }
-                }),
-                cells: [
-                  DataCell(
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        SizedBox(
-                          width: 32,
-                          height: 32,
-                          child: IconButton(
-                            padding: EdgeInsets.zero,
-                            iconSize: 16,
-                            icon: Icon(Icons.edit_outlined, color: cs.primary),
-                            tooltip: 'Edit row',
-                            onPressed: () => _openEditDialog(row),
-                          ),
-                        ),
-                        SizedBox(
-                          width: 32,
-                          height: 32,
-                          child: IconButton(
-                            padding: EdgeInsets.zero,
-                            iconSize: 16,
-                            icon: Icon(Icons.delete_outline, color: cs.error),
-                            tooltip: 'Delete row',
-                            onPressed: () => _confirmDeleteRow(row),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                  ...widget.columns.map(
-                    (col) => DataCell(
-                      Text(
-                        _formatValue(row[col]),
-                        style: TextStyle(
-                          fontSize: 13,
-                          color: row[col] == null ? cs.outline : null,
-                          fontStyle:
-                              row[col] == null ? FontStyle.italic : null,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              );
-            }),
-          ),
-        ),
-        if (widget.rows.length >= 500)
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 4, 16, 12),
-            child: Text(
-              'Showing first 500 rows',
-              style: TextStyle(fontSize: 11, color: cs.outline),
-            ),
-          )
-        else
-          const SizedBox(height: 8),
-      ],
+      ),
     );
-  }
-
-  String _formatValue(dynamic value) {
-    if (value == null) return 'NULL';
-    final str = value.toString();
-    if (str.length > 80) return '${str.substring(0, 77)}…';
-    return str;
   }
 }
 
-// ---------------------------------------------------------------------------
-// Selection action bar
-// ---------------------------------------------------------------------------
-
 class _SelectionBar extends StatelessWidget {
-  final int count;
-  final VoidCallback onDelete;
-  final VoidCallback onClear;
-
   const _SelectionBar({
     required this.count,
     required this.onDelete,
     required this.onClear,
   });
 
+  final int count;
+  final VoidCallback onDelete;
+  final VoidCallback onClear;
+
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     return Container(
-      color: cs.primaryContainer.withValues(alpha: 0.4),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+      color: cs.secondaryContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
       child: Row(
         children: [
-          Text(
-            '$count selected',
-            style: TextStyle(fontWeight: FontWeight.w600, color: cs.primary),
+          Expanded(
+            child: Text(
+              '$count selected',
+              style: TextStyle(
+                fontWeight: FontWeight.w600,
+                color: cs.onSecondaryContainer,
+              ),
+            ),
           ),
-          const Spacer(),
           TextButton(onPressed: onClear, child: const Text('Clear')),
           const SizedBox(width: 8),
           FilledButton.icon(
@@ -540,23 +564,25 @@ class _SelectionBar extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// Edit row dialog
+// Edit dialog
 // ---------------------------------------------------------------------------
 
 class _EditRowDialog extends StatefulWidget {
-  final JustDatabase db;
-  final String tableName;
-  final TableSchema schema;
-  final Map<String, dynamic> row;
-  final String whereClause;
-
   const _EditRowDialog({
     required this.db,
-    required this.tableName,
+    required this.table,
     required this.schema,
-    required this.row,
-    required this.whereClause,
+    required this.columns,
+    required this.rowid,
+    required this.values,
   });
+
+  final JustDatabase db;
+  final String table;
+  final TableSchema schema;
+  final List<ColumnDefinition> columns;
+  final int rowid;
+  final List<Object?> values;
 
   @override
   State<_EditRowDialog> createState() => _EditRowDialogState();
@@ -564,89 +590,84 @@ class _EditRowDialog extends StatefulWidget {
 
 class _EditRowDialogState extends State<_EditRowDialog> {
   final _formKey = GlobalKey<FormState>();
-  final Map<String, TextEditingController> _textControllers = {};
-  final Map<String, bool> _boolValues = {};
-  bool _submitting = false;
+  late final List<ColumnInput> _inputs;
+  bool _saving = false;
   String? _error;
 
   @override
   void initState() {
     super.initState();
-    for (final col in widget.schema.columns) {
-      final val = widget.row[col.name];
-      if (col.type == DataType.boolean) {
-        _boolValues[col.name] = val == true || val == 1;
-      } else {
-        _textControllers[col.name] = TextEditingController(
-          text: val?.toString() ?? '',
-        );
-      }
-    }
+    final aliasIndex = widget.schema.rowidAlias;
+    final alias = aliasIndex == null
+        ? null
+        : widget.schema.columns[aliasIndex].name;
+    _inputs = [
+      for (var i = 0; i < widget.columns.length; i++)
+        ColumnInput.forEdit(
+          widget.columns[i],
+          i < widget.values.length ? widget.values[i] : null,
+          isRowidAlias: widget.columns[i].name == alias,
+        ),
+    ];
   }
 
   @override
   void dispose() {
-    for (final c in _textControllers.values) {
-      c.dispose();
+    for (final input in _inputs) {
+      input.dispose();
     }
     super.dispose();
   }
 
-  Future<void> _submit() async {
+  Future<void> _save() async {
     if (!(_formKey.currentState?.validate() ?? false)) return;
-    setState(() {
-      _submitting = true;
-      _error = null;
-    });
-
-    final setParts = <String>[];
-    for (final col in widget.schema.columns) {
-      // Never modify auto-increment primary keys
-      if (col.constraints.primaryKey && col.constraints.autoIncrement) continue;
-
-      if (col.type == DataType.boolean) {
-        final v = _boolValues[col.name] ?? false;
-        setParts.add('${col.name} = ${v ? 1 : 0}');
-      } else {
-        final ctrl = _textControllers[col.name];
-        final raw = ctrl?.text.trim() ?? '';
-        if (raw.isEmpty) {
-          if (col.constraints.notNull && !col.constraints.hasDefault) {
-            setState(() {
-              _error = '${col.name} is required';
-              _submitting = false;
-            });
-            return;
-          }
-          setParts.add('${col.name} = NULL');
-        } else if (col.type == DataType.integer || col.type == DataType.real) {
-          setParts.add('${col.name} = $raw');
-        } else {
-          setParts.add("${col.name} = '${raw.replaceAll("'", "''")}'");
-        }
-      }
-    }
-
-    if (setParts.isEmpty) {
-      setState(() {
-        _error = 'No editable columns.';
-        _submitting = false;
-      });
+    final changed = [
+      for (final i in _inputs)
+        if (i.isChanged) i,
+    ];
+    if (changed.isEmpty) {
+      Navigator.pop(context, false);
       return;
     }
-
-    final sql =
-        'UPDATE ${widget.tableName} SET ${setParts.join(', ')} '
-        'WHERE ${widget.whereClause}';
-    final result = await widget.db.execute(sql);
-    if (!mounted) return;
-
-    if (result.success) {
-      Navigator.of(context).pop(true);
-    } else {
+    final assignments = <String>[];
+    final params = <Object?>[];
+    for (final input in changed) {
+      final parsed = input.parse();
+      if (parsed.error != null) return; // the validator showed it
+      assignments.add('${quoteIdentifier(input.column.name)} = ?');
+      params.add(parsed.value);
+    }
+    params.add(widget.rowid);
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    try {
+      final r = await widget.db.execute(
+        'UPDATE ${quoteIdentifier(widget.table)} SET ${assignments.join(', ')} WHERE rowid = ?',
+        params,
+      );
+      if (!mounted) return;
+      if (!r.success) {
+        setState(() {
+          _saving = false;
+          _error = r.errorMessage ?? 'The update failed.';
+        });
+      } else if (r.affectedRows != 1) {
+        setState(() {
+          _saving = false;
+          _error =
+              'Expected to update 1 row but ${r.affectedRows} changed. '
+              'The row may have been deleted elsewhere; close this and reload.';
+        });
+      } else {
+        Navigator.pop(context, true);
+      }
+    } catch (e) {
+      if (!mounted) return;
       setState(() {
-        _error = result.errorMessage ?? 'Update failed';
-        _submitting = false;
+        _saving = false;
+        _error = describeError(e);
       });
     }
   }
@@ -654,26 +675,23 @@ class _EditRowDialogState extends State<_EditRowDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: Text('Edit row — ${widget.tableName}'),
+      title: Text('Edit row ${widget.rowid} of ${widget.table}'),
       content: SizedBox(
-        width: 420,
+        width: 460,
         child: SingleChildScrollView(
           child: Form(
             key: _formKey,
             child: Column(
               mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                if (_error != null) _InlineError(error: _error!),
-                ...widget.schema.columns.map(
-                  (col) => _EditField(
-                    col: col,
-                    controller: _textControllers[col.name],
-                    boolValue: _boolValues[col.name],
-                    onBoolChanged: (v) =>
-                        setState(() => _boolValues[col.name] = v),
+                if (_error != null)
+                  MessageBanner(
+                    message: _error!,
+                    tone: BannerTone.error,
+                    margin: const EdgeInsets.only(bottom: 12),
                   ),
-                ),
+                for (final input in _inputs) ColumnInputField(input: input),
               ],
             ),
           ),
@@ -681,13 +699,12 @@ class _EditRowDialogState extends State<_EditRowDialog> {
       ),
       actions: [
         TextButton(
-          onPressed:
-              _submitting ? null : () => Navigator.of(context).pop(false),
+          onPressed: _saving ? null : () => Navigator.pop(context, false),
           child: const Text('Cancel'),
         ),
         FilledButton.icon(
-          onPressed: _submitting ? null : _submit,
-          icon: _submitting
+          onPressed: _saving ? null : _save,
+          icon: _saving
               ? const SizedBox(
                   width: 14,
                   height: 14,
@@ -697,358 +714,6 @@ class _EditRowDialogState extends State<_EditRowDialog> {
           label: const Text('Save'),
         ),
       ],
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Edit field — one column in the edit dialog
-// ---------------------------------------------------------------------------
-
-class _EditField extends StatelessWidget {
-  final ColumnDefinition col;
-  final TextEditingController? controller;
-  final bool? boolValue;
-  final ValueChanged<bool> onBoolChanged;
-
-  const _EditField({
-    required this.col,
-    required this.controller,
-    required this.boolValue,
-    required this.onBoolChanged,
-  });
-
-  bool get _isAutoInc =>
-      col.constraints.primaryKey && col.constraints.autoIncrement;
-
-  String get _typeLabel => switch (col.type) {
-    DataType.integer => 'INTEGER',
-    DataType.real => 'REAL',
-    DataType.text => 'TEXT',
-    DataType.boolean => 'BOOLEAN',
-    DataType.datetime => 'DATETIME',
-    DataType.blob => 'BLOB',
-  };
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final isRequired =
-        col.constraints.notNull &&
-        !col.constraints.hasDefault &&
-        !_isAutoInc;
-
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              if (col.constraints.primaryKey) ...[
-                Icon(Icons.key, size: 12, color: cs.primary),
-                const SizedBox(width: 4),
-              ],
-              Text(
-                col.name,
-                style: const TextStyle(
-                  fontWeight: FontWeight.w600,
-                  fontSize: 13,
-                ),
-              ),
-              const SizedBox(width: 6),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-                decoration: BoxDecoration(
-                  color: cs.secondaryContainer,
-                  borderRadius: BorderRadius.circular(4),
-                ),
-                child: Text(
-                  _typeLabel,
-                  style: TextStyle(
-                    fontSize: 10,
-                    color: cs.onSecondaryContainer,
-                    fontWeight: FontWeight.w600,
-                  ),
-                ),
-              ),
-              if (_isAutoInc) ...[
-                const SizedBox(width: 4),
-                Text('auto', style: TextStyle(fontSize: 10, color: cs.outline)),
-              ],
-              if (isRequired) ...[
-                const SizedBox(width: 4),
-                Text(
-                  'required',
-                  style: TextStyle(fontSize: 10, color: cs.error),
-                ),
-              ],
-            ],
-          ),
-          const SizedBox(height: 6),
-          if (col.type == DataType.boolean)
-            AbsorbPointer(
-              absorbing: _isAutoInc,
-              child: Opacity(
-                opacity: _isAutoInc ? 0.5 : 1.0,
-                child: _BoolToggle(
-                  value: boolValue ?? false,
-                  onChanged: onBoolChanged,
-                ),
-              ),
-            )
-          else
-            _EditTextField(
-              col: col,
-              controller: controller!,
-              readOnly: _isAutoInc,
-            ),
-        ],
-      ),
-    );
-  }
-}
-
-class _BoolToggle extends StatelessWidget {
-  final bool value;
-  final ValueChanged<bool> onChanged;
-  const _BoolToggle({required this.value, required this.onChanged});
-
-  @override
-  Widget build(BuildContext context) {
-    return Row(
-      children: [
-        Switch(value: value, onChanged: onChanged),
-        const SizedBox(width: 8),
-        Text(
-          value ? 'true' : 'false',
-          style: TextStyle(
-            color: value
-                ? Theme.of(context).colorScheme.primary
-                : Theme.of(context).colorScheme.outline,
-          ),
-        ),
-      ],
-    );
-  }
-}
-
-class _EditTextField extends StatelessWidget {
-  final ColumnDefinition col;
-  final TextEditingController controller;
-  final bool readOnly;
-
-  const _EditTextField({
-    required this.col,
-    required this.controller,
-    required this.readOnly,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final isRequired =
-        col.constraints.notNull && !col.constraints.hasDefault && !readOnly;
-
-    TextInputType keyboardType = TextInputType.text;
-    List<TextInputFormatter> formatters = [];
-    String? hint;
-
-    switch (col.type) {
-      case DataType.integer:
-        keyboardType = TextInputType.number;
-        formatters = [FilteringTextInputFormatter.allow(RegExp(r'^-?\d*'))];
-      case DataType.real:
-        keyboardType = const TextInputType.numberWithOptions(decimal: true);
-        formatters = [
-          FilteringTextInputFormatter.allow(RegExp(r'^-?\d*\.?\d*')),
-        ];
-      case DataType.datetime:
-        hint = 'e.g. 2026-02-20T10:00:00';
-      case DataType.blob:
-        hint = 'hex bytes';
-      default:
-        break;
-    }
-
-    return TextFormField(
-      controller: controller,
-      readOnly: readOnly,
-      keyboardType: keyboardType,
-      inputFormatters: formatters,
-      decoration: InputDecoration(
-        hintText: hint,
-        border: const OutlineInputBorder(),
-        contentPadding:
-            const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        filled: readOnly,
-        fillColor: readOnly ? cs.surfaceContainerHighest : null,
-        suffixIcon: col.type == DataType.datetime && !readOnly
-            ? IconButton(
-                icon: const Icon(Icons.calendar_today, size: 18),
-                tooltip: 'Pick date',
-                onPressed: () async {
-                  final now = DateTime.now();
-                  final picked = await showDatePicker(
-                    context: context,
-                    initialDate: now,
-                    firstDate: DateTime(2000),
-                    lastDate: DateTime(2100),
-                  );
-                  if (picked != null) {
-                    controller.text =
-                        picked.toIso8601String().split('T').first;
-                  }
-                },
-              )
-            : null,
-      ),
-      validator: isRequired
-          ? (v) =>
-                (v == null || v.trim().isEmpty) ? '${col.name} is required' : null
-          : null,
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Small shared widgets
-// ---------------------------------------------------------------------------
-
-class _InlineError extends StatelessWidget {
-  final String error;
-  const _InlineError({required this.error});
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: cs.errorContainer,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        children: [
-          Icon(Icons.error_outline, size: 16, color: cs.onErrorContainer),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              error,
-              style: TextStyle(fontSize: 12, color: cs.onErrorContainer),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ErrorBanner extends StatelessWidget {
-  final String error;
-  const _ErrorBanner({required this.error});
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.all(16),
-      child: Row(
-        children: [
-          Icon(Icons.error_outline, color: cs.error, size: 18),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              error,
-              style: TextStyle(color: cs.error, fontSize: 13),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ModeBadge extends StatelessWidget {
-  final DatabaseMode mode;
-  const _ModeBadge({required this.mode});
-
-  @override
-  Widget build(BuildContext context) {
-    final (label, color) = switch (mode) {
-      DatabaseMode.standard => ('Standard', Colors.blue),
-      DatabaseMode.readFast => ('Read+', Colors.green),
-      DatabaseMode.writeFast => ('Write+', Colors.orange),
-      DatabaseMode.secure => ('Secure', Colors.purple),
-    };
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-      decoration: BoxDecoration(
-        color: color.withAlpha(30),
-        borderRadius: BorderRadius.circular(4),
-        border: Border.all(color: color.withAlpha(80)),
-      ),
-      child: Text(
-        label,
-        style: TextStyle(
-          fontSize: 11,
-          color: color,
-          fontWeight: FontWeight.w600,
-        ),
-      ),
-    );
-  }
-}
-
-class _NoDatabaseView extends StatelessWidget {
-  const _NoDatabaseView();
-
-  @override
-  Widget build(BuildContext context) {
-    return const Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.storage_outlined, size: 56, color: Colors.grey),
-          SizedBox(height: 12),
-          Text(
-            'Database not available',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-          ),
-          SizedBox(height: 4),
-          Text(
-            'The database could not be opened.',
-            style: TextStyle(color: Colors.grey),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _NoTablesView extends StatelessWidget {
-  const _NoTablesView();
-
-  @override
-  Widget build(BuildContext context) {
-    return const Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.table_chart_outlined, size: 56, color: Colors.grey),
-          SizedBox(height: 12),
-          Text(
-            'No tables yet',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-          ),
-          SizedBox(height: 4),
-          Text(
-            'Use the Query tab to CREATE TABLE first.',
-            style: TextStyle(color: Colors.grey),
-          ),
-        ],
-      ),
     );
   }
 }

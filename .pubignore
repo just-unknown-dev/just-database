@@ -1,25 +1,39 @@
+# pub ignores .gitignore when this file exists, so everything that must
+# not be published is listed here.
+
 # IDE and editor files
 .idea/
 .vscode/
 *.iml
 
-# Build artifacts
+# Build and tool output
 .dart_tool/
 build/
+coverage/
+doc/api/
 .flutter-plugins
 .flutter-plugins-dependencies
-.metadata
+example/build/
+example/.dart_tool/
 
-# Git
+# Repository files
 .git/
+.github/
 .gitignore
 .gitattributes
+.metadata
 
-# Development files
+# Local development
 pubspec.lock
+pubspec_overrides.yaml
+example/pubspec.lock
+example/pubspec_overrides.yaml
 
 # Temporary files
 *.tmp
 *.log
 .DS_Store
 Thumbs.db
+
+# Audit notes (not part of the package)
+.audit/

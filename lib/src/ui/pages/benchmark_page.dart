@@ -1,29 +1,38 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:just_signals/just_signals.dart';
-import 'package:just_database/just_database.dart';
 
+import '../../benchmark/benchmark.dart';
+import '../../core/just_database.dart';
+import '../../sql/sql_exception.dart';
+import '../admin_utils.dart';
+import '../widgets/admin_widgets.dart';
+
+/// Runs the standard benchmark suite, or times a SELECT on [database].
+///
+/// The standard suite runs on a private in-memory database, so no data is
+/// touched; it yields to the event loop between runs, so the page stays
+/// responsive. A custom query must be a SELECT (it runs through
+/// `JustDatabase.query`, which refuses anything else).
 class BenchmarkPage extends StatefulWidget {
-  final DatabaseInfo info;
-  final DatabaseProvider provider;
+  /// Creates the page. Without a [database] only the standard suite runs.
+  const BenchmarkPage({super.key, this.database});
 
-  const BenchmarkPage({super.key, required this.info, required this.provider});
+  /// The database custom queries run on.
+  final JustDatabase? database;
 
   @override
   State<BenchmarkPage> createState() => _BenchmarkPageState();
 }
 
 class _BenchmarkPageState extends State<BenchmarkPage> {
-  // Config
-  final _rowCountController = TextEditingController(text: '1000');
-  final _warmupController = TextEditingController(text: '3');
-  final _iterationsController = TextEditingController(text: '50');
-  final _queryController = TextEditingController(
-    text: 'SELECT * FROM users LIMIT 100',
-  );
-  final _queryLabelController = TextEditingController(text: 'My query');
+  final _formKey = GlobalKey<FormState>();
+  final _rowCount = TextEditingController(text: '1000');
+  final _warmup = TextEditingController(text: '3');
+  final _iterations = TextEditingController(text: '50');
+  final _query = TextEditingController(text: 'SELECT * FROM users LIMIT 100');
+  final _label = TextEditingController(text: 'My query');
 
-  bool _useCustomQuery = false;
+  bool _custom = false;
   bool _running = false;
   String? _error;
   BenchmarkSuiteResult? _suiteResult;
@@ -31,15 +40,19 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
 
   @override
   void dispose() {
-    _rowCountController.dispose();
-    _warmupController.dispose();
-    _iterationsController.dispose();
-    _queryController.dispose();
-    _queryLabelController.dispose();
+    _rowCount.dispose();
+    _warmup.dispose();
+    _iterations.dispose();
+    _query.dispose();
+    _label.dispose();
     super.dispose();
   }
 
-  Future<void> _run(JustDatabase db) async {
+  Future<void> _run() async {
+    if (_running || !(_formKey.currentState?.validate() ?? false)) return;
+    final warmup = int.parse(_warmup.text.trim());
+    final iterations = int.parse(_iterations.text.trim());
+    final db = widget.database;
     setState(() {
       _running = true;
       _error = null;
@@ -47,133 +60,166 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
       _customResult = null;
     });
     try {
-      final warmup = int.tryParse(_warmupController.text.trim()) ?? 3;
-      final iters = int.tryParse(_iterationsController.text.trim()) ?? 50;
-
-      if (_useCustomQuery) {
-        final sql = _queryController.text.trim();
-        final label = _queryLabelController.text.trim().isNotEmpty
-            ? _queryLabelController.text.trim()
-            : 'Custom query';
-        final result = await db.benchmarkQuery(
+      if (_custom) {
+        if (db == null || !db.isOpen) {
+          throw StateError('No open database to run the query on.');
+        }
+        final label = _label.text.trim().isEmpty
+            ? 'Custom query'
+            : _label.text.trim();
+        final stats = await db.benchmarkQuery(
           label,
-          sql,
+          _query.text,
           warmup: warmup,
-          iterations: iters,
+          iterations: iterations,
         );
-        setState(() => _customResult = result);
+        if (!mounted) return;
+        setState(() => _customResult = stats);
       } else {
-        final rowCount = int.tryParse(_rowCountController.text.trim()) ?? 1000;
-        final result = await db.runStandardBenchmark(
-          rowCount: rowCount,
-          warmup: warmup,
-          iterations: iters,
-        );
+        final rows = int.parse(_rowCount.text.trim());
+        final result = db != null && db.isOpen
+            ? await db.runStandardBenchmark(
+                rowCount: rows,
+                warmup: warmup,
+                iterations: iterations,
+              )
+            : await runStandardDatabaseBenchmark(
+                rowCount: rows,
+                warmup: warmup,
+                iterations: iterations,
+              );
+        if (!mounted) return;
         setState(() => _suiteResult = result);
       }
+    } on SqlException catch (e) {
+      if (!mounted) return;
+      setState(() => _error = 'The query failed: ${e.message}');
     } catch (e) {
-      setState(() => _error = e.toString());
+      if (!mounted) return;
+      setState(() => _error = describeError(e));
     } finally {
-      setState(() => _running = false);
+      if (mounted) setState(() => _running = false);
     }
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return SignalBuilder<int>(
-      signal: widget.provider.revision,
-      builder: (context, value, child) {
-        final db = widget.provider.currentDatabase;
-
-        return Scaffold(
-          appBar: AppBar(
-            leading: IconButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-              },
-              icon: Icon(Icons.arrow_back_ios_outlined, size: 18),
-            ),
-            title: Text('Benchmark — ${widget.info.name}'),
-          ),
-          body: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              _ConfigCard(
-                rowCountController: _rowCountController,
-                warmupController: _warmupController,
-                iterationsController: _iterationsController,
-                queryController: _queryController,
-                queryLabelController: _queryLabelController,
-                useCustomQuery: _useCustomQuery,
-                onModeChanged: (v) => setState(() {
-                  _useCustomQuery = v;
-                  _suiteResult = null;
-                  _customResult = null;
-                  _error = null;
-                }),
-              ),
-              _RunBar(
-                canRun: db != null && !_running,
-                running: _running,
-                noDatabaseSelected: db == null,
-                onRun: db != null ? () => _run(db) : null,
-                onClear: () => setState(() {
-                  _suiteResult = null;
-                  _customResult = null;
-                  _error = null;
-                }),
-              ),
-              if (_error != null) _ErrorBanner(message: _error!),
-              Expanded(
-                child: _useCustomQuery
-                    ? (_customResult != null
-                          ? _CustomResultPanel(stats: _customResult!)
-                          : _EmptyState(
-                              running: _running,
-                              message: 'Configure a query above, then tap Run.',
-                            ))
-                    : (_suiteResult != null
-                          ? _SuiteResultPanel(result: _suiteResult!)
-                          : _EmptyState(
-                              running: _running,
-                              message:
-                                  'Select a database and tap Run to start the standard benchmark suite.',
-                            )),
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Config card
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _ConfigCard extends StatelessWidget {
-  final TextEditingController rowCountController;
-  final TextEditingController warmupController;
-  final TextEditingController iterationsController;
-  final TextEditingController queryController;
-  final TextEditingController queryLabelController;
-  final bool useCustomQuery;
-  final ValueChanged<bool> onModeChanged;
-
-  const _ConfigCard({
-    required this.rowCountController,
-    required this.warmupController,
-    required this.iterationsController,
-    required this.queryController,
-    required this.queryLabelController,
-    required this.useCustomQuery,
-    required this.onModeChanged,
+  void _clear() => setState(() {
+    _suiteResult = null;
+    _customResult = null;
+    _error = null;
   });
 
+  String? _intError(String? text, int min, int max) {
+    final v = int.tryParse((text ?? '').trim());
+    if (v == null) return 'Enter a whole number';
+    if (v < min || v > max) return 'Use $min to $max';
+    return null;
+  }
+
   @override
   Widget build(BuildContext context) {
+    final db = widget.database;
+    final suite = _suiteResult;
+    final custom = _customResult;
+    final Widget results;
+    if (_running) {
+      results = const Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            CircularProgressIndicator(),
+            SizedBox(height: 16),
+            Text('Benchmarking…'),
+          ],
+        ),
+      );
+    } else if (!_custom && suite != null) {
+      results = _SuiteResultView(result: suite);
+    } else if (_custom && custom != null) {
+      results = ListView(
+        padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
+        children: [
+          _StatCard(stats: custom, maxThroughput: custom.throughput),
+          const SizedBox(height: 8),
+          _CopyButton(text: formatQueryStats([custom])),
+        ],
+      );
+    } else {
+      results = EmptyState(
+        icon: Icons.speed,
+        title: _custom ? 'Time a SELECT' : 'Standard suite',
+        message: _custom
+            ? 'The query runs ${db == null ? 'on the selected database' : 'on "${db.name}"'}; '
+                  'only SELECT statements are allowed.'
+            : 'Runs on a private in-memory database: your data is not touched.',
+      );
+    }
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(
+          db == null ? 'Benchmark' : 'Benchmark — ${db.name}',
+          overflow: TextOverflow.ellipsis,
+        ),
+      ),
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Form(key: _formKey, child: _config(context)),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+            child: Row(
+              children: [
+                FilledButton.icon(
+                  onPressed: _running || (_custom && db == null) ? null : _run,
+                  icon: const Icon(Icons.play_arrow),
+                  label: Text(_running ? 'Running…' : 'Run benchmark'),
+                ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: _running ? null : _clear,
+                  icon: const Icon(Icons.clear),
+                  label: const Text('Clear'),
+                ),
+              ],
+            ),
+          ),
+          if (_error != null)
+            MessageBanner(
+              message: _error!,
+              tone: BannerTone.error,
+              margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+              onClose: () => setState(() => _error = null),
+            ),
+          Expanded(child: results),
+        ],
+      ),
+    );
+  }
+
+  Widget _config(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    Widget intField(
+      String label,
+      TextEditingController c,
+      int min,
+      int max,
+      String tip,
+    ) => SizedBox(
+      width: 120,
+      child: Tooltip(
+        message: tip,
+        child: TextFormField(
+          controller: c,
+          keyboardType: TextInputType.number,
+          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+          decoration: InputDecoration(
+            labelText: label,
+            isDense: true,
+            border: const OutlineInputBorder(),
+          ),
+          validator: (v) => _intError(v, min, max),
+        ),
+      ),
+    );
     return Card(
       margin: const EdgeInsets.fromLTRB(12, 12, 12, 0),
       child: Padding(
@@ -181,84 +227,83 @@ class _ConfigCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Mode toggle
             SegmentedButton<bool>(
               segments: const [
                 ButtonSegment(
                   value: false,
-                  label: Text('Standard Suite'),
+                  label: Text('Standard suite'),
                   icon: Icon(Icons.speed),
                 ),
                 ButtonSegment(
                   value: true,
-                  label: Text('Custom Query'),
+                  label: Text('Custom SELECT'),
                   icon: Icon(Icons.tune),
                 ),
               ],
-              selected: {useCustomQuery},
-              onSelectionChanged: (s) => onModeChanged(s.first),
-              style: ButtonStyle(
-                visualDensity: VisualDensity.compact,
-                textStyle: WidgetStatePropertyAll(
-                  Theme.of(context).textTheme.bodySmall,
-                ),
-              ),
+              selected: {_custom},
+              onSelectionChanged: _running
+                  ? null
+                  : (s) => setState(() {
+                      _custom = s.first;
+                      _error = null;
+                    }),
             ),
             const SizedBox(height: 12),
-
-            // Parameters row
-            _ParamRow(
+            Wrap(
+              spacing: 10,
+              runSpacing: 10,
               children: [
-                if (!useCustomQuery)
-                  _IntField(
-                    label: 'Seed rows',
-                    controller: rowCountController,
-                    tooltip: 'Number of rows inserted before benchmarking',
+                if (!_custom)
+                  intField(
+                    'Rows',
+                    _rowCount,
+                    10,
+                    100000,
+                    'Rows in the benchmark tables',
                   ),
-                _IntField(
-                  label: 'Warm-up',
-                  controller: warmupController,
-                  tooltip: 'Iterations run before timing starts',
+                intField(
+                  'Warm-up',
+                  _warmup,
+                  0,
+                  1000,
+                  'Untimed runs before measuring',
                 ),
-                _IntField(
-                  label: 'Iterations',
-                  controller: iterationsController,
-                  tooltip: 'Timed iterations per operation',
+                intField(
+                  'Iterations',
+                  _iterations,
+                  1,
+                  10000,
+                  'Timed runs per operation',
                 ),
               ],
             ),
-
-            if (useCustomQuery) ...[
+            if (_custom) ...[
               const SizedBox(height: 10),
-              TextField(
-                controller: queryLabelController,
+              TextFormField(
+                controller: _label,
                 decoration: const InputDecoration(
                   labelText: 'Label',
                   isDense: true,
                   border: OutlineInputBorder(),
-                  contentPadding: EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 8,
-                  ),
                 ),
-                style: const TextStyle(fontSize: 13),
               ),
               const SizedBox(height: 8),
-              TextField(
-                controller: queryController,
-                maxLines: 3,
+              TextFormField(
+                key: const ValueKey('jdb-bench-sql'),
+                controller: _query,
+                minLines: 2,
+                maxLines: 4,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
                 decoration: InputDecoration(
-                  labelText: 'SQL',
+                  labelText: 'SELECT statement',
                   isDense: true,
                   border: const OutlineInputBorder(),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 8,
-                  ),
-                  fillColor: cs.surfaceContainerHighest,
                   filled: true,
+                  fillColor: cs.surfaceContainerHighest,
                 ),
-                style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                validator: (v) => (v == null || v.trim().isEmpty)
+                    ? 'Enter a SELECT statement'
+                    : null,
               ),
             ],
           ],
@@ -268,286 +313,90 @@ class _ConfigCard extends StatelessWidget {
   }
 }
 
-class _ParamRow extends StatelessWidget {
-  final List<Widget> children;
-  const _ParamRow({required this.children});
+class _SuiteResultView extends StatelessWidget {
+  const _SuiteResultView({required this.result});
 
-  @override
-  Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 10,
-      runSpacing: 10,
-      children: children.map((c) => SizedBox(width: 110, child: c)).toList(),
-    );
-  }
-}
-
-class _IntField extends StatelessWidget {
-  final String label;
-  final TextEditingController controller;
-  final String? tooltip;
-
-  const _IntField({
-    required this.label,
-    required this.controller,
-    this.tooltip,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final field = TextField(
-      controller: controller,
-      keyboardType: TextInputType.number,
-      inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-      decoration: InputDecoration(
-        labelText: label,
-        isDense: true,
-        border: const OutlineInputBorder(),
-        contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-      ),
-      style: const TextStyle(fontSize: 13),
-    );
-    if (tooltip == null) return field;
-    return Tooltip(message: tooltip!, child: field);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Run bar
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _RunBar extends StatelessWidget {
-  final bool canRun;
-  final bool running;
-  final bool noDatabaseSelected;
-  final VoidCallback? onRun;
-  final VoidCallback onClear;
-
-  const _RunBar({
-    required this.canRun,
-    required this.running,
-    required this.noDatabaseSelected,
-    required this.onRun,
-    required this.onClear,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-      child: Column(
-        spacing: 4,
-        children: [
-          Row(
-            children: [
-              FilledButton.icon(
-                onPressed: canRun ? onRun : null,
-                icon: running
-                    ? const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          color: Colors.white,
-                        ),
-                      )
-                    : const Icon(Icons.play_arrow),
-                label: Text(running ? 'Running…' : 'Run Benchmark'),
-              ),
-              const SizedBox(width: 8),
-              OutlinedButton.icon(
-                onPressed: onClear,
-                icon: const Icon(Icons.clear),
-                label: const Text('Clear'),
-              ),
-            ],
-          ),
-          if (noDatabaseSelected) ...[
-            Row(
-              spacing: 4,
-              children: [
-                Icon(
-                  Icons.info_outline,
-                  size: 16,
-                  color: Theme.of(context).colorScheme.error,
-                ),
-                Text(
-                  'Select a database first',
-                  style: TextStyle(
-                    fontSize: 12,
-                    color: Theme.of(context).colorScheme.error,
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ],
-      ),
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Error banner
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _ErrorBanner extends StatelessWidget {
-  final String message;
-  const _ErrorBanner({required this.message});
+  final BenchmarkSuiteResult result;
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    return Container(
-      margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: cs.errorContainer,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(
-        children: [
-          Icon(Icons.error_outline, size: 18, color: cs.onErrorContainer),
-          const SizedBox(width: 8),
-          Expanded(
-            child: Text(
-              message,
-              style: TextStyle(fontSize: 13, color: cs.onErrorContainer),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Empty state
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _EmptyState extends StatelessWidget {
-  final bool running;
-  final String message;
-  const _EmptyState({required this.running, required this.message});
-
-  @override
-  Widget build(BuildContext context) {
-    if (running) {
-      return const Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            CircularProgressIndicator(),
-            SizedBox(height: 16),
-            Text('Benchmarking…', style: TextStyle(fontSize: 14)),
-          ],
-        ),
-      );
-    }
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.all(32),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              Icons.speed,
-              size: 56,
-              color: Theme.of(context).colorScheme.outlineVariant,
-            ),
-            const SizedBox(height: 16),
-            Text(
-              message,
-              textAlign: TextAlign.center,
-              style: TextStyle(
-                fontSize: 14,
-                color: Theme.of(context).colorScheme.outline,
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Suite results panel
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _SuiteResultPanel extends StatelessWidget {
-  final BenchmarkSuiteResult result;
-  const _SuiteResultPanel({required this.result});
-
-  @override
-  Widget build(BuildContext context) {
-    final maxThroughput = result.results.fold(
+    final maxThroughput = result.results.fold<double>(
       0.01,
       (m, s) => s.throughput.isFinite && s.throughput > m ? s.throughput : m,
     );
     return ListView(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 24),
       children: [
-        _ResultHeader(result: result),
+        Row(
+          children: [
+            Icon(Icons.check_circle_outline, color: cs.primary, size: 20),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                result.suiteName,
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: cs.onSurface,
+                ),
+              ),
+            ),
+            Text(
+              plural(result.results.length, 'operation'),
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+            ),
+          ],
+        ),
         const SizedBox(height: 12),
-        ...result.results.map(
-          (s) => Padding(
+        for (final s in result.results)
+          Padding(
             padding: const EdgeInsets.only(bottom: 8),
             child: _StatCard(stats: s, maxThroughput: maxThroughput),
           ),
-        ),
-        const SizedBox(height: 8),
-        _CopyButton(result: result),
-      ],
-    );
-  }
-}
-
-class _ResultHeader extends StatelessWidget {
-  final BenchmarkSuiteResult result;
-  const _ResultHeader({required this.result});
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Row(
-      children: [
-        Icon(Icons.check_circle, color: cs.primary, size: 20),
-        const SizedBox(width: 8),
-        Expanded(
-          child: Text(
-            result.suiteName,
-            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
-          ),
-        ),
-        Text(
-          '${result.results.length} operations',
-          style: TextStyle(fontSize: 12, color: cs.outline),
-        ),
+        _CopyButton(text: result.formatTable()),
       ],
     );
   }
 }
 
 class _StatCard extends StatelessWidget {
+  const _StatCard({required this.stats, required this.maxThroughput});
+
   final QueryStats stats;
   final double maxThroughput;
-  const _StatCard({required this.stats, required this.maxThroughput});
+
+  static String _ms(Duration d) =>
+      '${(d.inMicroseconds / 1000.0).toStringAsFixed(2)} ms';
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final fraction = (stats.throughput.isFinite && maxThroughput > 0)
+    final fraction = stats.throughput.isFinite && maxThroughput > 0
         ? (stats.throughput / maxThroughput).clamp(0.04, 1.0)
-        : 0.04;
-
-    // Color based on relative throughput
-    final barColor = fraction >= 0.7
-        ? Colors.green.shade600
-        : fraction >= 0.4
-        ? Colors.orange.shade600
-        : cs.primary;
-
+        : 1.0;
+    final ops = stats.throughput.isInfinite
+        ? '∞'
+        : stats.throughput >= 1000
+        ? '${(stats.throughput / 1000).toStringAsFixed(1)}k'
+        : stats.throughput.toStringAsFixed(0);
+    Widget stat(String label, String value) => Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          '$label ',
+          style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+        ),
+        Text(
+          value,
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w600,
+            color: cs.onSurface,
+          ),
+        ),
+      ],
+    );
     return Card(
       elevation: 0,
       shape: RoundedRectangleBorder(
@@ -559,37 +408,62 @@ class _StatCard extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Operation name + throughput badge
             Row(
               children: [
                 Expanded(
                   child: Text(
                     stats.label,
-                    style: const TextStyle(
+                    style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.w600,
+                      color: cs.onSurface,
                     ),
                   ),
                 ),
-                _ThroughputBadge(throughput: stats.throughput),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 8,
+                    vertical: 3,
+                  ),
+                  decoration: BoxDecoration(
+                    color: cs.primaryContainer,
+                    borderRadius: BorderRadius.circular(20),
+                  ),
+                  child: Text(
+                    '$ops ops/s',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: cs.onPrimaryContainer,
+                    ),
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: 8),
-
-            // Throughput bar
             ClipRRect(
               borderRadius: BorderRadius.circular(4),
               child: LinearProgressIndicator(
                 value: fraction,
                 minHeight: 6,
                 backgroundColor: cs.surfaceContainerHighest,
-                valueColor: AlwaysStoppedAnimation(barColor),
+                color: cs.primary,
               ),
             ),
             const SizedBox(height: 10),
-
-            // Stat row
-            _StatRow(stats: stats),
+            Wrap(
+              spacing: 16,
+              runSpacing: 4,
+              children: [
+                stat('avg', _ms(stats.average)),
+                stat('median', _ms(stats.median)),
+                stat('min', _ms(stats.min)),
+                stat('max', _ms(stats.max)),
+                stat('p95', _ms(stats.p95)),
+                stat('p99', _ms(stats.p99)),
+                stat('n', '${stats.iterations}'),
+              ],
+            ),
           ],
         ),
       ),
@@ -597,123 +471,22 @@ class _StatCard extends StatelessWidget {
   }
 }
 
-class _ThroughputBadge extends StatelessWidget {
-  final double throughput;
-  const _ThroughputBadge({required this.throughput});
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final label = throughput.isInfinite
-        ? '∞'
-        : throughput >= 1000
-        ? '${(throughput / 1000).toStringAsFixed(1)}k'
-        : throughput.toStringAsFixed(0);
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-      decoration: BoxDecoration(
-        color: cs.primaryContainer,
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: Text(
-        '$label ops/s',
-        style: TextStyle(
-          fontSize: 11,
-          fontWeight: FontWeight.w600,
-          color: cs.onPrimaryContainer,
-        ),
-      ),
-    );
-  }
-}
-
-class _StatRow extends StatelessWidget {
-  final QueryStats stats;
-  const _StatRow({required this.stats});
-
-  String _ms(Duration d) =>
-      '${(d.inMicroseconds / 1000.0).toStringAsFixed(2)}ms';
-
-  @override
-  Widget build(BuildContext context) {
-    return Wrap(
-      spacing: 16,
-      runSpacing: 4,
-      children: [
-        _StatChip(label: 'avg', value: _ms(stats.average)),
-        _StatChip(label: 'min', value: _ms(stats.min)),
-        _StatChip(label: 'max', value: _ms(stats.max)),
-        _StatChip(label: 'p95', value: _ms(stats.p95)),
-        _StatChip(label: 'p99', value: _ms(stats.p99)),
-        _StatChip(label: 'n', value: '${stats.iterations}'),
-      ],
-    );
-  }
-}
-
-class _StatChip extends StatelessWidget {
-  final String label;
-  final String value;
-  const _StatChip({required this.label, required this.value});
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Row(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Text('$label ', style: TextStyle(fontSize: 11, color: cs.outline)),
-        Text(
-          value,
-          style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
-        ),
-      ],
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Custom query result panel
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _CustomResultPanel extends StatelessWidget {
-  final QueryStats stats;
-  const _CustomResultPanel({required this.stats});
-
-  @override
-  Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(12, 16, 12, 24),
-      children: [_StatCard(stats: stats, maxThroughput: stats.throughput)],
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Copy to clipboard button
-// ─────────────────────────────────────────────────────────────────────────────
-
 class _CopyButton extends StatelessWidget {
-  final BenchmarkSuiteResult result;
-  const _CopyButton({required this.result});
+  const _CopyButton({required this.text});
+
+  final String text;
 
   @override
   Widget build(BuildContext context) {
     return Align(
       alignment: Alignment.centerRight,
       child: TextButton.icon(
-        onPressed: () {
-          final text = DatabaseBenchmark.formatTable(result.results);
-          Clipboard.setData(ClipboardData(text: text));
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Results copied to clipboard'),
-              duration: Duration(seconds: 2),
-            ),
-          );
+        onPressed: () async {
+          await Clipboard.setData(ClipboardData(text: text));
+          if (context.mounted) showAdminMessage(context, 'Results copied.');
         },
         icon: const Icon(Icons.copy, size: 16),
-        label: const Text('Copy as table'),
+        label: const Text('Copy as text'),
       ),
     );
   }

@@ -1,81 +1,122 @@
 ﻿# Changelog
 
-## [1.5.0] - Unreleased
+## [2.0.0] - Unreleased
+
+A new SQL engine that follows SQLite, new persistence, and a tidier API.
+Every 1.x database file still opens. See [MIGRATION.md](MIGRATION.md).
+
+### Breaking
+
+- **SQL follows SQLite.** Three-valued `NULL` logic; numeric `+` (`||`
+  joins text); `BOOLEAN` stores `1`/`0` and `DATETIME` ISO-8601 text;
+  SQLite type affinity; `INTEGER PRIMARY KEY` is the rowid; unknown columns,
+  text after a statement and several statements in one `execute` are
+  errors; result columns are named like SQLite names them (duplicates get
+  `:1`); `LIKE`, `NOCASE`, `lower()` and `upper()` fold ASCII only.
+- **Encryption is not a mode:** `DatabaseMode.secure` is gone; pass an
+  `encryptionKey` with any mode. Keys are derived with PBKDF2-HMAC-SHA256
+  (600 000 iterations, a salt per file) instead of one SHA-256.
+- **Files moved** to `<application support>/just_database/` (1.x: the
+  documents directory, shared by every app on desktop). A 1.x file is
+  copied over the first time it is opened. The file format is now 2; the
+  first save converts a 1.x file.
+- **UI only in `package:just_database/ui.dart`.** `JUDatabaseAdminScreen` is
+  `JustDatabaseAdminScreen({theme, onSeedDatabase, provider, title})`;
+  `JustDatabaseAdminWidget` is removed; `DatabaseProvider` actions return
+  `Future<bool>` and report failures in `lastError`; the pages take the
+  database they show.
+- **Internals are no longer public:** `Executor`, `Parser`, the AST,
+  `Table`, `TableIndex`, `DatabaseRow`, `LockManager`, `QueryTracker`,
+  `PersistenceManager`, `BackupManager`, `RTreeIndex`, `BoundingBox`,
+  `Point`. Schemas use `ColumnDefinition`/`TableConstraint`/
+  `ForeignKeyDefinition` (`DataType` and `ConstraintDefinition` are gone).
+- `transaction()` passes a `Transaction` whose statements throw, and rolls
+  back when the callback throws (1.x committed after failed statements).
+- `query()` refuses statements that write.
+- Migrations take a `Transaction`; `MigrationStatus.skipped` is
+  `rolledBack`; `MigrationGuard` is removed.
+- `DatabaseManager.openDatabases` is read-only; `DatabaseInfo` reports
+  `isEncrypted` instead of a mode for closed databases.
+- ORM `fromRow` receives stored values (use the new row helpers); queries
+  take `whereArgs`.
+- Automatic query-pattern indexes are gone.
+- Requires Flutter 3.47.1, `just_signals` ^2.0.0 and `just_storage` ^2.0.0;
+  the `encrypt` dependency is replaced by `pointycastle`.
 
 ### Added
 
-- **Migrations on an opened database** — `JustDatabase.migrate(migrations)`
-  applies pending migrations, and `JustDatabase.migrationRunner(migrations)`
-  returns a runner for `migrate`, `rollback`, `status` and `currentVersion`.
-  Previously `MigrationRunner` needed an `Executor` that `JustDatabase` kept
-  private, so migrations could not run against an opened database. Persistent
-  databases are saved after every runner operation. On web this works with the
-  IndexedDB and in-memory backends; OPFS worker mode throws `UnsupportedError`.
-  `MigrationRunner` gains an optional `guard` parameter (`MigrationGuard`)
-  that wraps each operation.
-- **`ON DELETE` / `ON UPDATE` foreign key actions** — `CASCADE`, `SET NULL`,
-  `SET DEFAULT`, `RESTRICT` and `NO ACTION`, on both column-level
-  `REFERENCES` and table-level `FOREIGN KEY` clauses. These previously failed
-  to parse (`Expected rparen but got ON`). Cascaded changes fire the child
-  table's triggers and are undone by `ROLLBACK`. A `DELETE` checks every
-  `RESTRICT` / `NOT NULL` violation before changing any row. The actions are
-  stored in `ConstraintDefinition.onDelete` / `onUpdate` (new
-  `ForeignKeyAction` enum), persisted, and kept by the SQL and JSON backups.
-  Actions on composite foreign keys are rejected.
-- **Async introspection on native** — `tableNamesAsync()`, `viewNamesAsync()`,
-  `triggerNamesAsync()`, `indexNamesForTableAsync()`, `getTableSchemaAsync()`,
-  `totalRowsAsync()` and `estimatedSizeBytesAsync()`, plus the static
-  `onStorageDowngrade` callback (never called on native), now exist on the
-  native `JustDatabase` too. The README already listed them, so
-  cross-platform code using them now compiles everywhere.
-- **`JustDatabase.flush()`** — waits until every write made so far is saved,
-  and throws if that save fails (background saves still fail silently).
-  Completes at once when nothing is unsaved, for in-memory databases, and in
-  OPFS worker mode, where the worker logs each statement to its WAL before
-  replying.
-
-### Changed
-
-- **`JustDatabase.open` no longer starts empty over an unreadable file** —
-  when the database file exists but cannot be read or decoded (corrupt,
-  truncated, or a secure-mode database opened without its key), `open` now
-  throws a `StateError` that names the file, and leaves the file untouched.
-  It used to start with an empty database, and the next save overwrote the
-  file. A wrong `encryptionKey` already threw. On web, the IndexedDB backend
-  does the same for a snapshot it cannot decode. Catch the error to offer
-  restoring, moving or deleting the file.
+- Bound parameters (`?`, `?NNN`, `:name`, `@name`, `$name`) on `execute`,
+  `query`, the query builder and the ORM.
+- SQL: `CASE`, `CAST`, `IN (SELECT …)`, `EXISTS`, correlated subqueries,
+  `UNION [ALL]`/`INTERSECT`/`EXCEPT`, `VALUES`, `INSERT … SELECT`,
+  `DEFAULT VALUES`, `INSERT OR …`, `REPLACE`, upserts
+  (`ON CONFLICT … DO UPDATE`), `RIGHT`/`FULL`/`NATURAL`/`USING` joins,
+  `CHECK`, `INSTEAD OF` triggers, `RAISE()`, `||`, `LIKE … ESCAPE`, `GLOB`,
+  `COLLATE`, quoted identifiers, blob and hex literals, `ORDER BY … NULLS
+  FIRST/LAST`, `CREATE TABLE … AS SELECT`, `ALTER TABLE … RENAME TO`,
+  `PRAGMA foreign_keys/user_version/table_info/index_list`, and SQLite's
+  string, math, date/time and aggregate functions.
+- Indexes answer equality lookups and joins; spatial indexes answer
+  `ST_WITHIN`/`ST_INTERSECTS`/`ST_CONTAINS`/`ST_DWITHIN`. New
+  `ST_MAKEENVELOPE`, `ST_DISTANCE_SPHERE`, `ST_DWITHIN`, WKT geometries.
+- `executeScript()`, `QueryResult.values`/`error`/`scalar`/
+  `lastInsertRowId`/`orThrow()`, `SqlException` with `SqlErrorKind`.
+- `exportSql()`, `exportJson()`, `importSql()`, `importJson()` on the
+  database (atomic replace).
+- `changeEncryptionKey()`, `onSaveError`, `findOpen()`, `indexesForTable()`,
+  `rowCount()`, `JustDatabase.nameProblem()`, `SecureKeyManager.hasAutoKey()`.
+- A new saved database is written at once, so it exists (and is listed)
+  before its first change.
+- Opening an open database returns the same instance (reference-counted
+  `close`); a lock keeps other processes and browser tabs out.
+- Web: encrypted databases are encrypted in IndexedDB (WebCrypto).
+- `DbRowValues` row helpers, `QueryBuilder.whereEquals`.
+- Migrations on an opened database: `migrate()`, `migrationRunner()`
+  (from the unreleased 1.5.0).
 
 ### Fixed
 
-- **Lost writes on persistent databases** — every write starts a background
-  save, and those saves wrote the same `.jdb` file at the same time, so the
-  file could end up truncated or holding an older state, and `close()` did not
-  wait for them. Data was lost in about 1 in 4 write → close → reopen cycles on
-  Windows. Saves now run one at a time per database and coalesce, so the newest
-  state always lands last, and `close()` waits for them. Each save writes a
-  uniquely named `.tmp` file and renames it over the database file (retrying
-  briefly on Windows while another process holds the file open), so a crash
-  mid-save leaves the previous version intact. `PersistenceManager` runs its
-  save, load, `peekMode` and delete calls for one database in call order. The
-  IndexedDB backend on web uses the same save queue.
+- Statements are atomic: a failing multi-row `INSERT`/`UPDATE` or a
+  failing trigger leaves nothing behind.
+- Uncommitted transactions were saved, and `close()` inside a transaction
+  persisted it; views, triggers and `CREATE INDEX` indexes were not saved;
+  one `Infinity` value stopped every later save; `close()` did not wait for
+  running statements; one database could be open twice and lose writes;
+  saves raced and lost writes (fixed in the unreleased 1.5.0, kept).
+- Table-level `PRIMARY KEY`/`UNIQUE`, `CREATE UNIQUE INDEX`, composite keys
+  on `UPDATE` and keys after `ROLLBACK` were not enforced; values were
+  checked before type conversion; column names were case-sensitive in
+  `INSERT`/`UPDATE`; `ALTER TABLE` broke constraints.
+- Scalar functions collapsed results to one row; aggregates failed inside
+  expressions and `ORDER BY`; `DISTINCT` aggregates counted duplicates;
+  `ORDER BY` a column not selected did nothing; joins mixed up same-named
+  columns; `GROUP BY` merged `NULL` with `'NULL'`.
+- `AUTOINCREMENT` did not move past explicit ids; `ON DELETE`/`ON UPDATE`
+  actions, triggers' `NEW.id`, `DEFAULT -1` and `DEFAULT
+  CURRENT_TIMESTAMP` misbehaved.
+- Backups dropped negative numbers, blobs, defaults, keys, indexes, views
+  and triggers.
+- Migrations were not atomic, accepted duplicate versions, skipped
+  out-of-order ones and ignored checksums.
+- `SecureKeyManager`: concurrent first calls could create two keys;
+  passwords outside Latin-1 collided.
+- Database names could escape the database directory.
+- Admin UI: it opened a second instance of databases the app had open;
+  deleting one of two identical rows deleted both; editing trimmed text
+  and turned `''` into `NULL`; a failed open showed another database's
+  pages; the "File Persistence" switch hid saved data; DATETIME input
+  allowed SQL injection; large tables were capped at 500 rows and built
+  every cell; the benchmark froze the UI and dropped `_bench_t` in your
+  database; the back arrow emptied the app; colours ignored dark mode;
+  errors were shown on the wrong tab. All fixed, with widget tests.
+- Quadratic `UPDATE`, cascading `DELETE`, R-tree inserts and joins.
+- Opening a database file that cannot be read throws instead of starting
+  empty and overwriting it (from the unreleased 1.5.0).
 
-- **UNIQUE and PRIMARY KEY constraints after `ROLLBACK`** — after any
-  `ROLLBACK` or `ROLLBACK TO SAVEPOINT`, duplicate UNIQUE values and duplicate
-  primary keys (single-column and composite) were accepted, because
-  `Table.clone()` and `Table.restoreFrom()` rebuilt the automatic indexes empty.
-  Indexes from `CREATE INDEX`, query-pattern auto-indexes and indexes loaded
-  from disk were dropped by the rollback as well. Snapshots now copy every
-  index with its contents, and restoring leaves the snapshot intact, so rolling
-  back to the same savepoint twice also works. New `TableIndex.copy()` and
-  `IndexMetadata.copy()` return independent copies.
-- **README** — the migrations example now compiles (it called a
-  `MigrationRunner(db, ...)` constructor and `up:` / `down:` / `toVersion:`
-  parameters that do not exist), and the constraints section documents what
-  foreign keys do and do not enforce.
-- **ARCHITECTURE.md** — no longer claims that migrations run in a transaction
-  or that checksums are validated.
-- **`OpfsStorageDriver.listDatabases`** — errors while listing files are now caught
-  and return `[]` as intended (the inner future was returned without `await`).
+### Removed
+
+- The OPFS/Web Worker/WAL web backend, which could never activate.
+- `API.md` and `DOCS.md`; the README and dartdoc cover the API.
 
 ## [1.4.2] - 2026-05-05
 

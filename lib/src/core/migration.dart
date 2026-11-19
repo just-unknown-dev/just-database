@@ -1,19 +1,27 @@
 import 'dart:convert';
+
 import 'package:crypto/crypto.dart';
-import '../sql/parser.dart';
-import '../sql/executor.dart';
 
-/// Status of an individual migration.
-enum MigrationStatus { pending, applied, skipped, failed }
+import 'just_database.dart';
 
-/// Result for a single migration step.
-class MigrationResult {
-  final int version;
-  final String name;
-  final MigrationStatus status;
-  final String? errorMessage;
-  final Duration? duration;
+/// The state of one migration.
+enum MigrationStatus {
+  /// Not applied yet.
+  pending,
 
+  /// Applied (by this run, or before).
+  applied,
+
+  /// Rolled back by this run.
+  rolledBack,
+
+  /// Failed; nothing it did was kept.
+  failed,
+}
+
+/// The outcome of one migration step.
+final class MigrationResult {
+  /// Creates a result.
   const MigrationResult({
     required this.version,
     required this.name,
@@ -22,47 +30,63 @@ class MigrationResult {
     this.duration,
   });
 
-  bool get success =>
-      status == MigrationStatus.applied || status == MigrationStatus.skipped;
+  final int version;
+  final String name;
+  final MigrationStatus status;
+
+  /// Why it failed.
+  final String? errorMessage;
+
+  /// How long it took, for steps this run performed.
+  final Duration? duration;
+
+  /// Whether the step did not fail.
+  bool get success => status != MigrationStatus.failed;
 
   @override
   String toString() =>
-      'MigrationResult(v$version "$name" ${status.name}${errorMessage != null ? ": $errorMessage" : ""})';
+      'MigrationResult(v$version "$name" ${status.name}'
+      '${errorMessage != null ? ': $errorMessage' : ''})';
 }
 
-/// Abstract base class for migrations.
+/// A migration problem that stops every step: a changed migration, one
+/// added below the applied version, or duplicate versions.
+final class MigrationException implements Exception {
+  /// Creates the exception.
+  const MigrationException(this.message);
+
+  /// What is wrong.
+  final String message;
+
+  @override
+  String toString() => 'MigrationException: $message';
+}
+
+/// One schema change, identified by its [version] (1 and up).
 abstract class Migration {
   /// The schema version this migration upgrades to.
   int get version;
 
-  /// Human-readable name for the migration.
+  /// A human-readable name.
   String get name;
 
-  /// Applies the migration (up).
-  Future<void> up(Executor executor);
+  /// Applies the migration. Runs in a transaction: if it throws, nothing it
+  /// did is kept.
+  Future<void> up(Transaction tx);
 
-  /// Rolls back the migration (down). Optional — default throws unimplemented.
-  Future<void> down(Executor executor) {
-    throw UnimplementedError(
-      'Rollback not implemented for migration v$version',
-    );
-  }
+  /// Reverts the migration. The default throws [UnsupportedError].
+  Future<void> down(Transaction tx) =>
+      throw UnsupportedError('migration v$version has no down()');
 
-  /// Optional checksum for integrity validation (e.g., SHA-256 of the SQL script).
+  /// A fingerprint of the migration. When it is non-null and differs from
+  /// the one stored when the migration was applied, [MigrationRunner]
+  /// stops with a [MigrationException].
   String? get checksum => null;
 }
 
-/// A migration defined by raw SQL strings.
+/// A migration written as SQL scripts.
 class SqlMigration extends Migration {
-  @override
-  final int version;
-
-  @override
-  final String name;
-
-  final String upSql;
-  final String? downSql;
-
+  /// Creates a migration from SQL.
   SqlMigration({
     required this.version,
     required this.name,
@@ -71,52 +95,36 @@ class SqlMigration extends Migration {
   });
 
   @override
-  Future<void> up(Executor executor) async {
-    final stmts = Parser.parseSQLStatements(upSql);
-    for (final stmt in stmts) {
-      final result = await executor.execute(stmt);
-      if (!result.success) {
-        throw StateError(
-          'Migration v$version up() failed: ${result.errorMessage}',
-        );
-      }
-    }
-  }
-
-  @override
-  Future<void> down(Executor executor) async {
-    if (downSql == null) {
-      throw UnimplementedError('No down SQL for migration v$version');
-    }
-    final stmts = Parser.parseSQLStatements(downSql!);
-    for (final stmt in stmts) {
-      final result = await executor.execute(stmt);
-      if (!result.success) {
-        throw StateError(
-          'Migration v$version down() failed: ${result.errorMessage}',
-        );
-      }
-    }
-  }
-
-  @override
-  String get checksum {
-    final bytes = utf8.encode(upSql);
-    return sha256.convert(bytes).toString();
-  }
-}
-
-/// A migration defined by Dart callback functions.
-class CallbackMigration extends Migration {
-  @override
   final int version;
-
   @override
   final String name;
 
-  final Future<void> Function(Executor) upCallback;
-  final Future<void> Function(Executor)? downCallback;
+  /// The statements that apply it, separated by `;`.
+  final String upSql;
 
+  /// The statements that revert it.
+  final String? downSql;
+
+  @override
+  Future<void> up(Transaction tx) => tx.executeScript(upSql);
+
+  @override
+  Future<void> down(Transaction tx) {
+    final sql = downSql;
+    if (sql == null) {
+      throw UnsupportedError('migration v$version has no downSql');
+    }
+    return tx.executeScript(sql);
+  }
+
+  /// The SHA-256 of [upSql].
+  @override
+  String get checksum => sha256.convert(utf8.encode(upSql)).toString();
+}
+
+/// A migration written as Dart callbacks.
+class CallbackMigration extends Migration {
+  /// Creates a migration from callbacks.
   CallbackMigration({
     required this.version,
     required this.name,
@@ -125,239 +133,225 @@ class CallbackMigration extends Migration {
   });
 
   @override
-  Future<void> up(Executor executor) => upCallback(executor);
+  final int version;
+  @override
+  final String name;
+  final Future<void> Function(Transaction tx) upCallback;
+  final Future<void> Function(Transaction tx)? downCallback;
 
   @override
-  Future<void> down(Executor executor) {
-    if (downCallback == null) {
-      throw UnimplementedError('No down callback for migration v$version');
+  Future<void> up(Transaction tx) => upCallback(tx);
+
+  @override
+  Future<void> down(Transaction tx) {
+    final cb = downCallback;
+    if (cb == null) {
+      throw UnsupportedError('migration v$version has no downCallback');
     }
-    return downCallback!(executor);
+    return cb(tx);
   }
 }
 
-/// Wraps one [MigrationRunner] operation, e.g. to persist the database after
-/// it runs.
-typedef MigrationGuard = Future<T> Function<T>(Future<T> Function() operation);
-
-/// Manages schema versioning and migration execution.
-/// Stores applied versions in a special `_migrations` table.
-///
-/// To migrate an opened `JustDatabase`, use `db.migrate(migrations)` or
-/// `db.migrationRunner(migrations)`, which also save the result to disk.
-/// Construct a runner directly only around a bare [Executor].
+/// Applies and reverts [Migration]s on a database, recording the applied
+/// versions in the `_migrations` table.
 class MigrationRunner {
-  static const String _migrationsTable = '_migrations';
+  /// Creates a runner. Throws [ArgumentError] when two migrations share a
+  /// version or a version is below 1.
+  MigrationRunner(this.database, List<Migration> migrations)
+    : _migrations = List.of(migrations)
+        ..sort((a, b) => a.version.compareTo(b.version)) {
+    final seen = <int>{};
+    for (final m in _migrations) {
+      if (m.version < 1) {
+        throw ArgumentError.value(
+          m.version,
+          'version',
+          'migration versions start at 1',
+        );
+      }
+      if (!seen.add(m.version)) {
+        throw ArgumentError.value(
+          m.version,
+          'version',
+          'two migrations have version ${m.version}',
+        );
+      }
+    }
+  }
 
-  final Executor _executor;
+  static const _table = '_migrations';
+
+  /// The database migrated.
+  final JustDatabase database;
   final List<Migration> _migrations;
-  final MigrationGuard _guard;
-
-  /// Creates a runner that applies [migrations] through [executor].
-  ///
-  /// If [guard] is given, every public operation runs inside it.
-  MigrationRunner({
-    required Executor executor,
-    required List<Migration> migrations,
-    MigrationGuard? guard,
-  }) : _executor = executor,
-       _migrations = List.of(migrations)
-         ..sort((a, b) => a.version.compareTo(b.version)),
-       _guard = guard ?? _unguarded;
-
-  static Future<T> _unguarded<T>(Future<T> Function() operation) =>
-      operation();
-
-  /// Creates the internal migrations table if it doesn't exist.
-  Future<void> initialize() => _guard(_initialize);
-
-  /// Returns the highest applied migration version (0 if none).
-  Future<int> currentVersion() => _guard(_currentVersion);
-
-  /// Applies all pending migrations up to [targetVersion] (or all, if null).
-  Future<List<MigrationResult>> migrate({int? targetVersion}) =>
-      _guard(() => _migrate(targetVersion: targetVersion));
-
-  /// Rolls back migrations down to (but not including) [targetVersion].
-  Future<List<MigrationResult>> rollback({int targetVersion = 0}) =>
-      _guard(() => _rollback(targetVersion: targetVersion));
-
-  /// Returns the status of all known migrations relative to current version.
-  Future<List<MigrationResult>> status() => _guard(_status);
-
-  // ---------------------------------------------------------------------------
-  // Private implementation (already running inside the guard)
-  // ---------------------------------------------------------------------------
 
   Future<void> _initialize() async {
-    final result = await _executor.executeSQL('''
-      CREATE TABLE IF NOT EXISTS $_migrationsTable (
-        version INTEGER PRIMARY KEY,
-        name TEXT NOT NULL,
-        checksum TEXT,
-        applied_at TEXT NOT NULL
-      )
-    ''');
-    if (!result.success) {
-      throw StateError(
-        'Failed to initialize migrations table: ${result.errorMessage}',
-      );
+    final r = await database.execute(
+      'CREATE TABLE IF NOT EXISTS $_table ('
+      'version INTEGER PRIMARY KEY, name TEXT NOT NULL, checksum TEXT, '
+      'applied_at TEXT NOT NULL)',
+    );
+    r.orThrow();
+  }
+
+  /// Applied versions with their stored checksums.
+  Future<Map<int, String?>> _applied() async {
+    await _initialize();
+    final r = (await database.query(
+      'SELECT version, checksum FROM $_table',
+    )).orThrow();
+    return {
+      for (final row in r.values)
+        row[0] as int: (row[1] == null || row[1] == 'null')
+            ? null
+            : row[1] as String,
+    };
+  }
+
+  /// The highest applied version, or 0.
+  Future<int> currentVersion() async {
+    final applied = await _applied();
+    return applied.isEmpty ? 0 : applied.keys.reduce((a, b) => a > b ? a : b);
+  }
+
+  void _verify(Map<int, String?> applied) {
+    for (final m in _migrations) {
+      if (!applied.containsKey(m.version)) continue;
+      final stored = applied[m.version];
+      final now = m.checksum;
+      if (stored != null && now != null && stored != now) {
+        throw MigrationException(
+          'migration v${m.version} "${m.name}" was changed after it was applied',
+        );
+      }
     }
   }
 
-  Future<int> _currentVersion() async {
-    await _ensureInitialized();
-    final result = await _executor.executeSQL(
-      'SELECT MAX(version) AS v FROM $_migrationsTable',
-    );
-    if (!result.success || result.rows.isEmpty) return 0;
-    final v = result.rows.first['v'];
-    return v == null ? 0 : (v as num).toInt();
-  }
-
-  Future<List<MigrationResult>> _migrate({int? targetVersion}) async {
-    await _ensureInitialized();
-    final current = await _currentVersion();
+  /// Applies every pending migration up to [targetVersion] (all when
+  /// null), in version order, each in its own transaction. Stops at the
+  /// first that fails (it then left nothing behind) and returns a result
+  /// per migration that ran. Saves before returning.
+  ///
+  /// Throws [MigrationException] when an applied migration changed or a
+  /// pending one is older than the newest applied one.
+  Future<List<MigrationResult>> migrate({int? targetVersion}) async {
+    final applied = await _applied();
+    _verify(applied);
+    final newest = applied.isEmpty
+        ? 0
+        : applied.keys.reduce((a, b) => a > b ? a : b);
+    final pending = [
+      for (final m in _migrations)
+        if (!applied.containsKey(m.version) &&
+            (targetVersion == null || m.version <= targetVersion))
+          m,
+    ];
+    for (final m in pending) {
+      if (m.version < newest) {
+        throw MigrationException(
+          'migration v${m.version} "${m.name}" is older than the applied v$newest; '
+          'give it a higher version',
+        );
+      }
+    }
     final results = <MigrationResult>[];
-    for (final migration in _migrations) {
-      if (migration.version <= current) {
+    for (final m in pending) {
+      final watch = Stopwatch()..start();
+      try {
+        await database.transaction((tx) async {
+          await m.up(tx);
+          await tx.execute(
+            'INSERT INTO $_table (version, name, checksum, applied_at) VALUES (?, ?, ?, ?)',
+            [
+              m.version,
+              m.name,
+              m.checksum,
+              DateTime.now().toUtc().toIso8601String(),
+            ],
+          );
+        });
         results.add(
           MigrationResult(
-            version: migration.version,
-            name: migration.name,
-            status: MigrationStatus.skipped,
+            version: m.version,
+            name: m.name,
+            status: MigrationStatus.applied,
+            duration: watch.elapsed,
           ),
         );
-        continue;
+      } catch (e) {
+        results.add(
+          MigrationResult(
+            version: m.version,
+            name: m.name,
+            status: MigrationStatus.failed,
+            errorMessage: '$e',
+            duration: watch.elapsed,
+          ),
+        );
+        break;
       }
-      if (targetVersion != null && migration.version > targetVersion) break;
-      results.add(await _applyMigration(migration));
-      if (results.last.status == MigrationStatus.failed) break;
     }
+    await database.flush();
     return results;
   }
 
-  Future<List<MigrationResult>> _rollback({int targetVersion = 0}) async {
-    await _ensureInitialized();
-    final current = await _currentVersion();
-    final toRollback =
-        _migrations
-            .where((m) => m.version <= current && m.version > targetVersion)
-            .toList()
-          ..sort((a, b) => b.version.compareTo(a.version)); // descending
-
+  /// Reverts applied migrations above [targetVersion], newest first, each
+  /// in its own transaction. Stops at the first that fails. Saves before
+  /// returning.
+  Future<List<MigrationResult>> rollback({int targetVersion = 0}) async {
+    final applied = await _applied();
+    _verify(applied);
+    final todo = [
+      for (final m in _migrations.reversed)
+        if (applied.containsKey(m.version) && m.version > targetVersion) m,
+    ];
     final results = <MigrationResult>[];
-    for (final migration in toRollback) {
-      results.add(await _rollbackMigration(migration));
-      if (results.last.status == MigrationStatus.failed) break;
+    for (final m in todo) {
+      final watch = Stopwatch()..start();
+      try {
+        await database.transaction((tx) async {
+          await m.down(tx);
+          await tx.execute('DELETE FROM $_table WHERE version = ?', [
+            m.version,
+          ]);
+        });
+        results.add(
+          MigrationResult(
+            version: m.version,
+            name: m.name,
+            status: MigrationStatus.rolledBack,
+            duration: watch.elapsed,
+          ),
+        );
+      } catch (e) {
+        results.add(
+          MigrationResult(
+            version: m.version,
+            name: m.name,
+            status: MigrationStatus.failed,
+            errorMessage: '$e',
+            duration: watch.elapsed,
+          ),
+        );
+        break;
+      }
     }
+    await database.flush();
     return results;
   }
 
-  Future<List<MigrationResult>> _status() async {
-    await _ensureInitialized();
-    final current = await _currentVersion();
-    return _migrations.map((m) {
-      final s = m.version <= current
-          ? MigrationStatus.applied
-          : MigrationStatus.pending;
-      return MigrationResult(version: m.version, name: m.name, status: s);
-    }).toList();
+  /// Every known migration with whether it is applied.
+  Future<List<MigrationResult>> status() async {
+    final applied = await _applied();
+    return [
+      for (final m in _migrations)
+        MigrationResult(
+          version: m.version,
+          name: m.name,
+          status: applied.containsKey(m.version)
+              ? MigrationStatus.applied
+              : MigrationStatus.pending,
+        ),
+    ];
   }
-
-  Future<MigrationResult> _applyMigration(Migration migration) async {
-    final start = DateTime.now();
-    try {
-      await migration.up(_executor);
-      await _recordApplied(migration);
-      return MigrationResult(
-        version: migration.version,
-        name: migration.name,
-        status: MigrationStatus.applied,
-        duration: DateTime.now().difference(start),
-      );
-    } catch (e) {
-      return MigrationResult(
-        version: migration.version,
-        name: migration.name,
-        status: MigrationStatus.failed,
-        errorMessage: e.toString(),
-        duration: DateTime.now().difference(start),
-      );
-    }
-  }
-
-  Future<MigrationResult> _rollbackMigration(Migration migration) async {
-    final start = DateTime.now();
-    try {
-      await migration.down(_executor);
-      await _executor.executeSQL(
-        'DELETE FROM $_migrationsTable WHERE version = ${migration.version}',
-      );
-      return MigrationResult(
-        version: migration.version,
-        name: migration.name,
-        status: MigrationStatus.skipped,
-        duration: DateTime.now().difference(start),
-      );
-    } catch (e) {
-      return MigrationResult(
-        version: migration.version,
-        name: migration.name,
-        status: MigrationStatus.failed,
-        errorMessage: e.toString(),
-        duration: DateTime.now().difference(start),
-      );
-    }
-  }
-
-  Future<void> _recordApplied(Migration migration) async {
-    final appliedAt = DateTime.now().toIso8601String();
-    final checksum = migration.checksum ?? 'null';
-    final stmt = Parser.parseSQL(
-      "INSERT INTO $_migrationsTable (version, name, checksum, applied_at) "
-      "VALUES (${migration.version}, '${_escape(migration.name)}', "
-      "'${_escape(checksum)}', '$appliedAt')",
-    );
-    final result = await _executor.execute(stmt);
-    if (!result.success) {
-      throw StateError('Failed to record migration: ${result.errorMessage}');
-    }
-  }
-
-  Future<void> _ensureInitialized() async {
-    // Check if migrations table exists; initialize lazily
-    final result = await _executor.executeSQL(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name='$_migrationsTable'",
-    );
-    // If query fails (unknown table), initialize
-    if (!result.success || result.rows.isEmpty) {
-      await _initialize();
-    }
-  }
-
-  static String _escape(String s) => s.replaceAll("'", "''");
-}
-
-/// Simple DTO describing a recorded migration.
-class AppliedMigration {
-  final int version;
-  final String name;
-  final String? checksum;
-  final DateTime appliedAt;
-
-  const AppliedMigration({
-    required this.version,
-    required this.name,
-    this.checksum,
-    required this.appliedAt,
-  });
-
-  factory AppliedMigration.fromRow(Map<String, dynamic> row) =>
-      AppliedMigration(
-        version: row['version'] as int,
-        name: row['name'] as String,
-        checksum: row['checksum'] as String?,
-        appliedAt: DateTime.parse(row['applied_at'] as String),
-      );
 }

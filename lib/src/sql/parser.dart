@@ -1,1514 +1,1830 @@
-import '../storage/schema.dart' show ForeignKeyAction;
+import 'package:flutter/foundation.dart' show internal;
+
+import '../storage/schema.dart';
+import '../storage/values.dart' show minInt64;
 import 'ast.dart';
 import 'lexer.dart';
+import 'sql_exception.dart';
 
-/// Recursive-descent SQL parser.
-/// Converts a token list into an [Statement] AST.
-class Parser {
+/// A parsed statement with its parameters.
+@internal
+final class ParsedStatement {
+  ParsedStatement(this.statement, this.source, this.parameterCount, this.names);
+
+  /// The statement.
+  final Statement statement;
+
+  /// The whole SQL text the statement was parsed from; the offsets in the
+  /// syntax tree point into it.
+  final String source;
+
+  /// The statement's own SQL text.
+  String get sql => source.substring(statement.start, statement.end);
+
+  /// How many parameters it takes (the largest parameter index).
+  final int parameterCount;
+
+  /// The index of each named parameter, by its name without the prefix
+  /// (`:id`, `@id` and `$id` are all `id`).
+  final Map<String, int> names;
+}
+
+/// Words that cannot be used as identifiers without quoting (SQLite's
+/// keywords that have no fallback to an identifier), plus the join words.
+const _reserved = {
+  'ADD', 'ALL', 'ALTER', 'AND', 'AS', 'AUTOINCREMENT', 'BETWEEN', 'CASE', //
+  'CHECK', 'COLLATE', 'COMMIT', 'CONSTRAINT', 'CREATE', 'CROSS', //
+  'CURRENT_DATE', 'CURRENT_TIME', 'CURRENT_TIMESTAMP', 'DEFAULT', //
+  'DEFERRABLE', 'DELETE', 'DISTINCT', 'DROP', 'ELSE', 'ESCAPE', 'EXCEPT', //
+  'EXISTS', 'FOREIGN', 'FROM', 'FULL', 'GLOB', 'GROUP', 'HAVING', 'IN', //
+  'INDEX', 'INNER', 'INSERT', 'INTERSECT', 'INTO', 'IS', 'ISNULL', 'JOIN', //
+  'LEFT', 'LIKE', 'LIMIT', 'NATURAL', 'NOT', 'NOTNULL', 'NULL', 'ON', 'OR', //
+  'ORDER', 'OUTER', 'PRIMARY', 'REFERENCES', 'REGEXP', 'RETURNING', 'RIGHT', //
+  'ROLLBACK', 'SELECT', 'SET', 'TABLE', 'THEN', 'TO', 'TRANSACTION', //
+  'UNION', 'UNIQUE', 'UPDATE', 'USING', 'VALUES', 'WHEN', 'WHERE', //
+};
+
+/// Words that may name a column but never follow a table or expression as
+/// an alias without `AS`, because a clause starts with them.
+const _noImplicitAlias = {'OFFSET', 'WINDOW', 'INDEXED', 'MATCH'};
+
+/// Parses SQL text.
+@internal
+final class Parser {
+  Parser._(this._sql) : _tokens = _withHints(tokenize(_sql));
+
+  final String _sql;
   final List<Token> _tokens;
-  int _pos = 0;
-  final List<QueryHint> _pendingHints = [];
+  int _p = 0;
 
-  Parser(this._tokens);
+  // Parameters of the statement being parsed.
+  int _paramMax = 0;
+  Map<String, int> _named = {};
+  bool _paramsAllowed = true;
 
-  /// Convenience factory: tokenize + parse in one call.
-  static Statement parseSQL(String sql) {
-    final tokens = Lexer(sql).tokenize();
-    return Parser(tokens).parse();
-  }
-
-  /// Parse a SQL script containing multiple semicolon-separated statements.
-  static List<Statement> parseSQLStatements(String sql) {
-    final tokens = Lexer(sql).tokenize();
-    final parser = Parser(tokens);
-    final stmts = <Statement>[];
-    while (!parser._isAtEnd()) {
-      while (parser._check(TokenType.semicolon)) {
-        parser._advance();
-      }
-      if (parser._isAtEnd()) break;
-      stmts.add(parser._parseStatement());
-      parser._match(TokenType.semicolon);
+  /// Parses [sql], which must hold exactly one statement (a trailing `;` is
+  /// allowed). Throws [SqlException] on a syntax error, on trailing text,
+  /// and when [sql] holds more than one statement.
+  static ParsedStatement parseOne(String sql) {
+    final p = Parser._(sql);
+    p._skipSemicolons();
+    if (p._peek.kind == TokenKind.eof) {
+      throw SqlException.syntax('empty statement', sql, 0);
     }
-    return stmts;
-  }
-
-  Statement parse() {
-    // Skip leading semicolons
-    while (_check(TokenType.semicolon)) {
-      _advance();
-    }
-    final stmt = _parseStatement();
-    // Allow trailing semicolon
-    _match(TokenType.semicolon);
-    return stmt;
-  }
-
-  Statement _parseStatement() {
-    // Collect any leading query hints (/*+ ... */ before SELECT etc.)
-    while (_check(TokenType.hintComment)) {
-      _pendingHints.addAll(_parseHintBody(_advance().value as String? ?? ''));
-    }
-    final t = _peek();
-    switch (t.type) {
-      case TokenType.kwSelect:
-        return _parseSelect();
-      case TokenType.kwInsert:
-        return _parseInsert();
-      case TokenType.kwUpdate:
-        return _parseUpdate();
-      case TokenType.kwDelete:
-        return _parseDelete();
-      case TokenType.kwCreate:
-        return _parseCreate();
-      case TokenType.kwDrop:
-        return _parseDrop();
-      case TokenType.kwAlter:
-        return _parseAlter();
-      case TokenType.kwBegin:
-        return _parseBegin();
-      case TokenType.kwCommit:
-        return _parseCommit();
-      case TokenType.kwRollback:
-        return _parseRollback();
-      case TokenType.kwSavepoint:
-        return _parseSavepoint();
-      case TokenType.kwRelease:
-        return _parseRelease();
-      default:
-        throw _error(
-          'Expected SQL statement (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE)',
+    final s = p._statementWithParams();
+    p._skipSemicolons();
+    if (p._peek.kind != TokenKind.eof) {
+      final t = p._peek;
+      if (s.statement.end <= t.start && _startsStatement(t)) {
+        throw SqlException(
+          'more than one statement; use executeScript() to run several',
+          kind: SqlErrorKind.misuse,
+          sql: sql,
+          offset: t.start,
         );
-    }
-  }
-
-  // ===========================================================================
-  // SELECT
-  // ===========================================================================
-
-  SelectStatement _parseSelect() {
-    _consume(TokenType.kwSelect);
-    // Collect inline query hints: SELECT /*+ INDEX(tbl idx) */ ...
-    while (_check(TokenType.hintComment)) {
-      _pendingHints.addAll(_parseHintBody(_advance().value as String? ?? ''));
-    }
-    final distinct = _match(TokenType.kwDistinct) != null;
-
-    final columns = _parseSelectList();
-    // Allow SELECT without FROM (e.g. SELECT 1+1, scalar functions).
-    // In that case, use a virtual "_dual_" table (one row, no columns).
-    final String tableName;
-    final String? tableAlias;
-    if (_check(TokenType.kwFrom)) {
-      _advance(); // consume FROM
-      final ref = _parseTableRef();
-      tableName = ref.$1;
-      tableAlias = ref.$2;
-    } else {
-      tableName = '_dual_';
-      tableAlias = null;
-    }
-    final joins = _parseJoins();
-    Expression? where;
-    if (_match(TokenType.kwWhere) != null) {
-      where = _parseExpression();
-    }
-    final groupBy = <String>[];
-    if (_checkSequence([TokenType.kwGroup, TokenType.kwBy])) {
-      _advance();
-      _advance();
-      groupBy.add(_parseColumnName());
-      while (_match(TokenType.comma) != null) {
-        groupBy.add(_parseColumnName());
       }
+      throw SqlException.syntax('near $t: syntax error', sql, t.start);
     }
-    Expression? having;
-    if (_match(TokenType.kwHaving) != null) {
-      having = _parseExpression();
-    }
-    final orderBy = <OrderByClause>[];
-    if (_checkSequence([TokenType.kwOrder, TokenType.kwBy])) {
-      _advance();
-      _advance();
-      orderBy.addAll(_parseOrderByList());
-    }
-    int? limit;
-    if (_match(TokenType.kwLimit) != null) {
-      limit = _consumeInt('Expected integer after LIMIT');
-    }
-    int? offset;
-    if (_match(TokenType.kwOffset) != null) {
-      offset = _consumeInt('Expected integer after OFFSET');
-    }
-
-    final hints = List<QueryHint>.of(_pendingHints);
-    _pendingHints.clear();
-    return SelectStatement(
-      columns: columns,
-      tableName: tableName,
-      tableAlias: tableAlias,
-      joins: joins,
-      whereClause: where,
-      groupBy: groupBy,
-      having: having,
-      orderBy: orderBy,
-      limit: limit,
-      offset: offset,
-      distinct: distinct,
-      hints: hints,
-    );
+    return s;
   }
 
-  List<SelectColumn> _parseSelectList() {
-    final cols = <SelectColumn>[];
-    cols.add(_parseSelectColumn());
-    while (_match(TokenType.comma) != null) {
-      cols.add(_parseSelectColumn());
-    }
-    return cols;
-  }
-
-  SelectColumn _parseSelectColumn() {
-    // SELECT *
-    if (_check(TokenType.opStar)) {
-      _advance();
-      return const SelectColumn(isStar: true);
-    }
-    // SELECT t.*
-    if (_check(TokenType.identifier) &&
-        _peekAt(1).type == TokenType.dot &&
-        _peekAt(2).type == TokenType.opStar) {
-      final prefix = _advance().value as String;
-      _advance(); // dot
-      _advance(); // *
-      return SelectColumn(isStar: true, starTablePrefix: prefix);
-    }
-
-    final expr = _parseExpression();
-    String? alias;
-    if (_match(TokenType.kwAs) != null) {
-      alias = _parseColumnName();
-    } else if (_check(TokenType.identifier)) {
-      // Implicit alias
-      alias = _advance().value as String;
-    }
-    return SelectColumn(expression: expr, alias: alias);
-  }
-
-  /// Parses "tableName [alias]" or "tableName AS alias".
-  (String, String?) _parseTableRef() {
-    final name = _parseTableName();
-    String? alias;
-    if (_match(TokenType.kwAs) != null) {
-      alias = _parseColumnName();
-    } else if (_check(TokenType.identifier)) {
-      alias = _advance().value as String;
-    }
-    return (name, alias);
-  }
-
-  List<JoinClause> _parseJoins() {
-    final joins = <JoinClause>[];
-    while (_isJoinStart()) {
-      joins.add(_parseJoin());
-    }
-    return joins;
-  }
-
-  bool _isJoinStart() {
-    final t = _peek().type;
-    return t == TokenType.kwJoin ||
-        t == TokenType.kwInner ||
-        t == TokenType.kwLeft ||
-        t == TokenType.kwRight;
-  }
-
-  JoinClause _parseJoin() {
-    JoinType type;
-    final t = _peek().type;
-    if (t == TokenType.kwInner) {
-      _advance();
-      _consume(TokenType.kwJoin);
-      type = JoinType.inner;
-    } else if (t == TokenType.kwLeft) {
-      _advance();
-      _match(TokenType.kwOuter);
-      _consume(TokenType.kwJoin);
-      type = JoinType.left;
-    } else if (t == TokenType.kwRight) {
-      _advance();
-      _match(TokenType.kwOuter);
-      _consume(TokenType.kwJoin);
-      type = JoinType.right;
-    } else {
-      _consume(TokenType.kwJoin);
-      type = JoinType.inner;
-    }
-    final (tableName, alias) = _parseTableRef();
-    _consume(TokenType.kwOn, errorMessage: 'Expected ON after JOIN table name');
-    final condition = _parseExpression();
-    return JoinClause(
-      type: type,
-      tableName: tableName,
-      alias: alias,
-      condition: condition,
-    );
-  }
-
-  List<OrderByClause> _parseOrderByList() {
-    final clauses = <OrderByClause>[];
-    clauses.add(_parseOrderByClause());
-    while (_match(TokenType.comma) != null) {
-      clauses.add(_parseOrderByClause());
-    }
-    return clauses;
-  }
-
-  OrderByClause _parseOrderByClause() {
-    final expr = _parseExpression();
-    bool desc = false;
-    if (_check(TokenType.identifier)) {
-      final lexeme = _peek().lexeme.toUpperCase();
-      if (lexeme == 'DESC') {
-        _advance();
-        desc = true;
-      } else if (lexeme == 'ASC') {
-        _advance();
+  /// Parses every statement of [sql], separated by `;`.
+  static List<ParsedStatement> parseScript(String sql) {
+    final p = Parser._(sql);
+    final out = <ParsedStatement>[];
+    p._skipSemicolons();
+    while (p._peek.kind != TokenKind.eof) {
+      out.add(p._statementWithParams());
+      if (p._peek.kind != TokenKind.eof && !p._peek.isSymbol(';')) {
+        throw SqlException.syntax(
+          'near ${p._peek}: syntax error',
+          sql,
+          p._peek.start,
+        );
       }
+      p._skipSemicolons();
     }
-    return OrderByClause(expression: expr, descending: desc);
+    return out;
   }
 
-  // ===========================================================================
-  // INSERT
-  // ===========================================================================
-
-  InsertStatement _parseInsert() {
-    _consume(TokenType.kwInsert);
-    _consume(TokenType.kwInto, errorMessage: 'Expected INTO after INSERT');
-    final tableName = _parseTableName();
-
-    List<String>? columns;
-    if (_check(TokenType.lparen)) {
-      // Peek: if next after '(' is an identifier followed by ')' or ',' it's column list
-      // (Not a VALUES subquery)
-      _advance(); // consume '('
-      columns = [];
-      columns.add(_parseColumnName());
-      while (_match(TokenType.comma) != null) {
-        columns.add(_parseColumnName());
-      }
-      _consume(TokenType.rparen);
-    }
-
-    _consume(TokenType.kwValues, errorMessage: 'Expected VALUES');
-    final valueRows = <List<Expression>>[];
-    valueRows.add(_parseValueRow());
-    while (_match(TokenType.comma) != null) {
-      valueRows.add(_parseValueRow());
-    }
-
-    return InsertStatement(
-      tableName: tableName,
-      columns: columns,
-      valueRows: valueRows,
-    );
-  }
-
-  List<Expression> _parseValueRow() {
-    _consume(TokenType.lparen);
-    final values = <Expression>[];
-    values.add(_parseExpression());
-    while (_match(TokenType.comma) != null) {
-      values.add(_parseExpression());
-    }
-    _consume(TokenType.rparen);
-    return values;
-  }
-
-  // ===========================================================================
-  // UPDATE
-  // ===========================================================================
-
-  UpdateStatement _parseUpdate() {
-    _consume(TokenType.kwUpdate);
-    final tableName = _parseTableName();
-    _consume(TokenType.kwSet, errorMessage: 'Expected SET after table name');
-    final assignments = <AssignmentClause>[];
-    assignments.add(_parseAssignment());
-    while (_match(TokenType.comma) != null) {
-      assignments.add(_parseAssignment());
-    }
-    Expression? where;
-    if (_match(TokenType.kwWhere) != null) {
-      where = _parseExpression();
-    }
-    return UpdateStatement(
-      tableName: tableName,
-      assignments: assignments,
-      whereClause: where,
-    );
-  }
-
-  AssignmentClause _parseAssignment() {
-    final col = _parseColumnName();
-    _consume(TokenType.opEq, errorMessage: 'Expected = in assignment');
-    final value = _parseExpression();
-    return AssignmentClause(columnName: col, value: value);
-  }
-
-  // ===========================================================================
-  // DELETE
-  // ===========================================================================
-
-  DeleteStatement _parseDelete() {
-    _consume(TokenType.kwDelete);
-    _consume(TokenType.kwFrom, errorMessage: 'Expected FROM after DELETE');
-    final tableName = _parseTableName();
-    Expression? where;
-    if (_match(TokenType.kwWhere) != null) {
-      where = _parseExpression();
-    }
-    return DeleteStatement(tableName: tableName, whereClause: where);
-  }
-
-  // ===========================================================================
-  // CREATE
-  // ===========================================================================
-
-  Statement _parseCreate() {
-    _consume(TokenType.kwCreate);
-
-    // CREATE [OR REPLACE] VIEW
-    bool orReplace = false;
-    if (_check(TokenType.kwOr)) {
-      _advance(); // OR
-      // Next token should be REPLACE (an identifier-like keyword)
-      if (_peek().lexeme.toUpperCase() == 'REPLACE') {
-        _advance();
-        orReplace = true;
-      }
-    }
-    if (_check(TokenType.kwView)) {
-      return _parseCreateView(orReplace: orReplace);
-    }
-
-    // CREATE TRIGGER
-    if (_check(TokenType.kwTrigger)) {
-      return _parseCreateTrigger();
-    }
-
-    // CREATE [UNIQUE|SPATIAL] INDEX
-    bool isUnique = false;
-    bool isSpatial = false;
-    if (_match(TokenType.kwUnique) != null) {
-      isUnique = true;
-    } else if (_match(TokenType.kwSpatial) != null) {
-      isSpatial = true;
-    }
-    if (_check(TokenType.kwIndex)) {
-      return _parseCreateIndex(isUnique: isUnique, isSpatial: isSpatial);
-    }
-    if (isUnique || isSpatial) {
-      throw _error('Expected INDEX after UNIQUE or SPATIAL');
-    }
-
-    _consume(
-      TokenType.kwTable,
-      errorMessage: 'Expected TABLE, VIEW, TRIGGER, or INDEX after CREATE',
-    );
-    bool ifNotExists = false;
-    if (_checkSequence([TokenType.kwIf, TokenType.kwNot, TokenType.kwExists])) {
-      _advance();
-      _advance();
-      _advance();
-      ifNotExists = true;
-    }
-    final tableName = _parseTableName();
-    _consume(TokenType.lparen);
-    final columns = <ColumnDefinitionNode>[];
-    final foreignKeys = <ForeignKeyConstraintNode>[];
-    final tableConstraints = <TableLevelConstraintNode>[];
-    _parseColumnOrConstraint(columns, foreignKeys, tableConstraints);
-    while (_match(TokenType.comma) != null) {
-      if (_isAtEnd() || _check(TokenType.rparen)) break;
-      _parseColumnOrConstraint(columns, foreignKeys, tableConstraints);
-    }
-    _consume(TokenType.rparen);
-    return CreateTableStatement(
-      tableName: tableName,
-      ifNotExists: ifNotExists,
-      columns: columns,
-      foreignKeys: foreignKeys,
-      tableConstraints: tableConstraints,
-    );
-  }
-
-  /// CREATE [OR REPLACE] VIEW [IF NOT EXISTS] name AS select
-  CreateViewStatement _parseCreateView({bool orReplace = false}) {
-    _consume(TokenType.kwView);
-    bool ifNotExists = false;
-    if (_checkSequence([TokenType.kwIf, TokenType.kwNot, TokenType.kwExists])) {
-      _advance();
-      _advance();
-      _advance();
-      ifNotExists = true;
-    }
-    final viewName = _parseTableName();
-    // Expect AS
-    if (_peek().lexeme.toUpperCase() != 'AS' && !_check(TokenType.kwAs)) {
-      throw _error('Expected AS after view name');
-    }
-    _advance(); // AS
-    final select = _parseSelect();
-    return CreateViewStatement(
-      viewName: viewName,
-      orReplace: orReplace,
-      ifNotExists: ifNotExists,
-      selectStatement: select,
-    );
-  }
-
-  void _parseColumnOrConstraint(
-    List<ColumnDefinitionNode> columns,
-    List<ForeignKeyConstraintNode> foreignKeys,
-    List<TableLevelConstraintNode> tableConstraints,
-  ) {
-    if (_check(TokenType.kwForeign)) {
-      foreignKeys.add(_parseForeignKeyConstraint());
-    } else if (_check(TokenType.kwPrimary)) {
-      // Table-level PRIMARY KEY (col1, col2)
-      _advance(); // PRIMARY
-      _consume(TokenType.kwKey);
-      _consume(TokenType.lparen);
-      final cols = <String>[];
-      cols.add(_parseColumnName());
-      while (_match(TokenType.comma) != null) {
-        cols.add(_parseColumnName());
-      }
-      _consume(TokenType.rparen);
-      tableConstraints.add(
-        TableLevelConstraintNode(type: 'PRIMARY KEY', columns: cols),
+  /// Parses a single expression (used for stored DEFAULT and CHECK text).
+  static Expr parseExpression(String sql) {
+    final p = Parser._(sql).._paramsAllowed = false;
+    final e = p._expr();
+    if (p._peek.kind != TokenKind.eof) {
+      throw SqlException.syntax(
+        'near ${p._peek}: syntax error',
+        sql,
+        p._peek.start,
       );
-    } else if (_check(TokenType.kwUnique)) {
-      // Table-level UNIQUE (col1, col2)
-      _advance();
-      _consume(TokenType.lparen);
-      final cols = <String>[];
-      cols.add(_parseColumnName());
-      while (_match(TokenType.comma) != null) {
-        if (_check(TokenType.rparen)) break;
-        cols.add(_parseColumnName());
-      }
-      _consume(TokenType.rparen);
-      tableConstraints.add(
-        TableLevelConstraintNode(type: 'UNIQUE', columns: cols),
-      );
-    } else {
-      columns.add(_parseColumnDefinition());
     }
+    return e;
   }
 
-  ColumnDefinitionNode _parseColumnDefinition() {
-    final name = _parseColumnName();
-    final dataType = _parseDataTypeName();
-    bool notNull = false;
-    bool primaryKey = false;
-    bool unique = false;
-    bool autoIncrement = false;
-    Expression? defaultValue;
-    String? fkTable;
-    String? fkColumn;
-    var fkOnDelete = ForeignKeyAction.noAction;
-    var fkOnUpdate = ForeignKeyAction.noAction;
+  static bool _startsStatement(Token t) =>
+      t.kind == TokenKind.word &&
+      const {
+        'SELECT', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER', //
+        'BEGIN', 'COMMIT', 'END', 'ROLLBACK', 'SAVEPOINT', 'RELEASE', //
+        'PRAGMA', 'REPLACE', 'VALUES', 'WITH', //
+      }.contains(t.upper);
 
-    bool loop = true;
-    while (loop) {
-      if (_match(TokenType.kwNot) != null) {
-        _consume(TokenType.kwNull_, errorMessage: 'Expected NULL after NOT');
-        notNull = true;
-      } else if (_check(TokenType.kwPrimary)) {
-        _advance();
-        _consume(TokenType.kwKey);
-        primaryKey = true;
-        notNull = true;
-      } else if (_check(TokenType.kwAutoincrement)) {
-        _advance();
-        autoIncrement = true;
-      } else if (_match(TokenType.kwUnique) != null) {
-        unique = true;
-      } else if (_match(TokenType.kwDefault) != null) {
-        defaultValue = _parsePrimary();
-      } else if (_check(TokenType.kwReferences)) {
-        _advance();
-        fkTable = _parseTableName();
-        if (_check(TokenType.lparen)) {
-          _advance();
-          fkColumn = _parseColumnName();
-          _consume(TokenType.rparen);
+  /// Keeps hint comments only where hints may stand: at the start of a
+  /// statement and right after SELECT. Elsewhere they are plain comments.
+  static List<Token> _withHints(List<Token> tokens) {
+    final out = <Token>[];
+    for (final t in tokens) {
+      if (t.kind == TokenKind.hint) {
+        final prev = out.lastWhere(
+          (x) => x.kind != TokenKind.hint,
+          orElse: () => Token(TokenKind.eof, '', 0, 0),
+        );
+        if (prev.kind == TokenKind.eof ||
+            prev.isSymbol(';') ||
+            prev.isWord('SELECT')) {
+          out.add(t);
         }
-        final actions = _parseForeignKeyActions();
-        fkOnDelete = actions.onDelete;
-        fkOnUpdate = actions.onUpdate;
-      } else {
-        loop = false;
+        continue;
       }
+      out.add(t);
     }
+    return out;
+  }
 
-    return ColumnDefinitionNode(
-      name: name,
-      dataType: dataType,
-      notNull: notNull,
-      primaryKey: primaryKey,
-      unique: unique,
-      autoIncrement: autoIncrement,
-      defaultValue: defaultValue,
-      foreignKeyTable: fkTable,
-      foreignKeyColumn: fkColumn,
-      onDelete: fkOnDelete,
-      onUpdate: fkOnUpdate,
+  // ---------------------------------------------------------------------------
+  // Token helpers
+  // ---------------------------------------------------------------------------
+
+  Token get _peek => _tokens[_p];
+  Token _peekAt(int k) => _tokens[(_p + k).clamp(0, _tokens.length - 1)];
+  Token _advance() => _tokens[_p < _tokens.length - 1 ? _p++ : _p];
+  int get _lastEnd => _p == 0 ? 0 : _tokens[_p - 1].end;
+
+  bool _isWord(String w) => _peek.isWord(w);
+  bool _isSymbol(String s) => _peek.isSymbol(s);
+
+  bool _acceptWord(String w) {
+    if (_isWord(w)) {
+      _p++;
+      return true;
+    }
+    return false;
+  }
+
+  bool _acceptSymbol(String s) {
+    if (_isSymbol(s)) {
+      _p++;
+      return true;
+    }
+    return false;
+  }
+
+  Never _error([String? what]) {
+    final t = _peek;
+    throw SqlException.syntax(
+      what ??
+          (t.kind == TokenKind.eof
+              ? 'incomplete input'
+              : 'near $t: syntax error'),
+      _sql,
+      t.start,
     );
   }
 
-  /// Parses the `ON DELETE action` / `ON UPDATE action` clauses (in any
-  /// order) that may follow a REFERENCES clause.
-  ({ForeignKeyAction onDelete, ForeignKeyAction onUpdate})
-  _parseForeignKeyActions() {
-    var onDelete = ForeignKeyAction.noAction;
-    var onUpdate = ForeignKeyAction.noAction;
-    while (_match(TokenType.kwOn) != null) {
-      if (_match(TokenType.kwDelete) != null) {
-        onDelete = _parseForeignKeyAction();
-      } else if (_match(TokenType.kwUpdate) != null) {
-        onUpdate = _parseForeignKeyAction();
-      } else {
-        throw _error('Expected DELETE or UPDATE after ON in REFERENCES');
-      }
-    }
-    return (onDelete: onDelete, onUpdate: onUpdate);
+  void _expectWord(String w) {
+    if (!_acceptWord(w)) _error('expected $w but found $_peek');
   }
 
-  ForeignKeyAction _parseForeignKeyAction() {
-    if (_match(TokenType.kwSet) != null) {
-      if (_match(TokenType.kwNull_) != null) return ForeignKeyAction.setNull;
-      if (_match(TokenType.kwDefault) != null) {
-        return ForeignKeyAction.setDefault;
-      }
-      throw _error('Expected NULL or DEFAULT after SET');
-    }
-    switch (_peek().lexeme.toUpperCase()) {
-      case 'CASCADE':
-        _advance();
-        return ForeignKeyAction.cascade;
-      case 'RESTRICT':
-        _advance();
-        return ForeignKeyAction.restrict;
-      case 'NO':
-        _advance();
-        if (_peek().lexeme.toUpperCase() != 'ACTION') {
-          throw _error('Expected ACTION after NO');
-        }
-        _advance();
-        return ForeignKeyAction.noAction;
-    }
-    throw _error(
-      'Expected CASCADE, RESTRICT, SET NULL, SET DEFAULT or NO ACTION but '
-      'got "${_peek().lexeme}"',
-    );
+  void _expectSymbol(String s) {
+    if (!_acceptSymbol(s)) _error("expected '$s' but found $_peek");
   }
 
-  ForeignKeyConstraintNode _parseForeignKeyConstraint() {
-    _consume(TokenType.kwForeign);
-    _consume(TokenType.kwKey);
-    _consume(TokenType.lparen);
-    final cols = <String>[];
-    cols.add(_parseColumnName());
-    while (_match(TokenType.comma) != null) {
-      cols.add(_parseColumnName());
-    }
-    _consume(TokenType.rparen);
-    _consume(
-      TokenType.kwReferences,
-      errorMessage: 'Expected REFERENCES in FOREIGN KEY',
-    );
-    final refTable = _parseTableName();
-    _consume(TokenType.lparen);
-    final refCols = <String>[];
-    refCols.add(_parseColumnName());
-    while (_match(TokenType.comma) != null) {
-      refCols.add(_parseColumnName());
-    }
-    _consume(TokenType.rparen);
-    final actions = _parseForeignKeyActions();
-    return ForeignKeyConstraintNode(
-      columns: cols,
-      referencedTable: refTable,
-      referencedColumns: refCols,
-      onDelete: actions.onDelete,
-      onUpdate: actions.onUpdate,
-    );
+  void _skipSemicolons() {
+    while (_acceptSymbol(';')) {}
   }
 
-  String _parseDataTypeName() {
-    final t = _peek();
-    if (_isDataTypeToken(t.type)) {
-      _advance();
-      // Handle VARCHAR(n), CHAR(n) etc.
-      if (_check(TokenType.lparen)) {
-        _advance();
-        while (!_check(TokenType.rparen) && !_isAtEnd()) {
-          _advance();
-        }
-        _consume(TokenType.rparen);
-      }
-      return t.lexeme.toUpperCase();
+  /// An identifier: a quoted identifier, or a bare word that is not
+  /// reserved. Strings are accepted too, as SQLite does for names.
+  String _name([String what = 'a name']) {
+    final t = _peek;
+    if (t.kind == TokenKind.quotedIdentifier || t.kind == TokenKind.string) {
+      _p++;
+      return t.text;
     }
-    // Allow identifiers as type names too
-    if (t.type == TokenType.identifier) {
-      _advance();
-      if (_check(TokenType.lparen)) {
-        _advance();
-        while (!_check(TokenType.rparen) && !_isAtEnd()) {
-          _advance();
-        }
-        _consume(TokenType.rparen);
-      }
-      return t.lexeme.toUpperCase();
+    if (t.kind == TokenKind.word && !_reserved.contains(t.upper)) {
+      _p++;
+      return t.text;
     }
-    throw _error('Expected data type name');
+    _error('expected $what but found $t');
   }
 
-  bool _isDataTypeToken(TokenType t) {
-    return t == TokenType.kwInteger ||
-        t == TokenType.kwInt ||
-        t == TokenType.kwText ||
-        t == TokenType.kwVarchar ||
-        t == TokenType.kwReal ||
-        t == TokenType.kwFloat ||
-        t == TokenType.kwDouble ||
-        t == TokenType.kwBlob ||
-        t == TokenType.kwBoolean ||
-        t == TokenType.kwBool ||
-        t == TokenType.kwDatetime ||
-        t == TokenType.kwDate;
+  bool get _atName {
+    final t = _peek;
+    return t.kind == TokenKind.quotedIdentifier ||
+        (t.kind == TokenKind.word && !_reserved.contains(t.upper));
   }
 
-  // ===========================================================================
-  // DROP
-  // ===========================================================================
-
-  Statement _parseDrop() {
-    _consume(TokenType.kwDrop);
-    // DROP VIEW
-    if (_check(TokenType.kwView)) {
-      _advance(); // VIEW
-      bool ifExists = false;
-      if (_checkSequence([TokenType.kwIf, TokenType.kwExists])) {
-        _advance();
-        _advance();
-        ifExists = true;
-      }
-      final viewName = _parseTableName();
-      return DropViewStatement(viewName: viewName, ifExists: ifExists);
+  /// An optional alias: `AS name`, or a bare name that cannot start a
+  /// clause.
+  String? _alias() {
+    if (_acceptWord('AS')) return _name('an alias');
+    final t = _peek;
+    if (t.kind == TokenKind.quotedIdentifier || t.kind == TokenKind.string) {
+      _p++;
+      return t.text;
     }
-    // DROP TRIGGER
-    if (_check(TokenType.kwTrigger)) {
-      _advance(); // TRIGGER
-      bool ifExists = false;
-      if (_checkSequence([TokenType.kwIf, TokenType.kwExists])) {
-        _advance();
-        _advance();
-        ifExists = true;
-      }
-      final name = _parseIdentifierOrKeyword();
-      return DropTriggerStatement(name: name, ifExists: ifExists);
+    if (t.kind == TokenKind.word &&
+        !_reserved.contains(t.upper) &&
+        !_noImplicitAlias.contains(t.upper)) {
+      _p++;
+      return t.text;
     }
-    // DROP INDEX
-    if (_check(TokenType.kwIndex)) {
-      _advance(); // INDEX
-      bool ifExists = false;
-      if (_checkSequence([TokenType.kwIf, TokenType.kwExists])) {
-        _advance();
-        _advance();
-        ifExists = true;
-      }
-      final indexName = _parseIdentifierOrKeyword();
-      String? tableName;
-      if (_check(TokenType.kwOn) ||
-          (_peek().type == TokenType.identifier &&
-              _peek().lexeme.toUpperCase() == 'ON')) {
-        _advance(); // ON
-        tableName = _parseTableName();
-      }
-      return DropIndexStatement(
-        indexName: indexName,
-        tableName: tableName,
-        ifExists: ifExists,
-      );
-    }
-    _consume(
-      TokenType.kwTable,
-      errorMessage: 'Expected TABLE, VIEW, TRIGGER, or INDEX after DROP',
-    );
-    bool ifExists = false;
-    if (_checkSequence([TokenType.kwIf, TokenType.kwExists])) {
-      _advance();
-      _advance();
-      ifExists = true;
-    }
-    final tableName = _parseTableName();
-    return DropTableStatement(tableName: tableName, ifExists: ifExists);
-  }
-
-  // ===========================================================================
-  // ALTER
-  // ===========================================================================
-
-  AlterTableStatement _parseAlter() {
-    _consume(TokenType.kwAlter);
-    _consume(TokenType.kwTable, errorMessage: 'Expected TABLE after ALTER');
-    final tableName = _parseTableName();
-
-    if (_check(TokenType.kwAdd)) {
-      _advance();
-      _match(TokenType.kwColumn);
-      final col = _parseColumnDefinition();
-      return AlterTableStatement(
-        tableName: tableName,
-        action: AlterActionType.addColumn,
-        newColumn: col,
-      );
-    }
-
-    if (_check(TokenType.kwDrop)) {
-      _advance();
-      _match(TokenType.kwColumn);
-      final colName = _parseColumnName();
-      return AlterTableStatement(
-        tableName: tableName,
-        action: AlterActionType.dropColumn,
-        targetName: colName,
-      );
-    }
-
-    if (_check(TokenType.kwRename)) {
-      _advance();
-      _match(TokenType.kwColumn);
-      final oldName = _parseColumnName();
-      _consume(TokenType.kwTo, errorMessage: 'Expected TO in RENAME COLUMN');
-      final newName = _parseColumnName();
-      return AlterTableStatement(
-        tableName: tableName,
-        action: AlterActionType.renameColumn,
-        targetName: oldName,
-        newName: newName,
-      );
-    }
-
-    throw _error('Expected ADD, DROP, or RENAME after ALTER TABLE');
-  }
-
-  // ===========================================================================
-  // TRANSACTION STATEMENTS
-  // ===========================================================================
-
-  /// BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE] [TRANSACTION|WORK]
-  BeginStatement _parseBegin() {
-    _consume(TokenType.kwBegin);
-    String? mode;
-    if (_match(TokenType.kwDeferred) != null) {
-      mode = 'DEFERRED';
-    } else if (_match(TokenType.kwImmediate) != null) {
-      mode = 'IMMEDIATE';
-    } else if (_match(TokenType.kwExclusive) != null) {
-      mode = 'EXCLUSIVE';
-    }
-    // Optional TRANSACTION or WORK keyword
-    _match(TokenType.kwTransaction);
-    _match(TokenType.kwWork);
-    return BeginStatement(mode: mode);
-  }
-
-  /// COMMIT [TRANSACTION|WORK]
-  CommitStatement _parseCommit() {
-    _consume(TokenType.kwCommit);
-    _match(TokenType.kwTransaction);
-    _match(TokenType.kwWork);
-    return const CommitStatement();
-  }
-
-  /// ROLLBACK [TRANSACTION|WORK] [TO [SAVEPOINT] name]
-  RollbackStatement _parseRollback() {
-    _consume(TokenType.kwRollback);
-    _match(TokenType.kwTransaction);
-    _match(TokenType.kwWork);
-    String? savepointName;
-    if (_match(TokenType.kwTo) != null) {
-      _match(TokenType.kwSavepoint); // Optional SAVEPOINT keyword
-      savepointName = _parseIdentifierOrKeyword();
-    }
-    return RollbackStatement(savepointName: savepointName);
-  }
-
-  /// SAVEPOINT name
-  SavepointStatement _parseSavepoint() {
-    _consume(TokenType.kwSavepoint);
-    final name = _parseIdentifierOrKeyword();
-    return SavepointStatement(name: name);
-  }
-
-  /// RELEASE [SAVEPOINT] name
-  ReleaseStatement _parseRelease() {
-    _consume(TokenType.kwRelease);
-    _match(TokenType.kwSavepoint); // Optional SAVEPOINT keyword
-    final name = _parseIdentifierOrKeyword();
-    return ReleaseStatement(name: name);
-  }
-
-  /// Parses the next token as an identifier even if it is a keyword.
-  /// Used for savepoint names which can shadow keywords.
-  String _parseIdentifierOrKeyword() {
-    final t = _advance();
-    return t.lexeme;
-  }
-
-  // ===========================================================================
-  // EXPRESSION PARSING (precedence climbing)
-  // ===========================================================================
-
-  Expression _parseExpression() => _parseOr();
-
-  Expression _parseOr() {
-    var left = _parseAnd();
-    while (_match(TokenType.kwOr) != null) {
-      final right = _parseAnd();
-      left = BinaryExpression(left: left, operator_: 'OR', right: right);
-    }
-    return left;
-  }
-
-  Expression _parseAnd() {
-    var left = _parseNot();
-    while (_match(TokenType.kwAnd) != null) {
-      final right = _parseNot();
-      left = BinaryExpression(left: left, operator_: 'AND', right: right);
-    }
-    return left;
-  }
-
-  Expression _parseNot() {
-    if (_match(TokenType.kwNot) != null) {
-      final operand = _parseNot();
-      return UnaryExpression(operator_: 'NOT', operand: operand);
-    }
-    return _parseComparison();
-  }
-
-  Expression _parseComparison() {
-    var left = _parseAdditive();
-
-    // IS [NOT] NULL
-    if (_match(TokenType.kwIs) != null) {
-      final isNot = _match(TokenType.kwNot) != null;
-      _consume(TokenType.kwNull_, errorMessage: 'Expected NULL after IS [NOT]');
-      return IsNullExpression(operand: left, isNotNull: isNot);
-    }
-
-    // [NOT] BETWEEN
-    final notBetween =
-        _check(TokenType.kwNot) && _peekAt(1).type == TokenType.kwBetween;
-    if (notBetween) {
-      _advance(); // NOT
-      _advance(); // BETWEEN
-      final lower = _parseAdditive();
-      _consume(TokenType.kwAnd, errorMessage: 'Expected AND in BETWEEN');
-      final upper = _parseAdditive();
-      return BetweenExpression(
-        operand: left,
-        lower: lower,
-        upper: upper,
-        notBetween: true,
-      );
-    }
-    if (_match(TokenType.kwBetween) != null) {
-      final lower = _parseAdditive();
-      _consume(TokenType.kwAnd, errorMessage: 'Expected AND in BETWEEN');
-      final upper = _parseAdditive();
-      return BetweenExpression(operand: left, lower: lower, upper: upper);
-    }
-
-    // [NOT] IN (...)
-    final notIn = _check(TokenType.kwNot) && _peekAt(1).type == TokenType.kwIn;
-    if (notIn) {
-      _advance(); // NOT
-      _advance(); // IN
-      final values = _parseInList();
-      return InListExpression(operand: left, values: values, notIn: true);
-    }
-    if (_match(TokenType.kwIn) != null) {
-      final values = _parseInList();
-      return InListExpression(operand: left, values: values);
-    }
-
-    // LIKE
-    if (_match(TokenType.kwLike) != null) {
-      final pattern = _parseAdditive();
-      return BinaryExpression(left: left, operator_: 'LIKE', right: pattern);
-    }
-    if (_check(TokenType.kwNot) && _peekAt(1).type == TokenType.kwLike) {
-      _advance(); // NOT
-      _advance(); // LIKE
-      final pattern = _parseAdditive();
-      return UnaryExpression(
-        operator_: 'NOT',
-        operand: BinaryExpression(
-          left: left,
-          operator_: 'LIKE',
-          right: pattern,
-        ),
-      );
-    }
-
-    // Comparison operators
-    final ops = {
-      TokenType.opEq: '=',
-      TokenType.opNeq: '!=',
-      TokenType.opLt: '<',
-      TokenType.opLte: '<=',
-      TokenType.opGt: '>',
-      TokenType.opGte: '>=',
-    };
-    for (final entry in ops.entries) {
-      if (_match(entry.key) != null) {
-        final right = _parseAdditive();
-        return BinaryExpression(
-          left: left,
-          operator_: entry.value,
-          right: right,
-        );
-      }
-    }
-
-    return left;
-  }
-
-  List<Expression> _parseInList() {
-    _consume(TokenType.lparen);
-    final values = <Expression>[];
-    values.add(_parseExpression());
-    while (_match(TokenType.comma) != null) {
-      values.add(_parseExpression());
-    }
-    _consume(TokenType.rparen);
-    return values;
-  }
-
-  Expression _parseAdditive() {
-    var left = _parseMultiplicative();
-    while (true) {
-      if (_match(TokenType.opPlus) != null) {
-        left = BinaryExpression(
-          left: left,
-          operator_: '+',
-          right: _parseMultiplicative(),
-        );
-      } else if (_match(TokenType.opMinus) != null) {
-        left = BinaryExpression(
-          left: left,
-          operator_: '-',
-          right: _parseMultiplicative(),
-        );
-      } else {
-        break;
-      }
-    }
-    return left;
-  }
-
-  Expression _parseMultiplicative() {
-    var left = _parseUnary();
-    while (true) {
-      if (_match(TokenType.opStar) != null) {
-        left = BinaryExpression(
-          left: left,
-          operator_: '*',
-          right: _parseUnary(),
-        );
-      } else if (_match(TokenType.opSlash) != null) {
-        left = BinaryExpression(
-          left: left,
-          operator_: '/',
-          right: _parseUnary(),
-        );
-      } else if (_match(TokenType.opPercent) != null) {
-        left = BinaryExpression(
-          left: left,
-          operator_: '%',
-          right: _parseUnary(),
-        );
-      } else {
-        break;
-      }
-    }
-    return left;
-  }
-
-  Expression _parseUnary() {
-    if (_match(TokenType.opMinus) != null) {
-      return UnaryExpression(operator_: '-', operand: _parseUnary());
-    }
-    if (_match(TokenType.opPlus) != null) {
-      return _parseUnary(); // unary + is a no-op
-    }
-    return _parsePrimary();
-  }
-
-  Expression _parsePrimary() {
-    final t = _peek();
-
-    // NULL literal
-    if (_match(TokenType.kwNull_) != null) {
-      return const LiteralExpression(null);
-    }
-    // TRUE / FALSE
-    if (_match(TokenType.kwTrue) != null) {
-      return const LiteralExpression(true);
-    }
-    if (_match(TokenType.kwFalse) != null) {
-      return const LiteralExpression(false);
-    }
-    // Integer literal
-    if (t.type == TokenType.litInteger) {
-      _advance();
-      return LiteralExpression(t.value as int);
-    }
-    // Float literal
-    if (t.type == TokenType.litFloat) {
-      _advance();
-      return LiteralExpression(t.value as double);
-    }
-    // String literal
-    if (t.type == TokenType.litString) {
-      _advance();
-      return LiteralExpression(t.value as String);
-    }
-
-    // Aggregate functions
-    if (_isAggregateFunction(t.type)) {
-      return _parseFunctionCall();
-    }
-
-    // Subquery in parens: (SELECT ...)
-    if (t.type == TokenType.lparen && _peekAt(1).type == TokenType.kwSelect) {
-      _advance(); // consume (
-      final sub = _parseSelect();
-      _consume(TokenType.rparen);
-      return SubqueryExpression(sub);
-    }
-
-    // Parenthesized expression
-    if (_match(TokenType.lparen) != null) {
-      final inner = _parseExpression();
-      _consume(TokenType.rparen);
-      return ParenthesizedExpression(inner);
-    }
-
-    // Column reference: [table.]column  OR  generic function call: name(...)
-    if (t.type == TokenType.identifier) {
-      final name = t.value as String;
-      _advance();
-      // Generic function call (including ST_* spatial functions)
-      if (_check(TokenType.lparen)) {
-        return _parseGenericFunctionCall(name.toUpperCase());
-      }
-      if (_match(TokenType.dot) != null) {
-        // Could be table.column or table.function(...)
-        final next = _peek();
-        if (next.type == TokenType.identifier) {
-          final col = next.value as String;
-          _advance();
-          if (_check(TokenType.lparen)) {
-            return _parseGenericFunctionCall(col.toUpperCase());
-          }
-          return ColumnReferenceExpression(tableAlias: name, columnName: col);
-        }
-        final colName = _parseColumnName();
-        return ColumnReferenceExpression(tableAlias: name, columnName: colName);
-      }
-      return ColumnReferenceExpression(columnName: name);
-    }
-
-    // Keyword used as identifier (e.g. column named "status")
-    if (_isKeywordUsableAsIdentifier(t.type)) {
-      _advance();
-      return ColumnReferenceExpression(columnName: t.lexeme);
-    }
-
-    throw _error('Unexpected token "${t.lexeme}" (${t.type}) in expression');
-  }
-
-  bool _isKeywordUsableAsIdentifier(TokenType type) {
-    // Some keywords are commonly used as column names
-    return type == TokenType.kwKey ||
-        type == TokenType.kwDate ||
-        type == TokenType.kwTo ||
-        type == TokenType.kwEnd ||
-        type == TokenType.kwAll;
-  }
-
-  bool _isAggregateFunction(TokenType type) {
-    return type == TokenType.kwCount ||
-        type == TokenType.kwSum ||
-        type == TokenType.kwAvg ||
-        type == TokenType.kwMin ||
-        type == TokenType.kwMax;
-  }
-
-  Expression _parseFunctionCall() {
-    final funcToken = _advance();
-    final name = funcToken.lexeme.toUpperCase();
-    _consume(
-      TokenType.lparen,
-      errorMessage: 'Expected ( after function name $name',
-    );
-
-    bool distinct = false;
-    bool isStar = false;
-    Expression? argument;
-
-    if (_check(TokenType.opStar)) {
-      _advance();
-      isStar = true;
-    } else {
-      if (_match(TokenType.kwDistinct) != null) distinct = true;
-      argument = _parseExpression();
-    }
-
-    _consume(
-      TokenType.rparen,
-      errorMessage: 'Expected ) after function arguments',
-    );
-    return FunctionCallExpression(
-      functionName: name,
-      distinct: distinct,
-      isStar: isStar,
-      argument: argument,
-    );
-  }
-
-  // ===========================================================================
-  // HELPERS
-  // ===========================================================================
-
-  String _parseColumnName() {
-    final t = _peek();
-    if (t.type == TokenType.identifier) {
-      _advance();
-      return t.value as String;
-    }
-    // Allow keywords as column names
-    if (_isKeywordToken(t.type)) {
-      _advance();
-      return t.lexeme;
-    }
-    throw _error('Expected column name, got "${t.lexeme}"');
-  }
-
-  String _parseTableName() {
-    final t = _peek();
-    if (t.type == TokenType.identifier) {
-      _advance();
-      return t.value as String;
-    }
-    throw _error('Expected table name, got "${t.lexeme}"');
-  }
-
-  bool _isKeywordToken(TokenType type) {
-    // Keywords that are commonly used as identifiers
-    return type == TokenType.kwKey ||
-        type == TokenType.kwDate ||
-        type == TokenType.kwAll ||
-        type == TokenType.kwEnd ||
-        type == TokenType.kwTo ||
-        type == TokenType.kwSet ||
-        type == TokenType.kwBy;
-  }
-
-  int _consumeInt(String errorMessage) {
-    final t = _peek();
-    if (t.type == TokenType.litInteger) {
-      _advance();
-      return t.value as int;
-    }
-    throw _error(errorMessage);
-  }
-
-  Token _consume(TokenType expected, {String? errorMessage}) {
-    if (_check(expected)) return _advance();
-    throw _error(
-      errorMessage ??
-          'Expected ${expected.name} but got "${_peek().lexeme}" (${_peek().type})',
-    );
-  }
-
-  Token? _match(TokenType type) {
-    if (_check(type)) return _advance();
     return null;
   }
 
-  bool _check(TokenType type) => !_isAtEnd() && _peek().type == type;
-
-  bool _checkSequence(List<TokenType> types) {
-    for (int i = 0; i < types.length; i++) {
-      if (_peekAt(i).type != types[i]) return false;
+  List<String> _nameList() {
+    _expectSymbol('(');
+    final names = [_name('a column name')];
+    while (_acceptSymbol(',')) {
+      names.add(_name('a column name'));
     }
-    return true;
+    _expectSymbol(')');
+    return names;
   }
 
-  Token _peek() => _peekAt(0);
+  // ---------------------------------------------------------------------------
+  // Statements
+  // ---------------------------------------------------------------------------
 
-  Token _peekAt(int offset) {
-    final idx = _pos + offset;
-    if (idx >= _tokens.length) return _tokens.last; // EOF
-    return _tokens[idx];
+  ParsedStatement _statementWithParams() {
+    _paramMax = 0;
+    _named = {};
+    final s = _statement();
+    return ParsedStatement(s, _sql, _paramMax, Map.unmodifiable(_named));
   }
 
-  Token _advance() {
-    final t = _tokens[_pos];
-    if (_pos < _tokens.length - 1) _pos++;
-    return t;
-  }
-
-  bool _isAtEnd() => _peek().type == TokenType.eof;
-
-  ParseException _error(String message) {
-    final t = _peek();
-    return ParseException(message, t.line, t.column);
-  }
-
-  // ===========================================================================
-  // TRIGGER PARSING
-  // ===========================================================================
-
-  CreateTriggerStatement _parseCreateTrigger() {
-    _consume(TokenType.kwTrigger);
-    bool ifNotExists = false;
-    if (_checkSequence([TokenType.kwIf, TokenType.kwNot, TokenType.kwExists])) {
-      _advance();
-      _advance();
-      _advance();
-      ifNotExists = true;
-    }
-    final name = _parseIdentifierOrKeyword();
-
-    // Timing: BEFORE | AFTER | INSTEAD OF
-    TriggerTiming timing;
-    if (_match(TokenType.kwBefore) != null) {
-      timing = TriggerTiming.before;
-    } else if (_match(TokenType.kwAfter) != null) {
-      timing = TriggerTiming.after;
-    } else if (_match(TokenType.kwInsteadOf) != null) {
-      // Consume optional 'OF' (tokenized as identifier)
-      if (_peek().type == TokenType.identifier &&
-          _peek().lexeme.toUpperCase() == 'OF') {
-        _advance();
-      }
-      timing = TriggerTiming.insteadOf;
-    } else {
-      throw _error('Expected BEFORE, AFTER, or INSTEAD OF in trigger');
-    }
-
-    // Event: INSERT | UPDATE [OF col,...] | DELETE
-    TriggerEvent event;
-    final List<String> updateColumns = [];
-    if (_match(TokenType.kwInsert) != null) {
-      event = TriggerEvent.insert_;
-    } else if (_match(TokenType.kwUpdate) != null) {
-      event = TriggerEvent.update_;
-      // Optional: OF col1, col2, ...
-      if (_peek().type == TokenType.identifier &&
-          _peek().lexeme.toUpperCase() == 'OF') {
-        _advance(); // OF
-        updateColumns.add(_parseColumnName());
-        while (_match(TokenType.comma) != null) {
-          updateColumns.add(_parseColumnName());
+  Statement _statement() {
+    final hints = _hints();
+    final t = _peek;
+    if (t.kind != TokenKind.word) _error();
+    switch (t.upper) {
+      case 'SELECT':
+      case 'VALUES':
+        return _select(hints: hints);
+      case 'WITH':
+        _error('WITH (common table expressions) is not supported');
+      case 'INSERT':
+      case 'REPLACE':
+        return _insert();
+      case 'UPDATE':
+        return _update();
+      case 'DELETE':
+        return _delete();
+      case 'CREATE':
+        return _create();
+      case 'DROP':
+        return _drop();
+      case 'ALTER':
+        return _alter();
+      case 'BEGIN':
+        _p++;
+        if (!_acceptWord('DEFERRED') && !_acceptWord('IMMEDIATE')) {
+          _acceptWord('EXCLUSIVE');
         }
-      }
-    } else if (_match(TokenType.kwDelete) != null) {
-      event = TriggerEvent.delete_;
-    } else {
-      throw _error('Expected INSERT, UPDATE, or DELETE in trigger');
+        if (_acceptWord('TRANSACTION') && _atName) _name();
+        return BeginStatement(t.start, _lastEnd);
+      case 'COMMIT':
+      case 'END':
+        _p++;
+        if (_acceptWord('TRANSACTION') && _atName) _name();
+        return CommitStatement(t.start, _lastEnd);
+      case 'ROLLBACK':
+        _p++;
+        if (_acceptWord('TRANSACTION') && _atName && !_isWord('TO')) _name();
+        String? sp;
+        if (_acceptWord('TO')) {
+          _acceptWord('SAVEPOINT');
+          sp = _name('a savepoint name');
+        }
+        return RollbackStatement(sp, t.start, _lastEnd);
+      case 'SAVEPOINT':
+        _p++;
+        return SavepointStatement(_name('a savepoint name'), t.start, _lastEnd);
+      case 'RELEASE':
+        _p++;
+        _acceptWord('SAVEPOINT');
+        return ReleaseStatement(_name('a savepoint name'), t.start, _lastEnd);
+      case 'PRAGMA':
+        _p++;
+        final name = _name('a pragma name').toLowerCase();
+        String? value;
+        if (_acceptSymbol('=')) {
+          value = _pragmaValue();
+        } else if (_acceptSymbol('(')) {
+          value = _pragmaValue();
+          _expectSymbol(')');
+        }
+        return PragmaStatement(name, value, t.start, _lastEnd);
+      case 'EXPLAIN':
+        _error('EXPLAIN is not supported');
+      default:
+        _error();
     }
-
-    // ON tableName
-    _consume(TokenType.kwOn, errorMessage: 'Expected ON in trigger');
-    final tableName = _parseTableName();
-
-    // FOR EACH ROW  (optional)
-    if (_match(TokenType.kwFor) != null) {
-      // optional EACH
-      if (_check(TokenType.kwEach) ||
-          (_peek().type == TokenType.identifier &&
-              _peek().lexeme.toUpperCase() == 'EACH')) {
-        _advance();
-      }
-      // optional ROW
-      if (_check(TokenType.kwRow) ||
-          (_peek().type == TokenType.identifier &&
-              _peek().lexeme.toUpperCase() == 'ROW')) {
-        _advance();
-      }
-    }
-
-    // WHEN (expr)  (optional)
-    Expression? whenExpr;
-    if (_match(TokenType.kwWhen) != null) {
-      _consume(TokenType.lparen);
-      whenExpr = _parseExpression();
-      _consume(TokenType.rparen);
-    }
-
-    // BEGIN stmt; ... END
-    _consume(TokenType.kwBegin, errorMessage: 'Expected BEGIN in trigger body');
-    final body = <Statement>[];
-    while (!_isAtEnd() && !_check(TokenType.kwEnd)) {
-      while (_match(TokenType.semicolon) != null) {}
-      if (_check(TokenType.kwEnd)) break;
-      body.add(_parseStatement());
-      _match(TokenType.semicolon);
-    }
-    _consume(
-      TokenType.kwEnd,
-      errorMessage: 'Expected END to close trigger body',
-    );
-
-    return CreateTriggerStatement(
-      name: name,
-      ifNotExists: ifNotExists,
-      timing: timing,
-      event: event,
-      updateColumns: updateColumns,
-      tableName: tableName,
-      whenExpr: whenExpr,
-      body: body,
-    );
   }
 
-  // ===========================================================================
-  // INDEX PARSING
-  // ===========================================================================
-
-  CreateIndexStatement _parseCreateIndex({
-    bool isUnique = false,
-    bool isSpatial = false,
-  }) {
-    _consume(TokenType.kwIndex);
-    bool ifNotExists = false;
-    if (_checkSequence([TokenType.kwIf, TokenType.kwNot, TokenType.kwExists])) {
-      _advance();
-      _advance();
-      _advance();
-      ifNotExists = true;
+  String _pragmaValue() {
+    final t = _advance();
+    switch (t.kind) {
+      case TokenKind.word:
+      case TokenKind.quotedIdentifier:
+      case TokenKind.string:
+      case TokenKind.integer:
+      case TokenKind.real:
+        return t.text;
+      case TokenKind.symbol when t.text == '-' || t.text == '+':
+        final n = _advance();
+        if (n.kind != TokenKind.integer && n.kind != TokenKind.real) _error();
+        return '${t.text}${n.text}';
+      default:
+        _p--;
+        _error('expected a pragma value');
     }
-    final indexName = _parseIdentifierOrKeyword();
-    _consume(TokenType.kwOn, errorMessage: 'Expected ON in CREATE INDEX');
-    final tableName = _parseTableName();
-    _consume(TokenType.lparen);
-    final columns = <String>[_parseColumnName()];
-    while (_match(TokenType.comma) != null) {
-      columns.add(_parseColumnName());
-    }
-    _consume(TokenType.rparen);
-    return CreateIndexStatement(
-      indexName: indexName,
-      tableName: tableName,
-      columns: columns,
-      isUnique: isUnique,
-      isSpatial: isSpatial,
-      ifNotExists: ifNotExists,
-    );
   }
 
-  // ===========================================================================
-  // QUERY HINT PARSING
-  // ===========================================================================
-
-  /// Parses the body text of a /*+ ... */ hint comment into [QueryHint]s.
-  List<QueryHint> _parseHintBody(String body) {
+  List<QueryHint> _hints() {
     final hints = <QueryHint>[];
-    final pattern = RegExp(r'(\w+)\s*(?:\(([^)]*)\))?');
-    for (final m in pattern.allMatches(body)) {
-      final hintName = m.group(1)!.toUpperCase();
-      final argStr = m.group(2) ?? '';
-      final args = argStr
+    while (_peek.kind == TokenKind.hint) {
+      hints.addAll(_parseHints(_advance().text));
+    }
+    return hints;
+  }
+
+  static final _hintPattern = RegExp(r'([A-Za-z_]+)\s*(?:\(([^)]*)\))?');
+
+  static List<QueryHint> _parseHints(String body) {
+    final hints = <QueryHint>[];
+    for (final m in _hintPattern.allMatches(body)) {
+      final args = (m.group(2) ?? '')
           .split(RegExp(r'[\s,]+'))
           .where((s) => s.isNotEmpty)
           .toList();
-      switch (hintName) {
+      switch (m.group(1)!.toUpperCase()) {
         case 'INDEX':
         case 'FORCE_INDEX':
-          hints.add(
-            QueryHint(
-              type: HintType.forceIndex,
-              tableName: args.isNotEmpty ? args[0] : null,
-              indexName: args.length > 1 ? args[1] : null,
-            ),
-          );
+          if (args.length >= 2) {
+            hints.add(
+              QueryHint(HintKind.forceIndex, table: args[0], index: args[1]),
+            );
+          } else if (args.length == 1) {
+            hints.add(QueryHint(HintKind.forceIndex, index: args[0]));
+          }
         case 'NO_INDEX':
           hints.add(
-            QueryHint(
-              type: HintType.noIndex,
-              tableName: args.isNotEmpty ? args[0] : null,
-              indexName: args.length > 1 ? args[1] : null,
-            ),
+            QueryHint(HintKind.noIndex, table: args.isEmpty ? null : args[0]),
           );
         case 'FULL_SCAN':
           hints.add(
-            QueryHint(
-              type: HintType.fullScan,
-              tableName: args.isNotEmpty ? args[0] : null,
-            ),
+            QueryHint(HintKind.fullScan, table: args.isEmpty ? null : args[0]),
           );
         case 'JOIN_ORDER':
-          hints.add(QueryHint(type: HintType.joinOrder, joinOrder: args));
+          hints.add(QueryHint(HintKind.joinOrder, order: args));
       }
     }
     return hints;
   }
 
-  // ===========================================================================
-  // GENERIC FUNCTION CALL
-  // ===========================================================================
+  // ---------------------------------------------------------------------------
+  // SELECT
+  // ---------------------------------------------------------------------------
 
-  /// Parses a generic function call: name(arg1, arg2, ...)
-  Expression _parseGenericFunctionCall(String name) {
-    _consume(TokenType.lparen);
-    if (_match(TokenType.rparen) != null) {
-      return FunctionCallExpression(functionName: name, arguments: const []);
+  SelectStatement _select({List<QueryHint> hints = const []}) {
+    final start = _peek.start;
+    final allHints = [...hints];
+    final cores = [_selectCore(allHints)];
+    final ops = <CompoundOp>[];
+    while (true) {
+      CompoundOp? op;
+      if (_acceptWord('UNION')) {
+        op = _acceptWord('ALL') ? CompoundOp.unionAll : CompoundOp.union;
+      } else if (_acceptWord('INTERSECT')) {
+        op = CompoundOp.intersect;
+      } else if (_acceptWord('EXCEPT')) {
+        op = CompoundOp.except;
+      }
+      if (op == null) break;
+      ops.add(op);
+      cores.add(_selectCore(allHints));
     }
-    if (_check(TokenType.opStar)) {
-      _advance();
-      _consume(TokenType.rparen);
-      return FunctionCallExpression(functionName: name, isStar: true);
+    var orderBy = const <OrderingTerm>[];
+    if (_acceptWord('ORDER')) {
+      _expectWord('BY');
+      orderBy = _orderingTerms();
     }
-    final bool distinct = _match(TokenType.kwDistinct) != null;
-    final args = <Expression>[_parseExpression()];
-    while (_match(TokenType.comma) != null) {
-      if (_check(TokenType.rparen)) break;
-      args.add(_parseExpression());
+    Expr? limit, offset;
+    if (_acceptWord('LIMIT')) {
+      limit = _expr();
+      if (_acceptWord('OFFSET')) {
+        offset = _expr();
+      } else if (_acceptSymbol(',')) {
+        // LIMIT offset, count
+        offset = limit;
+        limit = _expr();
+      }
     }
-    _consume(TokenType.rparen);
-    if (args.length == 1 && !distinct) {
-      return FunctionCallExpression(
-        functionName: name,
-        distinct: distinct,
-        argument: args[0],
+    return SelectStatement(
+      cores: cores,
+      ops: ops,
+      orderBy: orderBy,
+      limit: limit,
+      offset: offset,
+      hints: allHints,
+      start: start,
+      end: _lastEnd,
+    );
+  }
+
+  List<OrderingTerm> _orderingTerms() {
+    final terms = <OrderingTerm>[];
+    do {
+      final e = _expr();
+      var desc = false;
+      if (_acceptWord('DESC')) {
+        desc = true;
+      } else {
+        _acceptWord('ASC');
+      }
+      bool? nullsFirst;
+      if (_acceptWord('NULLS')) {
+        if (_acceptWord('FIRST')) {
+          nullsFirst = true;
+        } else {
+          _expectWord('LAST');
+          nullsFirst = false;
+        }
+      }
+      terms.add(OrderingTerm(e, desc, nullsFirst));
+    } while (_acceptSymbol(','));
+    return terms;
+  }
+
+  SelectCore _selectCore(List<QueryHint> hints) {
+    if (_acceptWord('VALUES')) {
+      final rows = <List<Expr>>[];
+      do {
+        rows.add(_valueRow());
+      } while (_acceptSymbol(','));
+      final width = rows.first.length;
+      for (final r in rows) {
+        if (r.length != width) {
+          _error('all VALUES must have the same number of terms');
+        }
+      }
+      return SelectCore(values: rows);
+    }
+    _expectWord('SELECT');
+    hints.addAll(_hints());
+    var distinct = false;
+    if (_acceptWord('DISTINCT')) {
+      distinct = true;
+    } else {
+      _acceptWord('ALL');
+    }
+    final columns = <ResultColumn>[];
+    do {
+      columns.add(_resultColumn());
+    } while (_acceptSymbol(','));
+    FromItem? from;
+    if (_acceptWord('FROM')) from = _joinChain();
+    final where = _acceptWord('WHERE') ? _expr() : null;
+    var groupBy = const <Expr>[];
+    Expr? having;
+    if (_acceptWord('GROUP')) {
+      _expectWord('BY');
+      groupBy = [_expr()];
+      while (_acceptSymbol(',')) {
+        groupBy.add(_expr());
+      }
+    }
+    if (_acceptWord('HAVING')) having = _expr();
+    if (_isWord('WINDOW')) _error('window functions are not supported');
+    return SelectCore(
+      distinct: distinct,
+      columns: columns,
+      from: from,
+      where: where,
+      groupBy: groupBy,
+      having: having,
+    );
+  }
+
+  List<Expr> _valueRow() {
+    _expectSymbol('(');
+    final items = [_expr()];
+    while (_acceptSymbol(',')) {
+      items.add(_expr());
+    }
+    _expectSymbol(')');
+    return items;
+  }
+
+  ResultColumn _resultColumn() {
+    if (_acceptSymbol('*')) return StarColumn(null);
+    // table.*
+    if ((_peek.kind == TokenKind.word ||
+            _peek.kind == TokenKind.quotedIdentifier) &&
+        _peekAt(1).isSymbol('.') &&
+        _peekAt(2).isSymbol('*')) {
+      final table = _advance().text;
+      _p += 2;
+      return StarColumn(table);
+    }
+    final e = _expr();
+    return ExprColumn(e, _alias());
+  }
+
+  FromItem _joinChain() {
+    var left = _tableOrSubquery();
+    while (true) {
+      if (_acceptSymbol(',')) {
+        left = JoinSource(
+          left,
+          _tableOrSubquery(),
+          JoinKind.cross,
+          false,
+          null,
+          null,
+        );
+        continue;
+      }
+      final save = _p;
+      final natural = _acceptWord('NATURAL');
+      JoinKind? kind;
+      if (_acceptWord('LEFT')) {
+        _acceptWord('OUTER');
+        kind = JoinKind.left;
+      } else if (_acceptWord('RIGHT')) {
+        _acceptWord('OUTER');
+        kind = JoinKind.right;
+      } else if (_acceptWord('FULL')) {
+        _acceptWord('OUTER');
+        kind = JoinKind.full;
+      } else if (_acceptWord('INNER')) {
+        kind = JoinKind.inner;
+      } else if (_acceptWord('CROSS')) {
+        kind = JoinKind.cross;
+      }
+      if (!_acceptWord('JOIN')) {
+        if (natural || kind != null) _error('expected JOIN');
+        _p = save;
+        return left;
+      }
+      kind ??= JoinKind.inner;
+      final right = _tableOrSubquery();
+      Expr? on;
+      List<String>? using;
+      if (!natural) {
+        if (_acceptWord('ON')) {
+          on = _expr();
+        } else if (_acceptWord('USING')) {
+          using = _nameList();
+        }
+      }
+      if (kind == JoinKind.cross && (on != null || using != null)) {
+        // SQLite treats CROSS JOIN … ON like an inner join.
+        kind = JoinKind.inner;
+      }
+      left = JoinSource(left, right, kind, natural, on, using);
+    }
+  }
+
+  FromItem _tableOrSubquery() {
+    if (_acceptSymbol('(')) {
+      if (_isWord('SELECT') || _isWord('VALUES')) {
+        final q = _select();
+        _expectSymbol(')');
+        return SubquerySource(q, _alias());
+      }
+      final inner = _joinChain();
+      _expectSymbol(')');
+      return inner;
+    }
+    final start = _peek.start;
+    final name = _name('a table name');
+    if (_acceptSymbol('.')) {
+      // schema.table: only "main" is known.
+      if (name.toLowerCase() != 'main') {
+        _error('unknown database $name');
+      }
+      final real = _name('a table name');
+      final alias = _alias();
+      _indexedBy();
+      return TableSource(real, alias, start, _lastEnd);
+    }
+    final alias = _alias();
+    _indexedBy();
+    return TableSource(name, alias, start, _lastEnd);
+  }
+
+  void _indexedBy() {
+    if (_acceptWord('INDEXED')) {
+      _expectWord('BY');
+      _name('an index name');
+    } else if (_isWord('NOT') && _peekAt(1).isWord('INDEXED')) {
+      _p += 2;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // INSERT, UPDATE, DELETE
+  // ---------------------------------------------------------------------------
+
+  ConflictAction? _orAction() {
+    if (!_acceptWord('OR')) return null;
+    final t = _advance();
+    return switch (t.upper) {
+      'ABORT' => ConflictAction.abort,
+      'FAIL' => ConflictAction.fail,
+      'IGNORE' => ConflictAction.ignore,
+      'REPLACE' => ConflictAction.replace,
+      'ROLLBACK' => ConflictAction.rollback,
+      _ => (() {
+        _p--;
+        _error('expected ABORT, FAIL, IGNORE, REPLACE or ROLLBACK');
+      })(),
+    };
+  }
+
+  InsertStatement _insert() {
+    final start = _peek.start;
+    ConflictAction conflict;
+    if (_acceptWord('REPLACE')) {
+      conflict = ConflictAction.replace;
+    } else {
+      _expectWord('INSERT');
+      conflict = _orAction() ?? ConflictAction.abort;
+    }
+    _expectWord('INTO');
+    var table = _name('a table name');
+    if (_acceptSymbol('.')) {
+      if (table.toLowerCase() != 'main') _error('unknown database $table');
+      table = _name('a table name');
+    }
+    if (_acceptWord('AS')) _name('an alias');
+    List<String>? columns;
+    if (_isSymbol('(')) columns = _nameList();
+    List<List<Expr>>? values;
+    SelectStatement? select;
+    if (_acceptWord('DEFAULT')) {
+      _expectWord('VALUES');
+    } else if (_isWord('VALUES')) {
+      _p++;
+      values = [];
+      do {
+        values.add(_valueRow());
+      } while (_acceptSymbol(','));
+    } else if (_isWord('SELECT') || _peek.kind == TokenKind.hint) {
+      select = _select(hints: _hints());
+    } else {
+      _error('expected VALUES, SELECT or DEFAULT VALUES');
+    }
+    Upsert? upsert;
+    if (_isWord('ON') && _peekAt(1).isWord('CONFLICT')) {
+      _p += 2;
+      List<String>? target;
+      if (_isSymbol('(')) target = _nameList();
+      _expectWord('DO');
+      if (_acceptWord('NOTHING')) {
+        upsert = Upsert(target, true, const [], null);
+      } else {
+        _expectWord('UPDATE');
+        _expectWord('SET');
+        final sets = _assignments();
+        final where = _acceptWord('WHERE') ? _expr() : null;
+        if (target == null) {
+          _error('ON CONFLICT DO UPDATE needs a conflict target');
+        }
+        upsert = Upsert(target, false, sets, where);
+      }
+    }
+    if (_isWord('RETURNING')) _error('RETURNING is not supported');
+    return InsertStatement(
+      conflict: conflict,
+      table: table,
+      columns: columns,
+      values: values,
+      select: select,
+      upsert: upsert,
+      start: start,
+      end: _lastEnd,
+    );
+  }
+
+  List<Assignment> _assignments() {
+    final sets = <Assignment>[];
+    do {
+      if (_isSymbol('(')) _error('row-value assignments are not supported');
+      final col = _name('a column name');
+      if (_acceptSymbol('.')) {
+        _error('qualified column names are not allowed in SET');
+      }
+      _expectSymbol('=');
+      sets.add(Assignment(col, _expr()));
+    } while (_acceptSymbol(','));
+    return sets;
+  }
+
+  UpdateStatement _update() {
+    final start = _peek.start;
+    _expectWord('UPDATE');
+    final conflict = _orAction() ?? ConflictAction.abort;
+    var table = _name('a table name');
+    if (_acceptSymbol('.')) {
+      if (table.toLowerCase() != 'main') _error('unknown database $table');
+      table = _name('a table name');
+    }
+    final alias = _isWord('SET') ? null : _alias();
+    _indexedBy();
+    _expectWord('SET');
+    final sets = _assignments();
+    if (_isWord('FROM')) _error('UPDATE … FROM is not supported');
+    final where = _acceptWord('WHERE') ? _expr() : null;
+    if (_isWord('RETURNING')) _error('RETURNING is not supported');
+    if (_isWord('ORDER') || _isWord('LIMIT')) {
+      _error('ORDER BY and LIMIT on UPDATE are not supported');
+    }
+    return UpdateStatement(
+      conflict: conflict,
+      table: table,
+      alias: alias,
+      sets: sets,
+      where: where,
+      start: start,
+      end: _lastEnd,
+    );
+  }
+
+  DeleteStatement _delete() {
+    final start = _peek.start;
+    _expectWord('DELETE');
+    _expectWord('FROM');
+    var table = _name('a table name');
+    if (_acceptSymbol('.')) {
+      if (table.toLowerCase() != 'main') _error('unknown database $table');
+      table = _name('a table name');
+    }
+    final alias = _isWord('WHERE') ? null : _alias();
+    _indexedBy();
+    final where = _acceptWord('WHERE') ? _expr() : null;
+    if (_isWord('RETURNING')) _error('RETURNING is not supported');
+    if (_isWord('ORDER') || _isWord('LIMIT')) {
+      _error('ORDER BY and LIMIT on DELETE are not supported');
+    }
+    return DeleteStatement(
+      table: table,
+      alias: alias,
+      where: where,
+      start: start,
+      end: _lastEnd,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // CREATE, DROP, ALTER
+  // ---------------------------------------------------------------------------
+
+  bool _ifNotExists() {
+    if (_isWord('IF')) {
+      _p++;
+      _expectWord('NOT');
+      _expectWord('EXISTS');
+      return true;
+    }
+    return false;
+  }
+
+  bool _ifExists() {
+    if (_isWord('IF')) {
+      _p++;
+      _expectWord('EXISTS');
+      return true;
+    }
+    return false;
+  }
+
+  String _qualifiedName(String what) {
+    final n = _name(what);
+    if (_acceptSymbol('.')) {
+      if (n.toLowerCase() != 'main') _error('unknown database $n');
+      return _name(what);
+    }
+    return n;
+  }
+
+  Statement _create() {
+    final start = _peek.start;
+    _expectWord('CREATE');
+    if (_isWord('TEMP') || _isWord('TEMPORARY')) {
+      _error('temporary tables, views and triggers are not supported');
+    }
+    if (_isWord('VIRTUAL')) _error('virtual tables are not supported');
+    if (_acceptWord('TABLE')) return _createTable(start);
+    if (_acceptWord('VIEW')) return _createView(start);
+    if (_acceptWord('TRIGGER')) return _createTrigger(start);
+    var unique = false, spatial = false;
+    if (_acceptWord('UNIQUE')) {
+      unique = true;
+    } else if (_acceptWord('SPATIAL')) {
+      spatial = true;
+    }
+    if (_acceptWord('INDEX')) return _createIndex(start, unique, spatial);
+    _error('expected TABLE, VIEW, INDEX or TRIGGER after CREATE');
+  }
+
+  CreateTableStatement _createTable(int start) {
+    final ifNotExists = _ifNotExists();
+    final name = _qualifiedName('a table name');
+    if (_acceptWord('AS')) {
+      final q = _select(hints: _hints());
+      return CreateTableStatement(
+        ifNotExists: ifNotExists,
+        name: name,
+        asSelect: q,
+        start: start,
+        end: _lastEnd,
       );
     }
-    return FunctionCallExpression(
-      functionName: name,
-      distinct: distinct,
-      arguments: args,
+    _expectSymbol('(');
+    final columns = <ColumnSpec>[];
+    final constraints = <ConstraintSpec>[];
+    var inConstraints = false;
+    do {
+      if (_isWord('CONSTRAINT') ||
+          _isWord('PRIMARY') ||
+          _isWord('UNIQUE') ||
+          _isWord('CHECK') ||
+          _isWord('FOREIGN')) {
+        inConstraints = true;
+        constraints.add(_tableConstraint());
+      } else {
+        if (inConstraints) {
+          _error('column definitions must come before constraints');
+        }
+        columns.add(_columnSpec());
+      }
+    } while (_acceptSymbol(','));
+    _expectSymbol(')');
+    if (_isWord('WITHOUT')) _error('WITHOUT ROWID tables are not supported');
+    if (_isWord('STRICT')) _error('STRICT tables are not supported');
+    if (columns.isEmpty) _error('a table needs at least one column');
+    return CreateTableStatement(
+      ifNotExists: ifNotExists,
+      name: name,
+      columns: columns,
+      constraints: constraints,
+      start: start,
+      end: _lastEnd,
     );
+  }
+
+  /// A declared type: words, then an optional `(n)` or `(n, m)`.
+  String _typeName() {
+    final words = <String>[];
+    while (_peek.kind == TokenKind.word &&
+        !_reserved.contains(_peek.upper) &&
+        !const {'GENERATED', 'AS'}.contains(_peek.upper)) {
+      words.add(_advance().text);
+    }
+    if (words.isEmpty) return '';
+    var type = words.join(' ');
+    if (_isSymbol('(')) {
+      final from = _peek.start;
+      _p++;
+      _signedNumber();
+      if (_acceptSymbol(',')) _signedNumber();
+      _expectSymbol(')');
+      type = '$type${_sql.substring(from, _lastEnd)}';
+    }
+    return type;
+  }
+
+  void _signedNumber() {
+    if (!_acceptSymbol('-')) _acceptSymbol('+');
+    final t = _advance();
+    if (t.kind != TokenKind.integer && t.kind != TokenKind.real) {
+      _p--;
+      _error('expected a number');
+    }
+  }
+
+  void _conflictClause() {
+    if (_isWord('ON') && _peekAt(1).isWord('CONFLICT')) {
+      _p += 2;
+      final t = _advance();
+      if (!const {
+        'ROLLBACK',
+        'ABORT',
+        'FAIL',
+        'IGNORE',
+        'REPLACE',
+      }.contains(t.upper)) {
+        _p--;
+        _error('expected a conflict resolution');
+      }
+    }
+  }
+
+  ColumnSpec _columnSpec() {
+    final name = _name('a column name');
+    final type = _typeName();
+    var notNull = false, primaryKey = false, descending = false;
+    var autoIncrement = false, unique = false;
+    Expr? defaultExpr;
+    String? defaultSql, collation;
+    final checks = <(Expr, String)>[];
+    ForeignKeyDefinition? references;
+    while (true) {
+      if (_acceptWord('CONSTRAINT')) _name('a constraint name');
+      if (_acceptWord('PRIMARY')) {
+        _expectWord('KEY');
+        if (_acceptWord('DESC')) {
+          descending = true;
+        } else {
+          _acceptWord('ASC');
+        }
+        _conflictClause();
+        primaryKey = true;
+        if (_acceptWord('AUTOINCREMENT')) autoIncrement = true;
+      } else if (_isWord('NOT') && _peekAt(1).isWord('NULL')) {
+        _p += 2;
+        _conflictClause();
+        notNull = true;
+      } else if (_acceptWord('NULL')) {
+        _conflictClause();
+      } else if (_acceptWord('UNIQUE')) {
+        _conflictClause();
+        unique = true;
+      } else if (_acceptWord('CHECK')) {
+        _expectSymbol('(');
+        final from = _peek.start;
+        final e = _expr();
+        final text = _sql.substring(from, _lastEnd);
+        _expectSymbol(')');
+        checks.add((e, text));
+      } else if (_acceptWord('DEFAULT')) {
+        final from = _peek.start;
+        defaultExpr = _defaultValue();
+        defaultSql = _sql.substring(from, _lastEnd);
+      } else if (_acceptWord('COLLATE')) {
+        collation = _name('a collation name').toUpperCase();
+      } else if (_acceptWord('REFERENCES')) {
+        references = _foreignKeyClause([name]);
+      } else if (_isWord('GENERATED') || _isWord('AS')) {
+        _error('generated columns are not supported');
+      } else {
+        break;
+      }
+    }
+    if (autoIncrement && type.toUpperCase() != 'INTEGER') {
+      _error('AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY');
+    }
+    return ColumnSpec(
+      name: name,
+      type: type,
+      notNull: notNull,
+      primaryKey: primaryKey,
+      descending: descending,
+      autoIncrement: autoIncrement,
+      unique: unique,
+      defaultExpr: defaultExpr,
+      defaultSql: defaultSql,
+      collation: collation,
+      checks: checks,
+      references: references,
+    );
+  }
+
+  /// `DEFAULT` value: a signed number, a literal, CURRENT_*, or `(expr)`.
+  Expr _defaultValue() {
+    final t = _peek;
+    if (t.isSymbol('(')) {
+      _p++;
+      final e = _expr();
+      _expectSymbol(')');
+      return e;
+    }
+    if (t.isSymbol('-') || t.isSymbol('+')) {
+      _p++;
+      final n = _peek;
+      if (n.kind != TokenKind.integer && n.kind != TokenKind.real) {
+        _error('expected a number after ${t.text}');
+      }
+      _p++;
+      final lit = Literal(n.value, n.start, n.end);
+      return t.text == '-' ? Unary('-', lit, t.start, n.end) : lit;
+    }
+    switch (t.kind) {
+      case TokenKind.integer:
+      case TokenKind.real:
+      case TokenKind.string:
+      case TokenKind.blob:
+        return _primary();
+      case TokenKind.word:
+        if (const {
+          'NULL',
+          'TRUE',
+          'FALSE',
+          'CURRENT_TIME',
+          'CURRENT_DATE',
+          'CURRENT_TIMESTAMP',
+        }.contains(t.upper)) {
+          return _primary();
+        }
+        // SQLite reads a bare word here as text.
+        _p++;
+        return Literal(t.text, t.start, t.end);
+      default:
+        _error('expected a DEFAULT value');
+    }
+  }
+
+  ForeignKeyDefinition _foreignKeyClause(List<String> columns) {
+    final parent = _qualifiedName('a table name');
+    final parentColumns = _isSymbol('(') ? _nameList() : const <String>[];
+    var onDelete = ForeignKeyAction.noAction;
+    var onUpdate = ForeignKeyAction.noAction;
+    while (true) {
+      if (_isWord('ON') &&
+          (_peekAt(1).isWord('DELETE') || _peekAt(1).isWord('UPDATE'))) {
+        _p++;
+        final isDelete = _advance().upper == 'DELETE';
+        final action = _fkAction();
+        if (isDelete) {
+          onDelete = action;
+        } else {
+          onUpdate = action;
+        }
+      } else if (_acceptWord('MATCH')) {
+        _name('a match type');
+      } else {
+        break;
+      }
+    }
+    // [NOT] DEFERRABLE [INITIALLY DEFERRED | IMMEDIATE]: parsed, enforced
+    // immediately.
+    if (_isWord('NOT') && _peekAt(1).isWord('DEFERRABLE')) _p++;
+    if (_acceptWord('DEFERRABLE')) {
+      if (_acceptWord('INITIALLY')) {
+        if (!_acceptWord('DEFERRED')) _expectWord('IMMEDIATE');
+      }
+    }
+    if (parentColumns.isNotEmpty && parentColumns.length != columns.length) {
+      _error(
+        'foreign key has ${columns.length} columns but references ${parentColumns.length}',
+      );
+    }
+    return ForeignKeyDefinition(
+      columns: columns,
+      parentTable: parent,
+      parentColumns: parentColumns,
+      onDelete: onDelete,
+      onUpdate: onUpdate,
+    );
+  }
+
+  ForeignKeyAction _fkAction() {
+    if (_acceptWord('CASCADE')) return ForeignKeyAction.cascade;
+    if (_acceptWord('RESTRICT')) return ForeignKeyAction.restrict;
+    if (_acceptWord('SET')) {
+      if (_acceptWord('NULL')) return ForeignKeyAction.setNull;
+      _expectWord('DEFAULT');
+      return ForeignKeyAction.setDefault;
+    }
+    if (_acceptWord('NO')) {
+      _expectWord('ACTION');
+      return ForeignKeyAction.noAction;
+    }
+    _error('expected CASCADE, RESTRICT, SET NULL, SET DEFAULT or NO ACTION');
+  }
+
+  ConstraintSpec _tableConstraint() {
+    String? name;
+    if (_acceptWord('CONSTRAINT')) name = _name('a constraint name');
+    if (_acceptWord('PRIMARY')) {
+      _expectWord('KEY');
+      final cols = _indexedColumnNames();
+      _conflictClause();
+      return ConstraintSpec(
+        kind: TableConstraintKind.primaryKey,
+        name: name,
+        columns: cols,
+      );
+    }
+    if (_acceptWord('UNIQUE')) {
+      final cols = _indexedColumnNames();
+      _conflictClause();
+      return ConstraintSpec(
+        kind: TableConstraintKind.unique,
+        name: name,
+        columns: cols,
+      );
+    }
+    if (_acceptWord('CHECK')) {
+      _expectSymbol('(');
+      final from = _peek.start;
+      final e = _expr();
+      final text = _sql.substring(from, _lastEnd);
+      _expectSymbol(')');
+      return ConstraintSpec(
+        kind: TableConstraintKind.check,
+        name: name,
+        check: e,
+        checkSql: text,
+      );
+    }
+    if (_acceptWord('FOREIGN')) {
+      _expectWord('KEY');
+      final cols = _nameList();
+      _expectWord('REFERENCES');
+      final fk = _foreignKeyClause(cols);
+      return ConstraintSpec(
+        kind: TableConstraintKind.foreignKey,
+        name: name,
+        columns: cols,
+        foreignKey: fk,
+      );
+    }
+    _error('expected PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY');
+  }
+
+  /// `(col [COLLATE c] [ASC|DESC], …)` in key constraints; only the names
+  /// are kept.
+  List<String> _indexedColumnNames() => [
+    for (final c in _indexedColumns()) c.name,
+  ];
+
+  List<IndexedColumn> _indexedColumns() {
+    _expectSymbol('(');
+    final cols = <IndexedColumn>[];
+    do {
+      if (!_atName) _error('only column names can be indexed');
+      final name = _name('a column name');
+      String? collation;
+      if (_acceptWord('COLLATE')) {
+        collation = _name('a collation name').toUpperCase();
+      }
+      var desc = false;
+      if (_acceptWord('DESC')) {
+        desc = true;
+      } else {
+        _acceptWord('ASC');
+      }
+      cols.add(IndexedColumn(name, collation, desc));
+    } while (_acceptSymbol(','));
+    _expectSymbol(')');
+    return cols;
+  }
+
+  CreateIndexStatement _createIndex(int start, bool unique, bool spatial) {
+    final ifNotExists = _ifNotExists();
+    // A spatial index may leave out its name (as 1.x documented).
+    final name = spatial && _isWord('ON')
+        ? null
+        : _qualifiedName('an index name');
+    _expectWord('ON');
+    final table = _name('a table name');
+    final columns = _indexedColumns();
+    if (_isWord('WHERE')) _error('partial indexes are not supported');
+    return CreateIndexStatement(
+      unique: unique,
+      spatial: spatial,
+      ifNotExists: ifNotExists,
+      name: name ?? 'spatial_${table}_${columns.map((c) => c.name).join('_')}',
+      table: table,
+      columns: columns,
+      start: start,
+      end: _lastEnd,
+    );
+  }
+
+  CreateViewStatement _createView(int start) {
+    final ifNotExists = _ifNotExists();
+    final name = _qualifiedName('a view name');
+    final columns = _isSymbol('(') ? _nameList() : null;
+    _expectWord('AS');
+    final saved = _paramsAllowed;
+    _paramsAllowed = false;
+    final q = _select(hints: _hints());
+    _paramsAllowed = saved;
+    return CreateViewStatement(
+      ifNotExists: ifNotExists,
+      name: name,
+      columns: columns,
+      query: q,
+      start: start,
+      end: _lastEnd,
+    );
+  }
+
+  CreateTriggerStatement _createTrigger(int start) {
+    final ifNotExists = _ifNotExists();
+    final name = _qualifiedName('a trigger name');
+    var timing = TriggerTiming.before;
+    if (_acceptWord('BEFORE')) {
+      timing = TriggerTiming.before;
+    } else if (_acceptWord('AFTER')) {
+      timing = TriggerTiming.after;
+    } else if (_acceptWord('INSTEAD')) {
+      _expectWord('OF');
+      timing = TriggerTiming.insteadOf;
+    }
+    TriggerEvent event;
+    List<String>? updateOf;
+    if (_acceptWord('INSERT')) {
+      event = TriggerEvent.insert;
+    } else if (_acceptWord('DELETE')) {
+      event = TriggerEvent.delete;
+    } else if (_acceptWord('UPDATE')) {
+      event = TriggerEvent.update;
+      if (_acceptWord('OF')) {
+        updateOf = [_name('a column name')];
+        while (_acceptSymbol(',')) {
+          updateOf.add(_name('a column name'));
+        }
+      }
+    } else {
+      _error('expected INSERT, UPDATE or DELETE');
+    }
+    _expectWord('ON');
+    final table = _qualifiedName('a table name');
+    if (_acceptWord('FOR')) {
+      _expectWord('EACH');
+      _expectWord('ROW');
+    }
+    final saved = _paramsAllowed;
+    _paramsAllowed = false;
+    final when = _acceptWord('WHEN') ? _expr() : null;
+    _expectWord('BEGIN');
+    final body = <Statement>[];
+    while (!_isWord('END')) {
+      if (_peek.kind == TokenKind.eof) _error('expected END');
+      final t = _peek;
+      Statement s;
+      if (t.isWord('INSERT') || t.isWord('REPLACE')) {
+        s = _insert();
+      } else if (t.isWord('UPDATE')) {
+        s = _update();
+      } else if (t.isWord('DELETE')) {
+        s = _delete();
+      } else if (t.isWord('SELECT') ||
+          t.isWord('VALUES') ||
+          t.kind == TokenKind.hint) {
+        s = _select(hints: _hints());
+      } else {
+        _error(
+          'only INSERT, UPDATE, DELETE and SELECT are allowed in a trigger',
+        );
+      }
+      body.add(s);
+      _expectSymbol(';');
+    }
+    _p++; // END
+    _paramsAllowed = saved;
+    if (body.isEmpty) _error('a trigger needs at least one statement');
+    return CreateTriggerStatement(
+      ifNotExists: ifNotExists,
+      name: name,
+      timing: timing,
+      event: event,
+      updateOf: updateOf,
+      table: table,
+      when: when,
+      body: body,
+      start: start,
+      end: _lastEnd,
+    );
+  }
+
+  Statement _drop() {
+    final start = _peek.start;
+    _expectWord('DROP');
+    if (_acceptWord('TABLE')) {
+      final ifExists = _ifExists();
+      return DropTableStatement(
+        ifExists,
+        _qualifiedName('a table name'),
+        start,
+        _lastEnd,
+      );
+    }
+    if (_acceptWord('VIEW')) {
+      final ifExists = _ifExists();
+      return DropViewStatement(
+        ifExists,
+        _qualifiedName('a view name'),
+        start,
+        _lastEnd,
+      );
+    }
+    if (_acceptWord('INDEX')) {
+      final ifExists = _ifExists();
+      final name = _qualifiedName('an index name');
+      return DropIndexStatement(ifExists, name, start, _lastEnd);
+    }
+    if (_acceptWord('TRIGGER')) {
+      final ifExists = _ifExists();
+      return DropTriggerStatement(
+        ifExists,
+        _qualifiedName('a trigger name'),
+        start,
+        _lastEnd,
+      );
+    }
+    _error('expected TABLE, VIEW, INDEX or TRIGGER after DROP');
+  }
+
+  Statement _alter() {
+    final start = _peek.start;
+    _expectWord('ALTER');
+    _expectWord('TABLE');
+    final table = _qualifiedName('a table name');
+    if (_acceptWord('RENAME')) {
+      if (_acceptWord('TO')) {
+        return RenameTableStatement(
+          table,
+          _name('a table name'),
+          start,
+          _lastEnd,
+        );
+      }
+      _acceptWord('COLUMN');
+      final col = _name('a column name');
+      _expectWord('TO');
+      return RenameColumnStatement(
+        table,
+        col,
+        _name('a column name'),
+        start,
+        _lastEnd,
+      );
+    }
+    if (_acceptWord('ADD')) {
+      _acceptWord('COLUMN');
+      return AddColumnStatement(table, _columnSpec(), start, _lastEnd);
+    }
+    if (_acceptWord('DROP')) {
+      _acceptWord('COLUMN');
+      return DropColumnStatement(
+        table,
+        _name('a column name'),
+        start,
+        _lastEnd,
+      );
+    }
+    _error('expected RENAME, ADD or DROP');
+  }
+
+  // ---------------------------------------------------------------------------
+  // Expressions (SQLite precedence, lowest first)
+  // ---------------------------------------------------------------------------
+
+  Expr _expr() => _or();
+
+  Expr _or() {
+    var left = _and();
+    while (_acceptWord('OR')) {
+      final right = _and();
+      left = Binary('OR', left, right, left.start, right.end);
+    }
+    return left;
+  }
+
+  Expr _and() {
+    var left = _not();
+    while (_acceptWord('AND')) {
+      final right = _not();
+      left = Binary('AND', left, right, left.start, right.end);
+    }
+    return left;
+  }
+
+  Expr _not() {
+    if (_isWord('NOT')) {
+      final t = _advance();
+      final operand = _not();
+      return Unary('NOT', operand, t.start, operand.end);
+    }
+    return _equality();
+  }
+
+  Expr _equality() {
+    var left = _comparison();
+    while (true) {
+      final t = _peek;
+      if (t.isSymbol('=') || t.isSymbol('==')) {
+        _p++;
+        final r = _comparison();
+        left = Binary('=', left, r, left.start, r.end);
+      } else if (t.isSymbol('!=') || t.isSymbol('<>')) {
+        _p++;
+        final r = _comparison();
+        left = Binary('!=', left, r, left.start, r.end);
+      } else if (t.isWord('IS')) {
+        _p++;
+        var not = _acceptWord('NOT');
+        if (_acceptWord('DISTINCT')) {
+          _expectWord('FROM');
+          not = !not;
+        }
+        final r = _comparison();
+        left = Binary(not ? 'IS NOT' : 'IS', left, r, left.start, r.end);
+      } else if (t.isWord('ISNULL')) {
+        _p++;
+        left = Binary(
+          'IS',
+          left,
+          Literal(null, t.start, t.end),
+          left.start,
+          t.end,
+        );
+      } else if (t.isWord('NOTNULL')) {
+        _p++;
+        left = Binary(
+          'IS NOT',
+          left,
+          Literal(null, t.start, t.end),
+          left.start,
+          t.end,
+        );
+      } else if (t.isWord('NOT') && _peekAt(1).isWord('NULL')) {
+        _p += 2;
+        left = Binary(
+          'IS NOT',
+          left,
+          Literal(null, t.start, t.end),
+          left.start,
+          _lastEnd,
+        );
+      } else {
+        final save = _p;
+        final not = _acceptWord('NOT');
+        if (_acceptWord('BETWEEN')) {
+          final low = _comparison();
+          _expectWord('AND');
+          final high = _comparison();
+          left = Between(left, low, high, not, left.start, high.end);
+        } else if (_acceptWord('IN')) {
+          left = _inTail(left, not);
+        } else if (_isWord('LIKE') || _isWord('GLOB')) {
+          final op = _advance().upper;
+          final pattern = _comparison();
+          Expr? escape;
+          if (_acceptWord('ESCAPE')) escape = _comparison();
+          left = Like(op, left, pattern, escape, not, left.start, _lastEnd);
+        } else if (_isWord('REGEXP') || _isWord('MATCH')) {
+          _error('${_peek.upper} is not supported');
+        } else {
+          _p = save;
+          return left;
+        }
+      }
+    }
+  }
+
+  Expr _inTail(Expr left, bool not) {
+    _expectSymbol('(');
+    if (_isWord('SELECT') || _isWord('VALUES')) {
+      final q = _select();
+      _expectSymbol(')');
+      return InSelect(left, q, not, left.start, _lastEnd);
+    }
+    final items = <Expr>[];
+    if (!_isSymbol(')')) {
+      items.add(_expr());
+      while (_acceptSymbol(',')) {
+        items.add(_expr());
+      }
+    }
+    _expectSymbol(')');
+    return InList(left, items, not, left.start, _lastEnd);
+  }
+
+  Expr _comparison() {
+    var left = _bitwise();
+    while (true) {
+      final t = _peek;
+      if (t.kind == TokenKind.symbol &&
+          (t.text == '<' ||
+              t.text == '<=' ||
+              t.text == '>' ||
+              t.text == '>=')) {
+        _p++;
+        final r = _bitwise();
+        left = Binary(t.text, left, r, left.start, r.end);
+      } else {
+        return left;
+      }
+    }
+  }
+
+  Expr _bitwise() {
+    var left = _additive();
+    while (true) {
+      final t = _peek;
+      if (t.kind == TokenKind.symbol &&
+          (t.text == '&' ||
+              t.text == '|' ||
+              t.text == '<<' ||
+              t.text == '>>')) {
+        _p++;
+        final r = _additive();
+        left = Binary(t.text, left, r, left.start, r.end);
+      } else {
+        return left;
+      }
+    }
+  }
+
+  Expr _additive() {
+    var left = _multiplicative();
+    while (true) {
+      final t = _peek;
+      if (t.isSymbol('+') || t.isSymbol('-')) {
+        _p++;
+        final r = _multiplicative();
+        left = Binary(t.text, left, r, left.start, r.end);
+      } else {
+        return left;
+      }
+    }
+  }
+
+  Expr _multiplicative() {
+    var left = _concat();
+    while (true) {
+      final t = _peek;
+      if (t.isSymbol('*') || t.isSymbol('/') || t.isSymbol('%')) {
+        _p++;
+        final r = _concat();
+        left = Binary(t.text, left, r, left.start, r.end);
+      } else {
+        return left;
+      }
+    }
+  }
+
+  Expr _concat() {
+    var left = _unary();
+    while (_isSymbol('||')) {
+      _p++;
+      final r = _unary();
+      left = Binary('||', left, r, left.start, r.end);
+    }
+    return left;
+  }
+
+  Expr _unary() {
+    final t = _peek;
+    if (t.isSymbol('-') || t.isSymbol('+') || t.isSymbol('~')) {
+      _p++;
+      final operand = _unary();
+      // Fold a negative number literal, so -9223372036854775808 is the
+      // smallest integer rather than a real.
+      if (t.text == '-' && operand is Literal && operand.value is num) {
+        final text = _sql.substring(operand.start, operand.end);
+        if (text == '9223372036854775808') {
+          return Literal(minInt64, t.start, operand.end);
+        }
+        return Literal(-(operand.value as num), t.start, operand.end);
+      }
+      return Unary(t.text, operand, t.start, operand.end);
+    }
+    var e = _primary();
+    while (_isWord('COLLATE')) {
+      _p++;
+      final name = _name('a collation name');
+      e = Collate(e, name.toUpperCase(), e.start, _lastEnd);
+    }
+    return e;
+  }
+
+  Expr _primary() {
+    final t = _peek;
+    switch (t.kind) {
+      case TokenKind.integer:
+      case TokenKind.real:
+      case TokenKind.blob:
+        _p++;
+        return Literal(t.value, t.start, t.end);
+      case TokenKind.string:
+        _p++;
+        return Literal(t.text, t.start, t.end);
+      case TokenKind.parameter:
+        _p++;
+        return _param(t);
+      case TokenKind.symbol:
+        if (t.text == '(') {
+          _p++;
+          if (_isWord('SELECT') || _isWord('VALUES')) {
+            final q = _select();
+            _expectSymbol(')');
+            return ScalarSubquery(q, t.start, _lastEnd);
+          }
+          final first = _expr();
+          if (_acceptSymbol(',')) {
+            final items = [first, _expr()];
+            while (_acceptSymbol(',')) {
+              items.add(_expr());
+            }
+            _expectSymbol(')');
+            return RowValue(items, t.start, _lastEnd);
+          }
+          _expectSymbol(')');
+          // Keep the parentheses in the span, as SQLite names the column.
+          return _reSpan(first, t.start, _lastEnd);
+        }
+        _error();
+      case TokenKind.quotedIdentifier:
+        return _columnOrFunction();
+      case TokenKind.word:
+        switch (t.upper) {
+          case 'NULL':
+            _p++;
+            return Literal(null, t.start, t.end);
+          case 'TRUE':
+            _p++;
+            return Literal(1, t.start, t.end);
+          case 'FALSE':
+            _p++;
+            return Literal(0, t.start, t.end);
+          case 'CURRENT_TIME':
+          case 'CURRENT_DATE':
+          case 'CURRENT_TIMESTAMP':
+            _p++;
+            return CurrentTime(t.upper, t.start, t.end);
+          case 'CAST':
+            if (_peekAt(1).isSymbol('(')) {
+              _p += 2;
+              final e = _expr();
+              _expectWord('AS');
+              final type = _typeName();
+              _expectSymbol(')');
+              return Cast(e, type, t.start, _lastEnd);
+            }
+          case 'CASE':
+            return _case();
+          case 'EXISTS':
+            _p++;
+            _expectSymbol('(');
+            final q = _select();
+            _expectSymbol(')');
+            return Exists(q, false, t.start, _lastEnd);
+          case 'RAISE':
+            if (_peekAt(1).isSymbol('(')) return _raise();
+          case 'NOT':
+            if (_peekAt(1).isWord('EXISTS')) {
+              _p += 2;
+              _expectSymbol('(');
+              final q = _select();
+              _expectSymbol(')');
+              return Exists(q, true, t.start, _lastEnd);
+            }
+        }
+        if (_reserved.contains(t.upper)) _error();
+        return _columnOrFunction();
+      default:
+        _error();
+    }
+  }
+
+  /// [e] with its span widened to [start]..[end] (for parentheses).
+  Expr _reSpan(Expr e, int start, int end) {
+    // The engine names columns from spans; parentheses around an
+    // expression become part of the name, as in SQLite.
+    return switch (e) {
+      Literal() => Literal(e.value, start, end),
+      ColumnRef() => ColumnRef(e.table, e.column, start, end),
+      Binary() => Binary(e.op, e.left, e.right, start, end),
+      Unary() => Unary(e.op, e.operand, start, end),
+      _ => e,
+    };
+  }
+
+  Expr _param(Token t) {
+    if (!_paramsAllowed) {
+      throw SqlException.syntax(
+        'parameters are not allowed in views, triggers and stored defaults',
+        _sql,
+        t.start,
+      );
+    }
+    final text = t.text;
+    if (text == '?') {
+      final i = ++_paramMax;
+      return Param(i, null, t.start, t.end);
+    }
+    if (text.startsWith('?')) {
+      final i = int.parse(text.substring(1));
+      if (i < 1 || i > 32766) {
+        throw SqlException.syntax(
+          'parameter index out of range',
+          _sql,
+          t.start,
+        );
+      }
+      if (i > _paramMax) _paramMax = i;
+      return Param(i, null, t.start, t.end);
+    }
+    final name = text.substring(1);
+    final i = _named[name] ??= ++_paramMax;
+    return Param(i, name, t.start, t.end);
+  }
+
+  Expr _columnOrFunction() {
+    final t = _advance();
+    final name = t.text;
+    if (_isSymbol('(') && t.kind == TokenKind.word) {
+      _p++;
+      final upper = t.upper;
+      var distinct = false, star = false;
+      final args = <Expr>[];
+      if (_acceptSymbol('*')) {
+        star = true;
+      } else if (!_isSymbol(')')) {
+        distinct = _acceptWord('DISTINCT');
+        if (!distinct) _acceptWord('ALL');
+        args.add(_expr());
+        while (_acceptSymbol(',')) {
+          args.add(_expr());
+        }
+      }
+      _expectSymbol(')');
+      if (_isWord('FILTER') || _isWord('OVER')) {
+        _error('${_peek.upper} clauses are not supported');
+      }
+      return FunctionCall(upper, args, distinct, star, t.start, _lastEnd);
+    }
+    if (_isSymbol('.')) {
+      _p++;
+      final col = _peek;
+      if (col.kind == TokenKind.quotedIdentifier ||
+          (col.kind == TokenKind.word)) {
+        _p++;
+        if (_isSymbol('.')) {
+          // schema.table.column
+          if (name.toLowerCase() != 'main') _error('unknown database $name');
+          _p++;
+          final c2 = _advance();
+          return ColumnRef(col.text, c2.text, t.start, c2.end);
+        }
+        return ColumnRef(name, col.text, t.start, col.end);
+      }
+      _error('expected a column name');
+    }
+    return ColumnRef(null, name, t.start, t.end);
+  }
+
+  Expr _case() {
+    final t = _advance();
+    Expr? base;
+    if (!_isWord('WHEN')) base = _expr();
+    final whens = <(Expr, Expr)>[];
+    while (_acceptWord('WHEN')) {
+      final w = _expr();
+      _expectWord('THEN');
+      whens.add((w, _expr()));
+    }
+    if (whens.isEmpty) _error('CASE needs at least one WHEN');
+    final otherwise = _acceptWord('ELSE') ? _expr() : null;
+    _expectWord('END');
+    return Case(base, whens, otherwise, t.start, _lastEnd);
+  }
+
+  Expr _raise() {
+    final t = _advance();
+    _expectSymbol('(');
+    final k = _advance();
+    RaiseKind kind;
+    switch (k.upper) {
+      case 'IGNORE':
+        _expectSymbol(')');
+        return Raise(RaiseKind.ignore, null, t.start, _lastEnd);
+      case 'ROLLBACK':
+        kind = RaiseKind.rollback;
+      case 'ABORT':
+        kind = RaiseKind.abort;
+      case 'FAIL':
+        kind = RaiseKind.fail;
+      default:
+        _p--;
+        _error('expected IGNORE, ROLLBACK, ABORT or FAIL');
+    }
+    _expectSymbol(',');
+    final m = _advance();
+    if (m.kind != TokenKind.string) {
+      _p--;
+      _error('expected an error message');
+    }
+    _expectSymbol(')');
+    return Raise(kind, m.text, t.start, _lastEnd);
   }
 }

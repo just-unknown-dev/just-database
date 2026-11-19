@@ -1,26 +1,30 @@
-import '../sql/executor.dart';
+import 'dart:async';
+import 'dart:math';
+
+import '../core/database_mode.dart';
+import '../core/just_database.dart';
 import '../sql/parser.dart';
 
-/// Statistics for a single query or operation.
+/// Timings of one benchmarked operation.
 class QueryStats {
-  final String label;
-  final int iterations;
-  final List<Duration> times;
-
+  /// Creates statistics from [times].
   const QueryStats({
     required this.label,
     required this.iterations,
     required this.times,
   });
 
-  Duration get total => times.fold(Duration.zero, (acc, d) => acc + d);
+  final String label;
+  final int iterations;
 
+  /// Every measured run.
+  final List<Duration> times;
+
+  Duration get total => times.fold(Duration.zero, (a, d) => a + d);
   Duration get min =>
       times.isEmpty ? Duration.zero : times.reduce((a, b) => a < b ? a : b);
-
   Duration get max =>
       times.isEmpty ? Duration.zero : times.reduce((a, b) => a > b ? a : b);
-
   Duration get average => times.isEmpty
       ? Duration.zero
       : Duration(microseconds: total.inMicroseconds ~/ times.length);
@@ -39,107 +43,121 @@ class QueryStats {
   Duration _percentile(double p) {
     if (times.isEmpty) return Duration.zero;
     final sorted = List.of(times)..sort();
-    final idx = ((p / 100) * (sorted.length - 1)).round();
-    return sorted[idx];
+    return sorted[((p / 100) * (sorted.length - 1)).round()];
   }
 
   Duration get p95 => _percentile(95);
   Duration get p99 => _percentile(99);
 
-  /// Operations per second based on total time.
+  /// Operations per second.
   double get throughput {
-    final totalMs = total.inMicroseconds / 1000.0;
-    if (totalMs == 0) return double.infinity;
-    return (iterations * 1000.0) / totalMs;
+    final ms = total.inMicroseconds / 1000.0;
+    return ms == 0 ? double.infinity : iterations * 1000.0 / ms;
   }
 
-  /// Returns a human-readable summary line.
-  String format({String indent = ''}) {
-    return '$indent$label: '
-        'avg=${_us(average)} min=${_us(min)} max=${_us(max)} '
-        'p95=${_us(p95)} p99=${_us(p99)} '
-        'throughput=${throughput.toStringAsFixed(0)} ops/s '
-        '(n=$iterations)';
-  }
+  /// One line of text.
+  String format({String indent = ''}) =>
+      '$indent$label: avg=${_ms(average)} min=${_ms(min)} max=${_ms(max)} '
+      'p95=${_ms(p95)} p99=${_ms(p99)} '
+      'throughput=${throughput.toStringAsFixed(0)} ops/s (n=$iterations)';
 
-  static String _us(Duration d) =>
+  static String _ms(Duration d) =>
       '${(d.inMicroseconds / 1000.0).toStringAsFixed(2)}ms';
 }
 
-/// A single benchmark test case.
+/// One benchmarked operation.
 class BenchmarkCase {
-  final String name;
-  final Future<void> Function() body;
-  final Future<void> Function()? setup;
-  final Future<void> Function()? teardown;
-
   const BenchmarkCase({
     required this.name,
     required this.body,
     this.setup,
     this.teardown,
   });
+  final String name;
+  final Future<void> Function() body;
+  final Future<void> Function()? setup;
+  final Future<void> Function()? teardown;
 }
 
-/// Result from running a full [BenchmarkSuite].
+/// The results of a suite.
 class BenchmarkSuiteResult {
-  final String suiteName;
-  final List<QueryStats> results;
-  final DateTime runAt;
-
   const BenchmarkSuiteResult({
     required this.suiteName,
     required this.results,
     required this.runAt,
   });
+  final String suiteName;
+  final List<QueryStats> results;
+  final DateTime runAt;
 
+  /// The results as text.
   String formatTable() {
-    final buf = StringBuffer();
-    buf.writeln('=== Benchmark: $suiteName (${runAt.toIso8601String()}) ===');
+    final b = StringBuffer(
+      '=== Benchmark: $suiteName (${runAt.toIso8601String()}) ===\n',
+    );
     for (final r in results) {
-      buf.writeln(r.format(indent: '  '));
+      b.writeln(r.format(indent: '  '));
     }
-    return buf.toString();
+    return b.toString();
   }
 }
 
-/// A collection of named benchmark cases that can be run together.
+/// Runs [BenchmarkCase]s: warm-up runs, then measured runs, yielding to the
+/// event loop between runs so a UI stays responsive.
 class BenchmarkSuite {
-  final String name;
-  final List<BenchmarkCase> cases = [];
-  final int warmupIterations;
-  final int measureIterations;
-
   BenchmarkSuite({
     required this.name,
     this.warmupIterations = 5,
     this.measureIterations = 100,
   });
 
+  final String name;
+  final List<BenchmarkCase> cases = [];
+  final int warmupIterations;
+  final int measureIterations;
+
   void add(BenchmarkCase bc) => cases.add(bc);
 
-  /// Convenience method to add a benchmark with just a body function.
   void addCase(
     String caseName,
     Future<void> Function() body, {
     Future<void> Function()? setup,
     Future<void> Function()? teardown,
-  }) {
-    cases.add(
-      BenchmarkCase(
-        name: caseName,
-        body: body,
-        setup: setup,
-        teardown: teardown,
-      ),
-    );
-  }
+  }) => cases.add(
+    BenchmarkCase(name: caseName, body: body, setup: setup, teardown: teardown),
+  );
 
+  /// Runs every case.
   Future<BenchmarkSuiteResult> run() async {
     final results = <QueryStats>[];
     for (final bc in cases) {
-      final stats = await _runCase(bc);
-      results.add(stats);
+      await bc.setup?.call();
+      try {
+        for (var i = 0; i < warmupIterations; i++) {
+          await bc.body();
+          await Future<void>.delayed(Duration.zero);
+        }
+        final times = <Duration>[];
+        final watch = Stopwatch();
+        for (var i = 0; i < measureIterations; i++) {
+          watch
+            ..reset()
+            ..start();
+          await bc.body();
+          watch.stop();
+          times.add(watch.elapsed);
+          await Future<void>.delayed(Duration.zero);
+        }
+        results.add(
+          QueryStats(
+            label: bc.name,
+            iterations: measureIterations,
+            times: times,
+          ),
+        );
+      } finally {
+        await bc.teardown?.call();
+      }
     }
     return BenchmarkSuiteResult(
       suiteName: name,
@@ -147,178 +165,159 @@ class BenchmarkSuite {
       runAt: DateTime.now(),
     );
   }
-
-  Future<QueryStats> _runCase(BenchmarkCase bc) async {
-    // Warm-up
-    for (int i = 0; i < warmupIterations; i++) {
-      await bc.setup?.call();
-      await bc.body();
-      await bc.teardown?.call();
-    }
-
-    // Measurement
-    final times = <Duration>[];
-    for (int i = 0; i < measureIterations; i++) {
-      await bc.setup?.call();
-      final start = DateTime.now();
-      await bc.body();
-      times.add(DateTime.now().difference(start));
-      await bc.teardown?.call();
-    }
-    return QueryStats(
-      label: bc.name,
-      iterations: measureIterations,
-      times: times,
-    );
-  }
 }
 
-/// Pre-built benchmark scenarios for JustDatabase.
-class DatabaseBenchmark {
-  final Executor executor;
-  final int rowCount;
+/// Benchmarks for databases.
+extension JustDatabaseBenchmark on JustDatabase {
+  /// Runs the standard suite (inserts, lookups, updates, deletes, counts,
+  /// sorting, a join and parsing) against a private in-memory database of
+  /// [rowCount] rows, so this database is never touched.
+  Future<BenchmarkSuiteResult> runStandardBenchmark({
+    int rowCount = 1000,
+    int warmup = 3,
+    int iterations = 50,
+  }) => runStandardDatabaseBenchmark(
+    rowCount: rowCount,
+    warmup: warmup,
+    iterations: iterations,
+  );
 
-  DatabaseBenchmark({required this.executor, this.rowCount = 1000});
-
-  /// Runs the standard benchmark suite and returns formatted results.
-  Future<BenchmarkSuiteResult> run({int? warmup, int? iterations}) async {
-    final suite = BenchmarkSuite(
-      name: 'JustDatabase v$rowCount rows',
-      warmupIterations: warmup ?? 3,
-      measureIterations: iterations ?? 50,
-    );
-
-    await _setupBenchmarkTables();
-
-    suite.addCase(
-      'INSERT single row',
-      () => executor.executeSQL(
-        "INSERT INTO _bench_t (val, label) VALUES (42, 'test')",
-      ),
-    );
-
-    suite.addCase(
-      'SELECT * (no index)',
-      () => executor.executeSQL('SELECT * FROM _bench_t LIMIT 100'),
-    );
-
-    suite.addCase(
-      'SELECT WHERE by indexed column',
-      () => executor.executeSQL('SELECT * FROM _bench_t WHERE id = 1'),
-    );
-
-    suite.addCase(
-      'UPDATE single row',
-      () => executor.executeSQL(
-        "UPDATE _bench_t SET label = 'updated' WHERE id = 1",
-      ),
-    );
-
-    suite.addCase('DELETE single row', () async {
-      // Re-insert to avoid running out of rows
-      await executor.executeSQL(
-        "INSERT INTO _bench_t (id, val, label) VALUES (99999, 0, 'del')",
-      );
-      await executor.executeSQL('DELETE FROM _bench_t WHERE id = 99999');
-    });
-
-    suite.addCase(
-      'SELECT COUNT(*)',
-      () => executor.executeSQL('SELECT COUNT(*) AS c FROM _bench_t'),
-    );
-
-    suite.addCase(
-      'SELECT with ORDER BY',
-      () => executor.executeSQL(
-        'SELECT * FROM _bench_t ORDER BY val DESC LIMIT 10',
-      ),
-    );
-
-    suite.addCase(
-      'SQL parse only (no execute)',
-      () async =>
-          Parser.parseSQL('SELECT id, val FROM _bench_t WHERE val > 50'),
-    );
-
-    final result = await suite.run();
-    await _teardownBenchmarkTables();
-    return result;
-  }
-
-  /// Runs a single SQL query benchmarked [iterations] times.
-  Future<QueryStats> runQuery(
+  /// Times the read-only [sql] (a SELECT) on this database. Throws the
+  /// statement's `SqlException` when it fails.
+  Future<QueryStats> benchmarkQuery(
     String label,
     String sql, {
+    Object? parameters,
     int warmup = 3,
-    int iterations = 100,
+    int iterations = 50,
   }) async {
-    // Warm-up
-    for (int i = 0; i < warmup; i++) {
-      await executor.executeSQL(sql);
+    for (var i = 0; i < warmup; i++) {
+      (await query(sql, parameters)).orThrow();
+      await Future<void>.delayed(Duration.zero);
     }
     final times = <Duration>[];
-    for (int i = 0; i < iterations; i++) {
-      final start = DateTime.now();
-      await executor.executeSQL(sql);
-      times.add(DateTime.now().difference(start));
+    final watch = Stopwatch();
+    for (var i = 0; i < iterations; i++) {
+      watch
+        ..reset()
+        ..start();
+      (await query(sql, parameters)).orThrow();
+      watch.stop();
+      times.add(watch.elapsed);
+      await Future<void>.delayed(Duration.zero);
     }
     return QueryStats(label: label, iterations: iterations, times: times);
   }
+}
 
-  /// Sets up benchmark support tables with [rowCount] rows.
-  Future<void> _setupBenchmarkTables() async {
-    await executor.executeSQL('DROP TABLE IF EXISTS _bench_t');
-    await executor.executeSQL('''
-      CREATE TABLE _bench_t (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        val INTEGER,
-        label TEXT
-      )
-    ''');
-    // Bulk insert
-    final batch = StringBuffer();
-    for (int i = 0; i < rowCount; i++) {
-      if (i > 0) batch.write('; ');
-      batch.write(
-        "INSERT INTO _bench_t (val, label) VALUES (${i % 1000}, 'row_$i')",
-      );
-    }
-    final stmts = Parser.parseSQLStatements(batch.toString());
-    for (final stmt in stmts) {
-      await executor.execute(stmt);
-    }
+/// The standard suite on a private in-memory database; see
+/// [JustDatabaseBenchmark.runStandardBenchmark].
+Future<BenchmarkSuiteResult> runStandardDatabaseBenchmark({
+  int rowCount = 1000,
+  int warmup = 3,
+  int iterations = 50,
+}) async {
+  final name = '__bench_${Random().nextInt(1 << 30)}';
+  final db = await JustDatabase.open(
+    name,
+    persist: false,
+    mode: DatabaseMode.standard,
+  );
+  try {
+    (await db.execute(
+      'CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER, label TEXT)',
+    )).orThrow();
+    (await db.execute('CREATE INDEX t_val ON t (val)')).orThrow();
+    (await db.execute(
+      'CREATE TABLE u (id INTEGER PRIMARY KEY, t_id INTEGER, note TEXT)',
+    )).orThrow();
+    await db.transaction((tx) async {
+      for (var i = 1; i <= rowCount; i++) {
+        await tx.execute('INSERT INTO t (id, val, label) VALUES (?, ?, ?)', [
+          i,
+          i % 100,
+          'row $i',
+        ]);
+        await tx.execute('INSERT INTO u (t_id, note) VALUES (?, ?)', [
+          i,
+          'note $i',
+        ]);
+      }
+    });
+    final suite =
+        BenchmarkSuite(
+            name: 'just_database, $rowCount rows',
+            warmupIterations: warmup,
+            measureIterations: iterations,
+          )
+          ..addCase('INSERT one row', () async {
+            (await db.execute('INSERT INTO t (val, label) VALUES (?, ?)', [
+              42,
+              'new',
+            ])).orThrow();
+          })
+          ..addCase('SELECT 100 rows', () async {
+            (await db.query('SELECT * FROM t LIMIT 100')).orThrow();
+          })
+          ..addCase('SELECT by primary key', () async {
+            (await db.query('SELECT * FROM t WHERE id = ?', [
+              rowCount ~/ 2,
+            ])).orThrow();
+          })
+          ..addCase('SELECT by indexed column', () async {
+            (await db.query('SELECT * FROM t WHERE val = ?', [7])).orThrow();
+          })
+          ..addCase('UPDATE by primary key', () async {
+            (await db.execute('UPDATE t SET label = ? WHERE id = ?', [
+              'changed',
+              1,
+            ])).orThrow();
+          })
+          ..addCase('INSERT + DELETE by key', () async {
+            final r = (await db.execute(
+              'INSERT INTO t (val, label) VALUES (0, ?)',
+              ['tmp'],
+            )).orThrow();
+            (await db.execute('DELETE FROM t WHERE id = ?', [
+              r.lastInsertRowId,
+            ])).orThrow();
+          })
+          ..addCase('SELECT COUNT(*)', () async {
+            (await db.query('SELECT COUNT(*) FROM t')).orThrow();
+          })
+          ..addCase('ORDER BY with LIMIT', () async {
+            (await db.query(
+              'SELECT * FROM t ORDER BY val DESC, id LIMIT 10',
+            )).orThrow();
+          })
+          ..addCase('JOIN on key', () async {
+            (await db.query(
+              'SELECT COUNT(*) FROM t JOIN u ON u.t_id = t.id',
+            )).orThrow();
+          })
+          ..addCase('Parse only', () async {
+            Parser.parseOne(
+              'SELECT id, val FROM t WHERE val > 50 ORDER BY id LIMIT 5',
+            );
+          });
+    return await suite.run();
+  } finally {
+    await db.close();
   }
+}
 
-  Future<void> _teardownBenchmarkTables() async {
-    await executor.executeSQL('DROP TABLE IF EXISTS _bench_t');
-  }
-
-  /// Formats a list of [QueryStats] results as a text table.
-  static String formatTable(List<QueryStats> stats) {
-    final colWidth = stats.fold(
-      10,
-      (w, s) => s.label.length > w ? s.label.length : w,
+/// Formats [stats] as an aligned table.
+String formatQueryStats(List<QueryStats> stats) {
+  final b = StringBuffer();
+  final width = stats.fold<int>(10, (w, s) => max(w, s.label.length));
+  b.writeln('${'Case'.padRight(width)}  avg(ms)  p95(ms)  ops/s');
+  for (final s in stats) {
+    b.writeln(
+      '${s.label.padRight(width)}  '
+      '${(s.average.inMicroseconds / 1000).toStringAsFixed(2).padLeft(7)}  '
+      '${(s.p95.inMicroseconds / 1000).toStringAsFixed(2).padLeft(7)}  '
+      '${s.throughput.toStringAsFixed(0)}',
     );
-    final buf = StringBuffer();
-    final header =
-        '${'Operation'.padRight(colWidth)}  ${'Avg(ms)'.padLeft(8)}  '
-        '${'Min(ms)'.padLeft(8)}  ${'Max(ms)'.padLeft(8)}  '
-        '${'P95(ms)'.padLeft(8)}  ${'ops/s'.padLeft(10)}';
-    buf.writeln(header);
-    buf.writeln('-' * header.length);
-    for (final s in stats) {
-      buf.writeln(
-        '${s.label.padRight(colWidth)}  '
-        '${_ms(s.average).padLeft(8)}  '
-        '${_ms(s.min).padLeft(8)}  '
-        '${_ms(s.max).padLeft(8)}  '
-        '${_ms(s.p95).padLeft(8)}  '
-        '${s.throughput.toStringAsFixed(0).padLeft(10)}',
-      );
-    }
-    return buf.toString();
   }
-
-  static String _ms(Duration d) =>
-      (d.inMicroseconds / 1000.0).toStringAsFixed(3);
+  return b.toString();
 }

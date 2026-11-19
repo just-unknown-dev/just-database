@@ -1,0 +1,20 @@
+name: just_database_example
+description: "Runs the just_database admin UI on a sample database, and a tour of the API."
+publish_to: none
+version: 2.0.0
+
+environment:
+  sdk: ^3.11.0
+  flutter: ">=3.47.1"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  just_database:
+    path: ../
+
+dev_dependencies:
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

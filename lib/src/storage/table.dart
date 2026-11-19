@@ -1,659 +1,399 @@
-import 'dart:convert';
-import 'dart:typed_data';
-import 'schema.dart';
-import 'database_row.dart';
+import 'dart:collection';
+
+import 'package:flutter/foundation.dart' show internal;
+
 import 'index.dart';
+import 'schema.dart';
+import 'undo_log.dart';
+import 'values.dart';
 
-/// Result of an INSERT operation.
-class InsertResult {
-  final bool success;
-  final int? rowId;
-  final String? errorMessage;
+/// The largest rowid.
+@internal
+final int maxRowId = maxInt64;
 
-  const InsertResult.success(this.rowId) : success = true, errorMessage = null;
+/// The rows of one table, kept by rowid in rowid order, with the indexes
+/// that enforce its keys and those created by `CREATE INDEX`.
+///
+/// The SQL engine validates a change before making it (NOT NULL, CHECK,
+/// UNIQUE, foreign keys); these methods only apply it, keep every index
+/// current, and record the undo of each change in the [UndoLog].
+@internal
+final class TableData {
+  /// Creates an empty table with [schema].
+  TableData(TableSchema schema, this._log) : _schema = schema {
+    _constraintIndexes();
+    ensureForeignKeyIndexes();
+  }
 
-  const InsertResult.error(this.errorMessage) : success = false, rowId = null;
-}
-
-/// In-memory table holding rows, a schema, and optional indices.
-class Table {
+  final UndoLog _log;
   TableSchema _schema;
+  final SplayTreeMap<int, List<Object?>> _rows =
+      SplayTreeMap<int, List<Object?>>();
 
-  final List<DatabaseRow> _rows = [];
-  final Map<int, int> _rowIdToIndex = {}; // rowId → index in _rows
-  final Map<String, TableIndex> _indices = {};
+  /// AUTOINCREMENT's high-water mark: the largest rowid ever used.
+  int sequence = 0;
 
-  int _nextRowId = 1;
-  int _autoIncrementValue = 0;
+  /// Every index, constraint indexes first.
+  final List<TableIndex> indexes = [];
 
-  Table({required TableSchema schema}) : _schema = schema {
-    _initializeIndices();
-  }
+  /// Every spatial index.
+  final List<SpatialIndex> spatialIndexes = [];
 
-  /// Initializes all automatic indices for the table.
-  void _initializeIndices() {
-    // Auto-create composite primary key index if exists
-    final pkCols = _schema.primaryKeyColumns;
-    if (pkCols.isNotEmpty) {
-      if (pkCols.length == 1) {
-        // Single-column PK
-        _indices[pkCols.first.toLowerCase()] = TableIndex(
-          columnName: pkCols.first,
-          unique: true,
-          type: IndexType.primary,
-        );
-      } else {
-        // Composite PK
-        final indexName = 'pk_${pkCols.join("_").toLowerCase()}';
-        _indices[indexName] = TableIndex.composite(
-          columns: pkCols,
-          unique: true,
-          type: IndexType.primary,
-          name: indexName,
-        );
-      }
-    }
-
-    // Create indices for table-level UNIQUE constraints
-    for (final constraint in _schema.tableConstraints) {
-      if (constraint.type == TableConstraintType.unique) {
-        if (constraint.columns.length == 1) {
-          final col = constraint.columns.first;
-          final key = col.toLowerCase();
-          if (!_indices.containsKey(key)) {
-            _indices[key] = TableIndex(
-              columnName: col,
-              unique: true,
-              type: IndexType.unique,
-            );
-          }
-        } else {
-          final indexName =
-              constraint.name ??
-              'unique_${constraint.columns.join("_").toLowerCase()}';
-          _indices[indexName] = TableIndex.composite(
-            columns: constraint.columns,
-            unique: true,
-            type: IndexType.unique,
-            name: indexName,
-          );
-        }
-      }
-    }
-
-    // Create indices for column-level UNIQUE constraints
-    for (final col in _schema.columns) {
-      final key = col.name.toLowerCase();
-      if (col.constraints.unique && !_indices.containsKey(key)) {
-        _indices[key] = TableIndex(
-          columnName: col.name,
-          unique: true,
-          type: IndexType.unique,
-        );
-      }
-
-      // Auto-index foreign key columns
-      if (col.constraints.foreignKeyTable != null &&
-          !_indices.containsKey(key)) {
-        _indices[key] = TableIndex(
-          columnName: col.name,
-          unique: false,
-          type: IndexType.foreign,
-          name: 'fk_idx_${col.name.toLowerCase()}',
-        );
-      }
-    }
-  }
-
+  /// The table's schema.
   TableSchema get schema => _schema;
 
-  /// Returns a deep clone of this table — used by the WAL transaction system
-  /// to snapshot state before a transaction begins.
-  Table clone() => Table(schema: _schema).._copyStateFrom(this);
+  /// The table's name.
+  String get name => _schema.name;
 
-  /// Restores this table's mutable state from a previously cloned snapshot.
-  /// Called during ROLLBACK to undo changes. The snapshot is left untouched,
-  /// so it can be restored again (e.g. ROLLBACK TO the same SAVEPOINT twice).
-  void restoreFrom(Table snapshot) => _copyStateFrom(snapshot);
-
-  /// Replaces this table's schema, counters, rows and indices with
-  /// independent copies of [source]'s. Every index is copied — automatic,
-  /// CREATE INDEX, auto-created and loaded-from-disk ones alike — together
-  /// with its contents, so constraints keep being enforced.
-  void _copyStateFrom(Table source) {
-    _schema = source._schema;
-    _nextRowId = source._nextRowId;
-    _autoIncrementValue = source._autoIncrementValue;
-    // DatabaseRow is immutable, so the row instances can be shared.
-    _rows
-      ..clear()
-      ..addAll(source._rows);
-    _rowIdToIndex.clear();
-    for (int i = 0; i < _rows.length; i++) {
-      _rowIdToIndex[_rows[i].rowId] = i;
-    }
-    _indices
-      ..clear()
-      ..addAll(source._indices.map((key, idx) => MapEntry(key, idx.copy())));
-  }
-
-  // ---------------------------------------------------------------------------
-  // INSERT
-  // ---------------------------------------------------------------------------
-
-  InsertResult insert(Map<String, dynamic> values) {
-    final row = Map<String, dynamic>.from(values);
-
-    // 1. Apply defaults for missing columns
-    for (final col in _schema.columns) {
-      if (!row.containsKey(col.name)) {
-        if (col.constraints.hasDefault) {
-          row[col.name] = col.constraints.defaultValue;
-        } else if (col.constraints.autoIncrement ||
-            col.constraints.primaryKey) {
-          row[col.name] = null; // will be assigned below
-        } else {
-          row[col.name] = null;
-        }
-      }
-    }
-
-    // 2. Handle AUTOINCREMENT for primary key
-    final pk = _schema.primaryKeyColumn;
-    if (pk != null && (row[pk.name] == null)) {
-      _autoIncrementValue++;
-      row[pk.name] = _autoIncrementValue;
-    }
-
-    // 3. Validate NOT NULL
-    for (final col in _schema.columns) {
-      if (col.constraints.notNull && row[col.name] == null) {
-        return InsertResult.error(
-          'NOT NULL constraint failed for column "${col.name}"',
-        );
-      }
-    }
-
-    // 4. Validate UNIQUE and PRIMARY KEY (single-column)
-    for (final col in _schema.columns) {
-      if ((col.constraints.unique || col.constraints.primaryKey) &&
-          row[col.name] != null) {
-        final idx = _indices[col.name.toLowerCase()];
-        if (idx != null && idx.containsValue(row[col.name])) {
-          return InsertResult.error(
-            'UNIQUE constraint failed for column "${col.name}": value already exists',
-          );
-        }
-      }
-    }
-
-    // 4b. Validate composite PRIMARY KEY and UNIQUE constraints
-    for (final idx in _indices.values) {
-      if (idx.isComposite && idx.unique) {
-        final testRow = DatabaseRow(rowId: -1, values: row);
-        if (idx.containsValue(testRow)) {
-          return InsertResult.error(
-            'UNIQUE constraint failed for (${idx.columns.join(", ")}): combination already exists',
-          );
-        }
-      }
-    }
-
-    // 5. Coerce types
-    for (final col in _schema.columns) {
-      if (row.containsKey(col.name) && row[col.name] != null) {
-        row[col.name] = _coerce(row[col.name], col.type);
-      }
-    }
-
-    // 6. Assign row ID and insert
-    final rowId = _nextRowId++;
-    final newRow = DatabaseRow(rowId: rowId, values: row);
-    final index = _rows.length;
-    _rows.add(newRow);
-    _rowIdToIndex[rowId] = index;
-    _addToIndices(newRow);
-
-    return InsertResult.success(rowId);
-  }
-
-  // ---------------------------------------------------------------------------
-  // UPDATE
-  // ---------------------------------------------------------------------------
-
-  int update(
-    bool Function(DatabaseRow) predicate,
-    Map<String, dynamic> updates,
-  ) {
-    int count = 0;
-    for (int i = 0; i < _rows.length; i++) {
-      final row = _rows[i];
-      if (predicate(row)) {
-        // Validate UNIQUE constraints on updated columns
-        for (final entry in updates.entries) {
-          final col = _schema.getColumn(entry.key);
-          if (col != null &&
-              (col.constraints.unique || col.constraints.primaryKey) &&
-              entry.value != null) {
-            final idx = _indices[col.name.toLowerCase()];
-            if (idx != null) {
-              final existingIds = idx.lookup(entry.value);
-              // Allow the same row to keep its own value
-              if (existingIds.any((id) => id != row.rowId)) {
-                throw StateError(
-                  'UNIQUE constraint failed for column "${col.name}"',
-                );
-              }
-            }
-          }
-        }
-
-        // Coerce types
-        final coerced = <String, dynamic>{};
-        for (final entry in updates.entries) {
-          final col = _schema.getColumn(entry.key);
-          if (col != null && entry.value != null) {
-            coerced[entry.key] = _coerce(entry.value, col.type);
-          } else {
-            coerced[entry.key] = entry.value;
-          }
-        }
-
-        final updatedRow = row.copyWith(coerced);
-        _removeFromIndices(row);
-        _rows[i] = updatedRow;
-        _addToIndices(updatedRow);
-        count++;
-      }
-    }
-    return count;
-  }
-
-  // ---------------------------------------------------------------------------
-  // DELETE
-  // ---------------------------------------------------------------------------
-
-  int delete(bool Function(DatabaseRow) predicate) {
-    final toDelete = _rows.where(predicate).toList();
-    for (final row in toDelete) {
-      _removeFromIndices(row);
-      _rowIdToIndex.remove(row.rowId);
-    }
-    _rows.removeWhere(predicate);
-    // Rebuild rowId→index map after removal
-    for (int i = 0; i < _rows.length; i++) {
-      _rowIdToIndex[_rows[i].rowId] = i;
-    }
-    return toDelete.length;
-  }
-
-  // ---------------------------------------------------------------------------
-  // SCAN / LOOKUP
-  // ---------------------------------------------------------------------------
-
-  List<DatabaseRow> scan() => List.unmodifiable(_rows);
-
-  DatabaseRow? getByPrimaryKey(dynamic value) {
-    final pk = _schema.primaryKeyColumn;
-    if (pk == null) return null;
-    final idx = _indices[pk.name.toLowerCase()];
-    if (idx == null) return null;
-    final ids = idx.lookup(value);
-    if (ids.isEmpty) return null;
-    return getByRowId(ids.first);
-  }
-
-  DatabaseRow? getByRowId(int rowId) {
-    final index = _rowIdToIndex[rowId];
-    if (index == null) return null;
-    return _rows[index];
-  }
-
-  // ---------------------------------------------------------------------------
-  // SCHEMA MUTATION
-  // ---------------------------------------------------------------------------
-
-  void addColumn(ColumnDefinition column) {
-    _schema = _schema.addColumn(column);
-    // Back-fill existing rows with default or null
-    for (int i = 0; i < _rows.length; i++) {
-      final row = _rows[i];
-      if (!row.values.containsKey(column.name)) {
-        _rows[i] = row.copyWith({
-          column.name: column.constraints.hasDefault
-              ? column.constraints.defaultValue
-              : null,
-        });
-        _rowIdToIndex[_rows[i].rowId] = i;
-      }
-    }
-    if (column.constraints.unique || column.constraints.primaryKey) {
-      final idx = TableIndex(columnName: column.name, unique: true);
-      idx.rebuild(_rows);
-      _indices[column.name.toLowerCase()] = idx;
-    }
-  }
-
-  void dropColumn(String columnName) {
-    _schema = _schema.dropColumn(columnName);
-    _indices.remove(columnName.toLowerCase());
-    for (int i = 0; i < _rows.length; i++) {
-      final row = _rows[i];
-      final updated = Map<String, dynamic>.from(row.values)..remove(columnName);
-      _rows[i] = DatabaseRow(rowId: row.rowId, values: updated);
-    }
-  }
-
-  void renameColumn(String oldName, String newName) {
-    _schema = _schema.renameColumn(oldName, newName);
-    final idx = _indices.remove(oldName.toLowerCase());
-    if (idx != null) _indices[newName.toLowerCase()] = idx;
-
-    for (int i = 0; i < _rows.length; i++) {
-      final row = _rows[i];
-      if (row.values.containsKey(oldName)) {
-        final updated = Map<String, dynamic>.from(row.values);
-        final val = updated.remove(oldName);
-        updated[newName] = val;
-        _rows[i] = DatabaseRow(rowId: row.rowId, values: updated);
-      }
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // STATS
-  // ---------------------------------------------------------------------------
-
+  /// The number of rows.
   int get rowCount => _rows.length;
 
-  /// Rough estimate of serialized size in bytes.
-  int get estimatedSizeBytes {
-    int total = 0;
-    for (final row in _rows) {
-      for (final val in row.values.values) {
-        if (val == null) {
-          total += 4;
-        } else if (val is String) {
-          total += val.length * 2;
-        } else if (val is int || val is double || val is bool) {
-          total += 8;
-        } else if (val is Uint8List) {
-          total += val.length;
-        } else if (val is DateTime) {
-          total += 24;
-        } else {
-          total += 16;
-        }
-      }
+  /// The rows, by rowid, in rowid order. The lists are the stored rows; do
+  /// not change them.
+  Iterable<MapEntry<int, List<Object?>>> get entries => _rows.entries;
+
+  /// The rowids, in order.
+  Iterable<int> get rowids => _rows.keys;
+
+  /// The stored row with [rowid], or null. Do not change it.
+  List<Object?>? row(int rowid) => _rows[rowid];
+
+  /// The rowid for a new row: one past the largest rowid (or past the
+  /// AUTOINCREMENT high-water mark). Throws [StateError] when the rowid
+  /// space is used up.
+  int newRowId() {
+    var base = _rows.isEmpty ? 0 : _rows.lastKey()!;
+    if (_schema.autoIncrement && sequence > base) base = sequence;
+    if (base < maxRowId) return base + 1;
+    if (_schema.autoIncrement) {
+      throw StateError('database or disk is full (AUTOINCREMENT exhausted)');
     }
-    return total + _schema.tableName.length + _schema.columns.length * 32;
+    // As SQLite: look for an unused rowid.
+    var candidate = 1;
+    for (final k in _rows.keys) {
+      if (k > candidate) return candidate;
+      if (k == candidate) candidate++;
+    }
+    throw StateError('database or disk is full (no rowid left)');
   }
 
   // ---------------------------------------------------------------------------
-  // INDEX MANAGEMENT
+  // Row changes
   // ---------------------------------------------------------------------------
 
-  /// Creates a composite index on the given columns.
-  void createCompositeIndex(
-    List<String> columns,
-    IndexType type, {
-    bool unique = false,
-    String? name,
-  }) {
-    final indexName = name ?? 'idx_${columns.join("_").toLowerCase()}';
-    if (_indices.containsKey(indexName)) {
-      throw StateError('Index "$indexName" already exists');
+  /// Stores [values] under [rowid], which must be unused.
+  void insert(int rowid, List<Object?> values) {
+    assert(!_rows.containsKey(rowid));
+    _rawInsert(rowid, values);
+    if (rowid > sequence && _schema.autoIncrement) {
+      final old = sequence;
+      sequence = rowid;
+      _log.record(() => sequence = old);
     }
-
-    final idx = TableIndex.composite(
-      columns: columns,
-      unique: unique,
-      type: type,
-      name: indexName,
-    );
-    idx.rebuild(_rows);
-    _indices[indexName] = idx;
+    _log.record(() => _rawDelete(rowid));
   }
 
-  /// Creates a single-column index.
-  void createAutoIndex(String columnName) {
-    final key = columnName.toLowerCase();
-    if (_indices.containsKey(key)) return; // Already indexed
-
-    final idx = TableIndex(
-      columnName: columnName,
-      unique: false,
-      type: IndexType.auto,
-      name: 'auto_idx_$key',
-    );
-    idx.rebuild(_rows);
-    _indices[key] = idx;
+  /// Deletes the row with [rowid] and returns it.
+  List<Object?> delete(int rowid) {
+    final old = _rawDelete(rowid);
+    _log.record(() => _rawInsert(rowid, old));
+    return old;
   }
 
-  /// Drops an index by name. Returns true if removed, false if not found.
-  bool dropIndex(String name) {
-    final key = name.toLowerCase();
-    if (_indices.remove(key) != null) return true;
-    // Try matching by metadata name (not key)
-    final entry = _indices.entries
-        .where((e) => e.value.metadata.name.toLowerCase() == key)
-        .firstOrNull;
-    if (entry != null) {
-      _indices.remove(entry.key);
-      return true;
+  /// Replaces the row with [rowid] by [values], moving it to [newRowid]
+  /// when that differs (the rowid alias changed).
+  void update(int rowid, List<Object?> values, {int? newRowid}) {
+    final target = newRowid ?? rowid;
+    final old = _rawDelete(rowid);
+    _rawInsert(target, values);
+    if (target > sequence && _schema.autoIncrement) {
+      final oldSeq = sequence;
+      sequence = target;
+      _log.record(() => sequence = oldSeq);
     }
-    return false;
+    _log.record(() {
+      _rawDelete(target);
+      _rawInsert(rowid, old);
+    });
   }
 
-  /// Returns all index names on this table.
-  List<String> get indexNames => _indices.keys.toList();
-
-  /// Returns the index for the given columns, if it exists.
-  TableIndex? getIndexForColumns(List<String> columns) {
-    if (columns.isEmpty) return null;
-
-    // Exact match
-    for (final idx in _indices.values) {
-      if (idx.columns.length == columns.length) {
-        bool matches = true;
-        for (int i = 0; i < columns.length; i++) {
-          if (idx.columns[i].toLowerCase() != columns[i].toLowerCase()) {
-            matches = false;
-            break;
-          }
-        }
-        if (matches) return idx;
-      }
+  void _rawInsert(int rowid, List<Object?> values) {
+    _rows[rowid] = values;
+    for (final i in indexes) {
+      i.add(values, rowid);
     }
-
-    // For single column, try direct lookup by name
-    if (columns.length == 1) {
-      return _indices[columns.first.toLowerCase()];
+    for (final s in spatialIndexes) {
+      s.add(values, rowid);
     }
+  }
 
+  List<Object?> _rawDelete(int rowid) {
+    final old = _rows.remove(rowid);
+    if (old == null) throw StateError('No row $rowid in $name');
+    for (final i in indexes) {
+      i.remove(old, rowid);
+    }
+    for (final s in spatialIndexes) {
+      s.remove(old, rowid);
+    }
+    return old;
+  }
+
+  /// Deletes every row (the truncate optimisation of `DELETE FROM t`).
+  int clear() {
+    final saved = SplayTreeMap<int, List<Object?>>.of(_rows);
+    final n = _rows.length;
+    _rows.clear();
+    _rebuildAll();
+    _log.record(() {
+      _rows
+        ..clear()
+        ..addAll(saved);
+      _rebuildAll();
+    });
+    return n;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Validation helpers
+  // ---------------------------------------------------------------------------
+
+  /// The first NOT NULL column that [values] leaves NULL, or null.
+  ColumnDefinition? notNullViolation(List<Object?> values) {
+    final cols = _schema.columns;
+    for (var i = 0; i < cols.length; i++) {
+      if (cols[i].notNull && values[i] == null) return cols[i];
+    }
     return null;
   }
 
-  /// Removes an index by name.
-  void removeIndex(String name) {
-    _indices.remove(name.toLowerCase());
-  }
-
-  /// Returns all index metadata.
-  List<IndexMetadata> get indexMetadata {
-    return _indices.values.map((idx) => idx.metadata).toList();
-  }
-
-  // ---------------------------------------------------------------------------
-  // SERIALIZATION
-  // ---------------------------------------------------------------------------
-
-  /// Serializes table to JSON with rows as ordered arrays for compactness.
-  Map<String, dynamic> toJson() {
-    final colNames = _schema.columns.map((c) => c.name).toList();
-    final rowArrays = _rows.map((row) {
-      return colNames.map((name) {
-        final v = row.values[name];
-        if (v == null) return null;
-        if (v is Uint8List) return {'__type': 'blob', 'data': base64.encode(v)};
-        if (v is DateTime) {
-          return {'__type': 'datetime', 'data': v.toUtc().toIso8601String()};
-        }
-        return v;
-      }).toList();
-    }).toList();
-
-    // Serialize index metadata (exclude auto-created indices, keep custom ones)
-    final indicesJson = <Map<String, dynamic>>[];
-    for (final idx in _indices.values) {
-      // Store all indices with their metadata
-      indicesJson.add(idx.metadata.toJson());
+  /// The first unique index another row already holds [values]' key in,
+  /// with that row's rowid; null when [values] conflicts with no row other
+  /// than [except].
+  (TableIndex, int)? uniqueConflict(List<Object?> values, {int? except}) {
+    for (final i in indexes) {
+      if (!i.unique) continue;
+      final other = i.conflict(values, except: except);
+      if (other != null) return (i, other);
     }
-
-    return {
-      'schema': _schema.toJson(),
-      'autoIncrement': _autoIncrementValue,
-      'nextRowId': _nextRowId,
-      'rows': rowArrays,
-      'indices': indicesJson,
-    };
-  }
-
-  factory Table.fromJson(Map<String, dynamic> json) {
-    final schema = TableSchema.fromJson(json['schema'] as Map<String, dynamic>);
-    final table = Table(schema: schema);
-    table._autoIncrementValue = json['autoIncrement'] as int? ?? 0;
-    table._nextRowId = json['nextRowId'] as int? ?? 1;
-
-    final colNames = schema.columns.map((c) => c.name).toList();
-    final rows = json['rows'] as List<dynamic>? ?? [];
-
-    for (final rawRow in rows) {
-      final arr = rawRow as List<dynamic>;
-      final values = <String, dynamic>{};
-      for (int i = 0; i < colNames.length && i < arr.length; i++) {
-        final v = arr[i];
-        if (v == null) {
-          values[colNames[i]] = null;
-        } else if (v is Map && v['__type'] == 'blob') {
-          values[colNames[i]] = base64.decode(v['data'] as String);
-        } else if (v is Map && v['__type'] == 'datetime') {
-          values[colNames[i]] = DateTime.parse(v['data'] as String);
-        } else {
-          values[colNames[i]] = v;
-        }
-      }
-      final rowId = table._nextRowId++;
-      final row = DatabaseRow(rowId: rowId, values: values);
-      final idx = table._rows.length;
-      table._rows.add(row);
-      table._rowIdToIndex[rowId] = idx;
-    }
-
-    // Rebuild indices (automatic indices already created in constructor)
-    for (final idx in table._indices.values) {
-      idx.rebuild(table._rows);
-    }
-
-    // Restore custom indices from JSON
-    final indicesJson = json['indices'] as List<dynamic>?;
-    if (indicesJson != null) {
-      for (final idxJson in indicesJson) {
-        final metadata = IndexMetadata.fromJson(
-          idxJson as Map<String, dynamic>,
-        );
-
-        // Check if this index already exists (from auto-creation)
-        final existingKey = metadata.columns.length == 1
-            ? metadata.columns.first.toLowerCase()
-            : metadata.name.toLowerCase();
-
-        if (!table._indices.containsKey(existingKey)) {
-          // Create the index
-          TableIndex newIdx;
-          if (metadata.columns.length == 1) {
-            newIdx = TableIndex(
-              columnName: metadata.columns.first,
-              unique: metadata.unique,
-              type: metadata.type,
-              name: metadata.name,
-            );
-          } else {
-            newIdx = TableIndex.composite(
-              columns: metadata.columns,
-              unique: metadata.unique,
-              type: metadata.type,
-              name: metadata.name,
-            );
-          }
-          newIdx.rebuild(table._rows);
-          table._indices[existingKey] = newIdx;
-        }
-      }
-    }
-
-    return table;
+    return null;
   }
 
   // ---------------------------------------------------------------------------
-  // PRIVATE HELPERS
+  // Schema changes (each records its own undo)
   // ---------------------------------------------------------------------------
 
-  void _addToIndices(DatabaseRow row) {
-    for (final idx in _indices.values) {
-      if (idx.isComposite) {
-        idx.add(row, row.rowId);
-      } else {
-        final colName = idx.columns.first;
-        idx.add(row.values[colName], row.rowId);
+  /// Replaces the schema without touching rows or indexes (renames).
+  void setSchema(TableSchema schema) {
+    final old = _schema;
+    _schema = schema;
+    _log.record(() => _schema = old);
+  }
+
+  /// Appends a column to the schema and [value] to every row.
+  void addColumn(ColumnDefinition column, Object? value) {
+    final oldSchema = _schema;
+    final oldRows = Map<int, List<Object?>>.of(_rows);
+    _schema = _schema.copyWith(columns: [..._schema.columns, column]);
+    for (final k in oldRows.keys) {
+      _rows[k] = [...oldRows[k]!, value];
+    }
+    _log.record(() {
+      _schema = oldSchema;
+      _rows.addAll(oldRows);
+    });
+  }
+
+  /// Removes the column at [position] from the schema and every row.
+  /// Indexes must not reference it.
+  void dropColumn(int position, TableSchema newSchema) {
+    final oldSchema = _schema;
+    final oldRows = Map<int, List<Object?>>.of(_rows);
+    for (final k in oldRows.keys) {
+      _rows[k] = [...oldRows[k]!]..removeAt(position);
+    }
+    _schema = newSchema;
+    void shift(int delta) {
+      for (final i in indexes) {
+        i.columns = [for (final c in i.columns) c > position ? c + delta : c];
       }
+      for (final s in spatialIndexes) {
+        if (s.xColumn > position) s.xColumn += delta;
+        if (s.yColumn > position) s.yColumn += delta;
+      }
+    }
+
+    shift(-1);
+    _log.record(() {
+      _schema = oldSchema;
+      shift(1);
+      _rows.addAll(oldRows);
+    });
+  }
+
+  /// Adds [index] and fills it. Returns the rowids of two rows sharing a
+  /// key when [index] is unique and the rows are not; the index is then not
+  /// added.
+  (int, int)? addIndex(TableIndex index) {
+    final dup = index.rebuild(_rows.entries);
+    if (dup != null) return dup;
+    indexes.add(index);
+    _log.record(() => indexes.remove(index));
+    return null;
+  }
+
+  /// Removes [index].
+  void dropIndex(TableIndex index) {
+    final at = indexes.indexOf(index);
+    if (at < 0) return;
+    indexes.removeAt(at);
+    _log.record(() => indexes.insert(at, index));
+  }
+
+  /// Adds [index] and fills it.
+  void addSpatialIndex(SpatialIndex index) {
+    index.rebuild(_rows.entries);
+    spatialIndexes.add(index);
+    _log.record(() => spatialIndexes.remove(index));
+  }
+
+  /// Removes [index].
+  void dropSpatialIndex(SpatialIndex index) {
+    final at = spatialIndexes.indexOf(index);
+    if (at < 0) return;
+    spatialIndexes.removeAt(at);
+    _log.record(() => spatialIndexes.insert(at, index));
+  }
+
+  /// Renames an index (used by `ALTER TABLE … RENAME TO`).
+  void renameIndex(TableIndex index, String name) {
+    final old = index.name;
+    index.name = name;
+    _log.record(() => index.name = old);
+  }
+
+  /// Describes every index, for introspection.
+  List<IndexInfo> describeIndexes() => [
+    for (final i in indexes)
+      if (i.origin != IndexOrigin.foreignKey)
+        IndexInfo(
+          name: i.name,
+          table: name,
+          columns: [for (final c in i.columns) _schema.columns[c].name],
+          unique: i.unique,
+          origin: i.origin,
+        ),
+    for (final s in spatialIndexes)
+      IndexInfo(
+        name: s.name,
+        table: name,
+        columns: [
+          _schema.columns[s.xColumn].name,
+          _schema.columns[s.yColumn].name,
+        ],
+        unique: false,
+        origin: IndexOrigin.spatial,
+      ),
+  ];
+
+  // ---------------------------------------------------------------------------
+  // Loading
+  // ---------------------------------------------------------------------------
+
+  /// Stores a row read from a file, without recording undo. The caller
+  /// rebuilds the indexes afterwards with [rebuildIndexes].
+  void loadRow(int rowid, List<Object?> values) {
+    _rows[rowid] = values;
+  }
+
+  /// Refills every index from the rows; returns the name of a unique index
+  /// the rows violate, or null.
+  String? rebuildIndexes() {
+    for (final i in indexes) {
+      if (i.rebuild(_rows.entries) != null) return i.name;
+    }
+    for (final s in spatialIndexes) {
+      s.rebuild(_rows.entries);
+    }
+    return null;
+  }
+
+  void _rebuildAll() {
+    for (final i in indexes) {
+      i.rebuild(_rows.entries);
+    }
+    for (final s in spatialIndexes) {
+      s.rebuild(_rows.entries);
     }
   }
 
-  void _removeFromIndices(DatabaseRow row) {
-    for (final idx in _indices.values) {
-      if (idx.isComposite) {
-        idx.remove(row, row.rowId);
-      } else {
-        final colName = idx.columns.first;
-        idx.remove(row.values[colName], row.rowId);
+  /// The internal index on [columns] (positions) kept for a foreign key,
+  /// or null.
+  TableIndex? foreignKeyIndex(List<int> columns) {
+    for (final i in indexes) {
+      if (i.columns.length != columns.length) continue;
+      var same = true;
+      for (var k = 0; k < columns.length; k++) {
+        if (i.columns[k] != columns[k]) same = false;
       }
+      if (same) return i;
+    }
+    return null;
+  }
+
+  /// Adds the internal indexes on foreign key columns that do not have
+  /// one yet (after CREATE TABLE, loading, or ADD COLUMN … REFERENCES).
+  void ensureForeignKeyIndexes() {
+    var n = indexes.where((i) => i.origin == IndexOrigin.foreignKey).length;
+    for (final fk in _schema.foreignKeys) {
+      final positions = <int>[];
+      for (final c in fk.columns) {
+        final p = _schema.indexOf(c);
+        if (p == null) break;
+        positions.add(p);
+      }
+      if (positions.length != fk.columns.length) continue;
+      if (foreignKeyIndex(positions) != null) continue;
+      n++;
+      final index = TableIndex(
+        name: 'sqlite_fkindex_${_schema.name}_$n',
+        columns: positions,
+        collations: [for (final _ in positions) Collation.binary],
+        unique: false,
+        origin: IndexOrigin.foreignKey,
+      );
+      index.rebuild(_rows.entries);
+      indexes.add(index);
+      _log.record(() => indexes.remove(index));
     }
   }
 
-  dynamic _coerce(dynamic value, DataType type) {
-    if (value == null) return null;
-    switch (type) {
-      case DataType.integer:
-        if (value is int) return value;
-        if (value is double) return value.toInt();
-        if (value is String) return int.tryParse(value) ?? value;
-        if (value is bool) return value ? 1 : 0;
-        return value;
-      case DataType.real:
-        if (value is double) return value;
-        if (value is int) return value.toDouble();
-        if (value is String) return double.tryParse(value) ?? value;
-        return value;
-      case DataType.text:
-        return value.toString();
-      case DataType.boolean:
-        if (value is bool) return value;
-        if (value is int) return value != 0;
-        if (value is String) {
-          return value.toLowerCase() == 'true' || value == '1';
-        }
-        return value;
-      case DataType.datetime:
-        if (value is DateTime) return value.toUtc();
-        if (value is String) {
-          return DateTime.tryParse(value)?.toUtc() ?? value;
-        }
-        return value;
-      case DataType.blob:
-        if (value is Uint8List) return value;
-        if (value is List<int>) return Uint8List.fromList(value);
-        return value;
+  /// Creates the indexes that enforce the primary key and UNIQUE
+  /// constraints, named `sqlite_autoindex_<table>_<n>` as in SQLite.
+  void _constraintIndexes() {
+    var n = 0;
+    final pk = _schema.primaryKey;
+    for (final key in _schema.uniqueKeys) {
+      n++;
+      final positions = [for (final c in key) _schema.indexOf(c)!];
+      final isPk =
+          pk.length == key.length &&
+          [
+                for (var i = 0; i < key.length; i++) key[i].toLowerCase(),
+              ].join('\u0000') ==
+              [for (final c in pk) c.toLowerCase()].join('\u0000');
+      indexes.add(
+        TableIndex(
+          name: 'sqlite_autoindex_${_schema.name}_$n',
+          columns: positions,
+          collations: [
+            for (final p in positions)
+              Collation.parse(_schema.columns[p].collation) ?? Collation.binary,
+          ],
+          unique: true,
+          origin: isPk ? IndexOrigin.primaryKey : IndexOrigin.unique,
+        ),
+      );
     }
   }
 }

@@ -1,114 +1,134 @@
+// A tour of just_database: tables, bound parameters, joins, a
+// transaction, a migration, the ORM and a backup. Every result is checked
+// with orThrow(), so a mistake stops the tour with a SqlException.
+//
+// Run it from the example app (lib/main.dart calls runTour) or call
+// runTour() from your own code.
 import 'package:flutter/foundation.dart';
 import 'package:just_database/just_database.dart';
 
-/// Example demonstrating basic usage of just_database
-Future<void> main() async {
-  debugPrint('=== just_database Example ===\n');
+/// A record for the ORM part of the tour.
+class Task extends DbRecord {
+  const Task({super.id, required this.title, this.done = false, this.due});
 
-  // Create a database
-  debugPrint('Creating database...');
-  final db = await JustDatabase.open('example_db', mode: DatabaseMode.standard);
+  final String title;
+  final bool done;
+  final DateTime? due;
 
-  // Create a table
-  debugPrint('Creating users table...');
-  await db.execute('''
-    CREATE TABLE users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT UNIQUE,
-      age INTEGER,
-      active BOOLEAN DEFAULT true
-    )
-  ''');
+  @override
+  Map<String, Object?> toMap() => {'title': title, 'done': done, 'due': due};
+}
 
-  // Insert some data
-  debugPrint('Inserting users...');
-  await db.execute(
-    "INSERT INTO users (name, email, age) VALUES ('Alice Johnson', 'alice@example.com', 28)",
+/// The `tasks` table, typed.
+class Tasks extends DbTable<Task> {
+  @override
+  String get tableName => 'tasks';
+
+  @override
+  List<DbColumn> get columns => [
+    DbColumn.text('title', notNull: true),
+    DbColumn.boolean('done', defaultValue: false),
+    DbColumn.datetime('due'),
+  ];
+
+  @override
+  Task fromRow(Map<String, Object?> row) => Task(
+    id: row.intValue('id'),
+    title: row.stringValue('title')!,
+    done: row.boolValue('done') ?? false,
+    due: row.dateTimeValue('due'),
   );
-  await db.execute(
-    "INSERT INTO users (name, email, age) VALUES ('Bob Smith', 'bob@example.com', 34)",
-  );
-  await db.execute(
-    "INSERT INTO users (name, email, age, active) VALUES ('Carol White', 'carol@example.com', 25, false)",
-  );
+}
 
-  // Query all users
-  debugPrint('\nQuerying all users:');
-  var result = await db.execute('SELECT * FROM users');
-  for (var row in result.rows) {
-    debugPrint('  ${row['name']} (${row['age']}) - ${row['email']}');
+/// Runs the tour on an in-memory database and returns what it printed.
+Future<List<String>> runTour() async {
+  final log = <String>[];
+  void say(Object line) {
+    log.add('$line');
+    debugPrint('$line');
   }
 
-  // Query with WHERE clause
-  debugPrint('\nActive users over 25:');
-  result = await db.execute(
-    'SELECT * FROM users WHERE age > 25 AND active = true',
-  );
-  for (var row in result.rows) {
-    debugPrint('  ${row['name']} - Age: ${row['age']}');
+  final db = await JustDatabase.open('tour', persist: false);
+  try {
+    // Tables and bound parameters.
+    (await db.execute('''
+      CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)
+    ''')).orThrow();
+    (await db.execute('''
+      CREATE TABLE books (
+        id INTEGER PRIMARY KEY,
+        author_id INTEGER REFERENCES authors (id) ON DELETE CASCADE,
+        title TEXT NOT NULL,
+        year INTEGER CHECK (year > 0)
+      )''')).orThrow();
+    for (final name in ['Austen', "O'Brien"]) {
+      (await db.execute('INSERT INTO authors (name) VALUES (?)', [
+        name,
+      ])).orThrow();
+    }
+    (await db.execute(
+      'INSERT INTO books (author_id, title, year) VALUES (?, ?, ?), (?, ?, ?)',
+      [1, 'Emma', 1815, 2, 'At Swim-Two-Birds', 1939],
+    )).orThrow();
+
+    // A join with an aggregate.
+    final perAuthor = (await db.query('''
+      SELECT a.name, COUNT(b.id) AS books, MIN(b.year) AS first
+      FROM authors a LEFT JOIN books b ON b.author_id = a.id
+      GROUP BY a.id ORDER BY a.name
+    ''')).orThrow();
+    for (final row in perAuthor.rows) {
+      say('${row['name']}: ${row['books']} book(s), first in ${row['first']}');
+    }
+
+    // A transaction: either both statements happen or neither.
+    try {
+      await db.transaction((tx) async {
+        await tx.execute(
+          "INSERT INTO books (author_id, title, year) VALUES (1, 'Persuasion', 1817)",
+        );
+        await tx.execute(
+          "INSERT INTO books (author_id, title, year) VALUES (1, 'Broken', 0)",
+        );
+      });
+    } on SqlException catch (e) {
+      say('rolled back: ${e.message}');
+    }
+    say('books: ${(await db.query('SELECT COUNT(*) FROM books')).scalar}');
+
+    // A migration.
+    final results = await db.migrate([
+      SqlMigration(
+        version: 1,
+        name: 'add isbn',
+        upSql: 'ALTER TABLE books ADD COLUMN isbn TEXT',
+      ),
+    ]);
+    say('migration: ${results.single.status.name}');
+
+    // The ORM.
+    final tasks = Tasks();
+    await tasks.createTable(db);
+    final saved = await tasks.insert(
+      db,
+      Task(title: 'Read Emma', due: DateTime.utc(2030, 1, 1)),
+    );
+    await tasks.update(
+      db,
+      Task(id: saved.id, title: saved.title, done: true, due: saved.due),
+    );
+    final done = await tasks.findAll(db, where: 'done = ?', whereArgs: [true]);
+    say(
+      'done: ${done.single.title}, due ${done.single.due!.toIso8601String()}',
+    );
+
+    // A backup into another database.
+    final copy = await JustDatabase.open('tour_copy', persist: false);
+    await copy.importSql(await db.exportSql());
+    say('copy has ${copy.totalRows} rows in ${copy.tableNames.join(', ')}');
+    await copy.close();
+  } finally {
+    await db.close();
   }
-
-  // Update a record
-  debugPrint('\nUpdating Carol to active...');
-  await db.execute("UPDATE users SET active = true WHERE name = 'Carol White'");
-
-  // Create products table with foreign key
-  debugPrint('\nCreating products and orders tables...');
-  await db.execute('''
-    CREATE TABLE products (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      price REAL NOT NULL,
-      stock INTEGER DEFAULT 0
-    )
-  ''');
-
-  await db.execute('''
-    CREATE TABLE orders (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      product_id INTEGER NOT NULL,
-      quantity INTEGER NOT NULL,
-      FOREIGN KEY (user_id) REFERENCES users(id),
-      FOREIGN KEY (product_id) REFERENCES products(id)
-    )
-  ''');
-
-  // Insert products
-  await db.execute(
-    "INSERT INTO products (name, price, stock) VALUES ('Laptop', 999.99, 10)",
-  );
-  await db.execute(
-    "INSERT INTO products (name, price, stock) VALUES ('Mouse', 29.99, 50)",
-  );
-
-  // Insert orders
-  await db.execute(
-    "INSERT INTO orders (user_id, product_id, quantity) VALUES (1, 1, 1)",
-  );
-  await db.execute(
-    "INSERT INTO orders (user_id, product_id, quantity) VALUES (2, 2, 2)",
-  );
-
-  // Check schema
-  debugPrint('\nDatabase tables:');
-  for (var tableName in db.tableNames) {
-    final schema = db.getTableSchema(tableName);
-    debugPrint('  $tableName (${schema!.columns.length} columns)');
-  }
-
-  // Note: Direct table access for composite indexes is internal
-  // In this example, foreign key indexes are automatically created
-  debugPrint('\nAutomatic indexes created for foreign keys');
-
-  // Delete a record
-  debugPrint('\nDeleting a user...');
-  await db.execute("DELETE FROM users WHERE name = 'Carol White'");
-
-  // Final count
-  result = await db.execute('SELECT * FROM users');
-  debugPrint('\nFinal user count: ${result.rows.length}');
-
-  debugPrint('\n=== Example Complete ===');
+  return log;
 }

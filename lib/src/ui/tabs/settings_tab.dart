@@ -1,251 +1,220 @@
 import 'package:flutter/material.dart';
 import 'package:just_signals/just_signals.dart';
-import 'package:just_database/just_database.dart';
 
+import '../../core/database_mode.dart';
+import '../../core/just_database.dart';
+import '../../core/version.dart';
+import '../admin_utils.dart';
+import '../database_provider.dart';
+import '../widgets/admin_widgets.dart';
+
+/// The repository of just_database.
+const String _repository = 'https://github.com/just-unknown-dev/just-database';
+
+/// Defaults for new databases, details of the selected one, "delete
+/// everything", and what the engine can do.
 class SettingsTab extends StatelessWidget {
-  final DatabaseProvider provider;
-
+  /// Creates the tab.
   const SettingsTab({super.key, required this.provider});
+
+  /// The admin state.
+  final DatabaseProvider provider;
 
   @override
   Widget build(BuildContext context) {
     return SignalBuilder<int>(
       signal: provider.revision,
-      builder: (context, value, child) {
+      builder: (context, _, _) {
+        final cs = Theme.of(context).colorScheme;
         final db = provider.currentDatabase;
         return ListView(
           padding: const EdgeInsets.all(16),
           children: [
-            // --- Storage section ---
-            _SectionCard(
-              title: 'Storage',
+            SectionCard(
+              title: 'New databases',
               children: [
                 SwitchListTile(
-                  title: const Text('File Persistence (default)'),
+                  key: const ValueKey('jdb-setting-persist'),
+                  title: const Text('Save new databases to storage'),
                   subtitle: const Text(
-                    'Default for new databases. Can be overridden per database when creating.',
+                    'The default when you create a database here (you can '
+                    'change it per database). Databases that are already '
+                    'saved always open from storage.',
                   ),
                   value: provider.persistEnabled,
                   onChanged: provider.setPersistEnabled,
                 ),
-              ],
-            ),
-            const SizedBox(height: 12),
-
-            // --- Default Mode section ---
-            _SectionCard(
-              title: 'Default Database Mode',
-              children: [
+                const Divider(height: 1, indent: 16, endIndent: 16),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 0),
+                  child: Text(
+                    'Default mode',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w600,
+                      color: cs.onSurface,
+                    ),
+                  ),
+                ),
                 RadioGroup<DatabaseMode>(
                   groupValue: provider.defaultMode,
-                  onChanged: (DatabaseMode? v) {
+                  onChanged: (v) {
                     if (v != null) provider.setDefaultMode(v);
                   },
                   child: Column(
-                    children: DatabaseMode.values
-                        .map(
-                          (mode) => RadioListTile<DatabaseMode>(
-                            title: Text(_modeName(mode)),
-                            subtitle: Text(_modeDescription(mode)),
-                            secondary: Icon(
-                              _modeIcon(mode),
-                              color: _modeColor(mode),
-                            ),
-                            value: mode,
-                          ),
-                        )
-                        .toList(),
+                    children: [
+                      for (final mode in DatabaseMode.values)
+                        RadioListTile<DatabaseMode>(
+                          value: mode,
+                          title: Text(modeLabel(mode)),
+                          subtitle: Text(modeDescription(mode)),
+                          secondary: Icon(modeIcon(mode), color: cs.primary),
+                        ),
+                    ],
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+                  child: Text(
+                    'Saved databases that are not open yet are opened in the '
+                    'default mode too.',
+                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
                   ),
                 ),
               ],
             ),
             const SizedBox(height: 12),
-
-            // --- Current database info ---
             if (db != null) ...[
-              _SectionCard(
-                title: 'Current Database',
+              SectionCard(
+                title: 'Selected database',
                 children: [
-                  // Identity row
                   ListTile(
-                    leading: const Icon(Icons.storage),
+                    leading: Icon(
+                      provider.isEncrypted(db.name)
+                          ? Icons.lock_outline
+                          : Icons.storage,
+                      color: cs.primary,
+                    ),
                     title: Text(db.name),
                     subtitle: Text(
-                      '${_modeName(db.mode)} mode · '
-                      '${db.persist ? "persisted" : "in-memory"}',
+                      '${modeLabel(db.mode)} mode · '
+                      '${db.persist ? 'saved' : 'in memory'}'
+                      '${provider.isEncrypted(db.name) ? ' · encrypted' : ''}',
                     ),
-                    trailing: _ModeBadge(mode: db.mode),
                   ),
                   const Divider(height: 1, indent: 16, endIndent: 16),
-                  // Stats grid
                   Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 12,
-                    ),
-                    child: _DbStatsGrid(db: db),
+                    padding: const EdgeInsets.all(16),
+                    child: _StatsGrid(db: db),
                   ),
                 ],
               ),
               const SizedBox(height: 12),
             ],
-
-            // --- Danger Zone section ---
-            _SectionCard(
-              title: 'Danger Zone',
-              titleColor: Theme.of(context).colorScheme.error,
+            SectionCard(
+              title: 'Danger zone',
+              titleColor: cs.error,
               children: [
                 ListTile(
-                  leading: Icon(
-                    Icons.delete_forever,
-                    color: Theme.of(context).colorScheme.error,
-                  ),
+                  key: const ValueKey('jdb-clear-all'),
+                  leading: Icon(Icons.delete_forever, color: cs.error),
                   title: Text(
-                    'Clear All Databases',
-                    style: TextStyle(
-                      color: Theme.of(context).colorScheme.error,
-                    ),
+                    'Delete all databases',
+                    style: TextStyle(color: cs.error),
                   ),
                   subtitle: const Text(
-                    'Permanently removes ALL databases from memory and disk',
+                    'Closes and deletes every database of this app, open or '
+                    'saved, and the stored keys of encrypted ones.',
                   ),
-                  onTap: () => _confirmClearAll(context, provider),
+                  onTap: () => _confirmClearAll(context),
                 ),
               ],
             ),
             const SizedBox(height: 12),
-
-            // --- Engine features overview ---
-            _SectionCard(
-              title: 'Engine Features',
-              children: const [
-                _FeatureTile(
+            const SectionCard(
+              title: 'Engine',
+              children: [
+                _InfoTile(
                   icon: Icons.table_rows_outlined,
-                  label: 'Core SQL',
-                  detail:
-                      'SELECT · INSERT · UPDATE · DELETE\n'
-                      'CREATE / DROP / ALTER TABLE · CREATE / DROP VIEW\n'
-                      'INNER / LEFT / RIGHT JOIN · Subqueries\n'
-                      'GROUP BY · HAVING · ORDER BY · LIMIT / OFFSET',
+                  title: 'SQL',
+                  body:
+                      'SQLite-style SQL: joins of every kind, subqueries, '
+                      'UNION / INTERSECT / EXCEPT, aggregates, CASE and CAST, '
+                      'upserts, views, triggers (INSTEAD OF on views), foreign '
+                      'keys with actions and CHECK constraints. Bound '
+                      'parameters: ?, ?NNN and :name.',
                 ),
-                _FeatureTile(
-                  icon: Icons.functions,
-                  label: 'Functions',
-                  detail:
-                      'Aggregates: COUNT · SUM · AVG · MIN · MAX\n'
-                      'String: UPPER · LOWER · LENGTH · SUBSTR · TRIM\n'
-                      '         REPLACE · CONCAT\n'
-                      'Math: ABS · ROUND\n'
-                      'Null: COALESCE · IFNULL',
+                _InfoTile(
+                  icon: Icons.data_object,
+                  title: 'Values',
+                  body:
+                      'NULL, INTEGER, REAL, TEXT and BLOB with SQLite type '
+                      'affinity. BOOLEAN columns hold 1 or 0; DATETIME columns '
+                      'hold ISO-8601 text (a Dart DateTime is stored as UTC). '
+                      'Every table has a rowid; INTEGER PRIMARY KEY is an alias '
+                      'of it.',
                 ),
-                _FeatureTile(
-                  icon: Icons.bolt,
-                  label: 'Triggers',
-                  detail:
-                      'BEFORE / AFTER INSERT, UPDATE, DELETE\n'
-                      'INSTEAD OF (on views)\n'
-                      'NEW / OLD row references · WHEN clause\n'
-                      'Multi-statement trigger bodies (BEGIN … END)',
-                ),
-                _FeatureTile(
-                  icon: Icons.pin_drop_outlined,
-                  label: 'Spatial (R-tree)',
-                  detail:
-                      'Point · BoundingBox · Polygon geometry types\n'
-                      'ST_MAKEPOINT · ST_X · ST_Y · ST_DISTANCE\n'
-                      'ST_WITHIN · ST_INTERSECTS · ST_CONTAINS · ST_BBOX\n'
-                      'CREATE SPATIAL INDEX · Quadratic-split R-tree',
-                ),
-                _FeatureTile(
-                  icon: Icons.manage_search,
-                  label: 'Indexes',
-                  detail:
-                      'AUTO-INDEX on frequently queried columns\n'
-                      'CREATE [UNIQUE] INDEX · CREATE SPATIAL INDEX\n'
-                      'Composite indexes · DROP INDEX',
-                ),
-                _FeatureTile(
-                  icon: Icons.tips_and_updates_outlined,
-                  label: 'Query Hints',
-                  detail:
-                      '/*+ INDEX(table idx) */  — force index use\n'
-                      '/*+ NO_INDEX */          — skip all indexes\n'
-                      '/*+ FULL_SCAN */         — table scan\n'
-                      '/*+ FORCE_INDEX(…) */    — alias for INDEX\n'
-                      'Inline and leading hint comment styles',
-                ),
-                _FeatureTile(
+                _InfoTile(
                   icon: Icons.swap_horiz,
-                  label: 'Transactions',
-                  detail:
-                      'BEGIN / COMMIT / ROLLBACK (WAL)\n'
-                      'BEGIN DEFERRED / IMMEDIATE modes\n'
-                      'SAVEPOINT · RELEASE SAVEPOINT\n'
-                      'ROLLBACK TO SAVEPOINT\n'
-                      'transaction() helper with auto-rollback',
+                  title: 'Transactions',
+                  body:
+                      'BEGIN / COMMIT / ROLLBACK and savepoints; '
+                      'transaction() holds the database and rolls back when '
+                      'its function throws. A failed statement changes '
+                      'nothing.',
                 ),
-                _FeatureTile(
-                  icon: Icons.backup_outlined,
-                  label: 'Backup & Restore',
-                  detail:
-                      'exportSql() — full SQL dump (CREATE + INSERT)\n'
-                      'importSql() — restore from SQL dump\n'
-                      'exportJson() / importJson() — JSON snapshot\n'
-                      'backupToFile / restoreFromFile helpers',
+                _InfoTile(
+                  icon: Icons.manage_search,
+                  title: 'Indexes and spatial data',
+                  body:
+                      'CREATE [UNIQUE] INDEX, used for equality and IN '
+                      'lookups and joins; index hints. CREATE SPATIAL INDEX '
+                      'builds an R-tree for the ST_* functions.',
                 ),
-                _FeatureTile(
+                _InfoTile(
+                  icon: Icons.save_outlined,
+                  title: 'Storage',
+                  body:
+                      'Saved after every committed change: a file in the '
+                      'app\'s support directory, or IndexedDB on the web. '
+                      'Export and import as SQL or JSON; versioned '
+                      'migrations; a typed ORM; benchmarks.',
+                ),
+                _InfoTile(
                   icon: Icons.lock_outline,
-                  label: 'Secure Mode',
-                  detail:
-                      'DatabaseMode.secure — AES-256-GCM encryption at rest\n'
-                      'Passphrase → SHA-256 → 32-byte AES key (never stored)\n'
-                      'Random 16-byte IV per save · GCM auth tag validates key\n'
-                      'Wrong key on load raises StateError',
-                ),
-                _FeatureTile(
-                  icon: Icons.upgrade,
-                  label: 'Schema Migrations',
-                  detail:
-                      'SqlMigration — up/down raw SQL scripts\n'
-                      'CallbackMigration — Dart function callbacks\n'
-                      'MigrationRunner — versioned apply / rollback\n'
-                      'SHA-256 checksum validation · status() report\n'
-                      'Persistent _migrations tracking table',
-                ),
-                _FeatureTile(
-                  icon: Icons.speed,
-                  label: 'Benchmarking',
-                  detail:
-                      'DatabaseBenchmark — 8-operation standard suite\n'
-                      'BenchmarkSuite — configurable custom suites\n'
-                      'QueryStats — avg · min · max · p95 · p99 · ops/s\n'
-                      'Warm-up iterations · seed-row control\n'
-                      'runStandardBenchmark() / benchmarkQuery() on JustDatabase',
+                  title: 'Encryption',
+                  body:
+                      'AES-256-GCM with a 12-byte random nonce per save. The '
+                      'key is derived from the passphrase with '
+                      'PBKDF2-HMAC-SHA256 (600 000 iterations, a random salt '
+                      'per file); a wrong key fails to open. Encrypted '
+                      'databases created here use a random key from '
+                      'SecureKeyManager.resolveAutoKey, kept by just_storage '
+                      'in the app\'s private storage: it protects a copied '
+                      'database file, not a device where someone can read '
+                      'all of the app\'s data.',
                 ),
               ],
             ),
             const SizedBox(height: 12),
-
-            // --- About section ---
-            _SectionCard(
+            const SectionCard(
               title: 'About',
-              children: const [
+              children: [
                 ListTile(
                   leading: Icon(Icons.info_outline),
                   title: Text('just_database'),
                   subtitle: Text(
-                    'Pure Dart / Flutter SQL engine · v$kJustDatabaseVersion',
+                    'Version $kJustDatabaseVersion · pure Dart SQL database for Flutter',
                   ),
                 ),
                 ListTile(
-                  leading: Icon(Icons.code),
+                  leading: Icon(Icons.gavel_outlined),
                   title: Text('License'),
-                  subtitle: Text('BSD 3-Clause License'),
+                  subtitle: Text('BSD 3-Clause'),
                 ),
                 ListTile(
                   leading: Icon(Icons.hub_outlined),
                   title: Text('Repository'),
-                  subtitle: Text('github.com/psbskb22/just-database'),
+                  subtitle: SelectableText(_repository),
                 ),
               ],
             ),
@@ -255,60 +224,62 @@ class SettingsTab extends StatelessWidget {
     );
   }
 
-  void _confirmClearAll(BuildContext context, DatabaseProvider provider) {
-    showDialog<void>(
+  Future<void> _confirmClearAll(BuildContext context) async {
+    final count = provider.databases.length;
+    final confirmed = await showDialog<bool>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Clear All Databases?'),
-        content: const Text(
-          'This will permanently delete ALL databases from memory and disk. '
-          'This action cannot be undone.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('Cancel'),
+      builder: (ctx) {
+        final cs = Theme.of(ctx).colorScheme;
+        return AlertDialog(
+          title: const Text('Delete all databases?'),
+          content: Text(
+            'This closes and deletes ${plural(count, 'database')} (open ones '
+            'too, for everyone using them) and the stored keys of encrypted '
+            'ones. It cannot be undone.',
           ),
-          FilledButton(
-            style: FilledButton.styleFrom(
-              backgroundColor: Theme.of(context).colorScheme.error,
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Cancel'),
             ),
-            onPressed: () {
-              Navigator.pop(ctx);
-              provider.clearAllDatabases();
-            },
-            child: const Text('Delete All'),
-          ),
-        ],
-      ),
+            FilledButton(
+              style: FilledButton.styleFrom(
+                backgroundColor: cs.error,
+                foregroundColor: cs.onError,
+              ),
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Delete all'),
+            ),
+          ],
+        );
+      },
     );
+    if (confirmed != true || !context.mounted) return;
+    final ok = await provider.clearAllDatabases();
+    if (!context.mounted) return;
+    if (ok) {
+      showAdminMessage(context, 'Deleted every database.');
+    } else {
+      showAdminError(
+        context,
+        provider.lastError ?? 'Some databases could not be deleted.',
+      );
+    }
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Database stats grid
-// ─────────────────────────────────────────────────────────────────────────────
+class _StatsGrid extends StatelessWidget {
+  const _StatsGrid({required this.db});
 
-class _DbStatsGrid extends StatelessWidget {
   final JustDatabase db;
-  const _DbStatsGrid({required this.db});
-
-  static String _fmt(int bytes) {
-    if (bytes < 1024) return '${bytes}B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)}KB';
-    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)}MB';
-  }
 
   @override
   Widget build(BuildContext context) {
-    final triggerCount = db.triggerNames.length;
-    final viewCount = db.viewNames.length;
-    final tableCount = db.tableNames.length;
-    final indexCount = db.tableNames.fold<int>(
+    final tables = db.tableNames;
+    final indexCount = tables.fold<int>(
       0,
-      (sum, t) => sum + db.indexNamesForTable(t).length,
+      (n, t) => n + db.indexesForTable(t).length,
     );
-
     return Wrap(
       spacing: 8,
       runSpacing: 8,
@@ -316,28 +287,32 @@ class _DbStatsGrid extends StatelessWidget {
         _StatTile(
           icon: Icons.table_chart_outlined,
           label: 'Tables',
-          value: '$tableCount',
+          value: '${tables.length}',
         ),
         _StatTile(
           icon: Icons.view_agenda_outlined,
           label: 'Views',
-          value: '$viewCount',
+          value: '${db.viewNames.length}',
         ),
         _StatTile(
           icon: Icons.format_list_numbered,
           label: 'Rows',
           value: '${db.totalRows}',
         ),
-        _StatTile(icon: Icons.bolt, label: 'Triggers', value: '$triggerCount'),
+        _StatTile(
+          icon: Icons.bolt,
+          label: 'Triggers',
+          value: '${db.triggerNames.length}',
+        ),
         _StatTile(
           icon: Icons.manage_search,
           label: 'Indexes',
           value: '$indexCount',
         ),
         _StatTile(
-          icon: Icons.sd_storage_outlined,
-          label: 'Size',
-          value: _fmt(db.estimatedSizeBytes),
+          icon: Icons.memory,
+          label: 'In memory',
+          value: formatBytes(db.estimatedSizeBytes),
         ),
       ],
     );
@@ -345,20 +320,21 @@ class _DbStatsGrid extends StatelessWidget {
 }
 
 class _StatTile extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final String value;
   const _StatTile({
     required this.icon,
     required this.label,
     required this.value,
   });
 
+  final IconData icon;
+  final String label;
+  final String value;
+
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
     return Container(
-      width: 90,
+      width: 96,
       padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
       decoration: BoxDecoration(
         color: cs.surfaceContainerHighest,
@@ -371,54 +347,32 @@ class _StatTile extends StatelessWidget {
           const SizedBox(height: 4),
           Text(
             value,
-            style: const TextStyle(
+            style: TextStyle(
               fontSize: 15,
               fontWeight: FontWeight.bold,
-              height: 1.2,
+              color: cs.onSurface,
             ),
           ),
-          Text(label, style: TextStyle(fontSize: 11, color: cs.outline)),
+          Text(
+            label,
+            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+          ),
         ],
       ),
     );
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Mode badge
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _ModeBadge extends StatelessWidget {
-  final DatabaseMode mode;
-  const _ModeBadge({required this.mode});
-
-  @override
-  Widget build(BuildContext context) {
-    return Chip(
-      avatar: Icon(_modeIcon(mode), size: 14, color: _modeColor(mode)),
-      label: Text(_modeName(mode), style: const TextStyle(fontSize: 11)),
-      visualDensity: VisualDensity.compact,
-      padding: EdgeInsets.zero,
-      side: BorderSide(color: _modeColor(mode).withValues(alpha: 0.4)),
-      backgroundColor: _modeColor(mode).withValues(alpha: 0.08),
-      labelStyle: TextStyle(color: _modeColor(mode)),
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Feature tile
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _FeatureTile extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  final String detail;
-  const _FeatureTile({
+class _InfoTile extends StatelessWidget {
+  const _InfoTile({
     required this.icon,
-    required this.label,
-    required this.detail,
+    required this.title,
+    required this.body,
   });
+
+  final IconData icon;
+  final String title;
+  final String body;
 
   @override
   Widget build(BuildContext context) {
@@ -427,94 +381,22 @@ class _FeatureTile extends StatelessWidget {
       leading: CircleAvatar(
         radius: 18,
         backgroundColor: cs.primaryContainer,
-        child: Icon(icon, size: 18, color: cs.onPrimaryContainer),
+        foregroundColor: cs.onPrimaryContainer,
+        child: Icon(icon, size: 18),
       ),
       title: Text(
-        label,
-        style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+        title,
+        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
       ),
       subtitle: Text(
-        detail,
-        style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant, height: 1.5),
+        body,
+        style: TextStyle(
+          fontSize: 12,
+          height: 1.45,
+          color: cs.onSurfaceVariant,
+        ),
       ),
-      isThreeLine: true,
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
     );
   }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Section card
-// ─────────────────────────────────────────────────────────────────────────────
-
-class _SectionCard extends StatelessWidget {
-  final String title;
-  final List<Widget> children;
-  final Color? titleColor;
-
-  const _SectionCard({
-    required this.title,
-    required this.children,
-    this.titleColor,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            child: Text(
-              title,
-              style: TextStyle(
-                fontWeight: FontWeight.bold,
-                fontSize: 14,
-                color: titleColor ?? Theme.of(context).colorScheme.primary,
-              ),
-            ),
-          ),
-          const Divider(height: 1),
-          ...children,
-        ],
-      ),
-    );
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-String _modeName(DatabaseMode mode) => switch (mode) {
-  DatabaseMode.standard => 'Standard',
-  DatabaseMode.readFast => 'Read Fast',
-  DatabaseMode.writeFast => 'Write Fast',
-  DatabaseMode.secure => 'Secure',
-};
-
-String _modeDescription(DatabaseMode mode) => switch (mode) {
-  DatabaseMode.standard =>
-    'Balanced: simple exclusive mutex for reads and writes',
-  DatabaseMode.readFast =>
-    'Read-optimized: many concurrent readers, exclusive writers',
-  DatabaseMode.writeFast =>
-    'Write-optimized: buffered writes with 100ms batch commits',
-  DatabaseMode.secure =>
-    'Encrypted at rest: AES-256-GCM encryption of the persisted file',
-};
-
-IconData _modeIcon(DatabaseMode mode) => switch (mode) {
-  DatabaseMode.standard => Icons.balance,
-  DatabaseMode.readFast => Icons.read_more,
-  DatabaseMode.writeFast => Icons.edit_note,
-  DatabaseMode.secure => Icons.lock_outline,
-};
-
-Color _modeColor(DatabaseMode mode) => switch (mode) {
-  DatabaseMode.standard => Colors.blue,
-  DatabaseMode.readFast => Colors.green,
-  DatabaseMode.writeFast => Colors.orange,
-  DatabaseMode.secure => Colors.purple,
-};

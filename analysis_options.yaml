@@ -1,6 +1,8 @@
 analyzer:
   exclude:
     - build/**
+    # The example is its own package (example/pubspec.yaml).
+    - example/**
 include: package:flutter_lints/flutter.yaml
 
 # Additional information about this file can be found at

@@ -1,693 +1,185 @@
-# Just Database — Architecture
+# just_database architecture
 
-> Version 1.3.0 · Last updated 2026-03-19
+This describes how just_database 2.x works inside, for people changing it.
+For using it, read the [README](README.md).
 
----
+## Layers
 
-## Table of Contents
+`lib/src` is split by feature. A feature only imports features in its own
+layer or below (checked by `test/library_layout_test.dart`):
 
-1. [Overview](#overview)
-2. [Layer Map](#layer-map)
-3. [Source Tree](#source-tree)
-4. [Layer Details](#layer-details)
-   - [Public API Surface](#public-api-surface)
-   - [SQL Pipeline](#sql-pipeline)
-   - [Storage Engine](#storage-engine)
-   - [Core Layer](#core-layer)
-   - [Concurrency Layer](#concurrency-layer)
-   - [ORM Layer](#orm-layer)
-   - [Persistence Layer](#persistence-layer)
-   - [Benchmark Layer](#benchmark-layer)
-   - [UI / Admin Layer](#ui--admin-layer)
-5. [Data Flow](#data-flow)
-6. [Concurrency Model](#concurrency-model)
-7. [Persistence & Encryption](#persistence--encryption)
-8. [Platform Portability](#platform-portability)
-9. [Index Strategy](#index-strategy)
-10. [Spatial Support](#spatial-support)
-11. [Transaction Model](#transaction-model)
-12. [Migration System](#migration-system)
-13. [Dependency Graph](#dependency-graph)
-
----
-
-## Overview
-
-`just_database` is a **pure-Dart, in-memory relational database engine** built for Flutter. It implements a full SQL dialect — DDL, DML, JOINs, aggregates, views, triggers, transactions, and spatial queries — entirely in Dart without any native plugins or FFI. Optional JSON-serialised persistence is provided via `path_provider` on native platforms, and via the **Origin Private File System (OPFS)** with a Web Worker or an **IndexedDB** fallback on web/WASM.
-
-Key design decisions:
-
-| Decision | Rationale |
-|---|---|
-| In-memory row store | Zero native dependencies; works on all Flutter targets |
-| Handwritten Lexer/Parser | Full control over the SQL dialect; no codegen needed |
-| Pluggable `LockManager` | One concurrency strategy per `DatabaseMode` |
-| Conditional export for persistence & database | `dart.library.js_interop` guard routes to web implementations |
-| OPFS + Web Worker for web persistence | Synchronous byte-level I/O in a dedicated worker; WAL for crash safety |
-| IndexedDB fallback | Broad browser support when OPFS is unavailable |
-| `ChangeNotifier` admin UI | Drop-in Flutter widget with zero routing changes |
-
----
-
-## Layer Map
-
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                         Public API (just_database.dart)                  │
-├───────────────┬──────────────────────┬──────────────┬────────────────────┤
-│   Core        │   SQL Pipeline       │   ORM        │   Admin UI         │
-│  ─────────    │  ──────────────      │  ─────────   │  ───────────────── │
-│  JustDatabase │  Lexer               │  DbTable<T>  │  DatabaseProvider  │
-│  DatabaseMgr  │  Parser              │  DbRecord    │  AdminWidget       │
-│  BackupMgr    │  AST (nodes)         │  DbColumn    │  Tabs / Pages      │
-│  Migration    │  Executor            │              │                    │
-│  SecureKeyMgr │                      │              │                    │
-├───────────────┴──────────────────────┴──────────────┴────────────────────┤
-│                         Storage Engine                                   │
-│          Table · TableSchema · DatabaseRow · TableIndex · RTree          │
-│                  QueryTracker · SpatialTypes (Point, BBox)               │
-├──────────────────────────────────────────────────────────────────────────┤
-│                      Concurrency Layer                                   │
-│             LockManager (Standard | ReadFast | WriteFast)                │
-├──────────────────────────────────────────────────────────────────────────┤
-│                       Persistence Layer                                  │
-│       PersistenceManager (native: dart:io + encrypt)                      │
-│                        / (web: OPFS + IndexedDB)                          │
-│                  BackupManager (native) / (web stubs)                    │
-│                       SecureKeyManager (just_storage)                    │
-└──────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Source Tree
-
-```
-lib/
-├── just_database.dart         ← core barrel export
-├── ui.dart                    ← UI barrel export
-└── src/
-    ├── version.dart
-    ├── sql/
-    │   ├── lexer.dart         ← tokeniser
-    │   ├── ast.dart           ← token enum + AST node types
-    │   ├── parser.dart        ← recursive-descent parser
-    │   └── executor.dart      ← AST interpreter + QueryResult
-    ├── storage/
-    │   ├── schema.dart        ← DataType, ColumnDef, TableSchema
-    │   ├── table.dart         ← Table (row store + index manager)
-    │   ├── database_row.dart  ← DatabaseRow value type
-    │   ├── index.dart         ← TableIndex (hash buckets), IndexMetadata
-    │   ├── query_tracker.dart ← usage counters for auto-indexing
-    │   ├── spatial.dart       ← Point, BoundingBox, Polygon, Circle
-    │   ├── rtree.dart         ← R-tree spatial index
-    │   ├── persistence.dart           ← conditional export gateway
-    │   ├── persistence_native.dart    ← dart:io + encrypt implementation
-    │   ├── persistence_web.dart       ← IndexedDB-backed web implementation
-    │   └── serialization.dart         ← shared JSON encode/decode
-    ├── core/
-    │   ├── database_mode.dart         ← DatabaseMode enum
-    │   ├── database.dart              ← conditional export gateway
-    │   ├── database_native.dart       ← native JustDatabase + QueryBuilder
-    │   ├── database_web.dart          ← web JustDatabase (Worker + IDB fallback)
-    │   ├── database_manager.dart      ← DatabaseManager + DatabaseInfo
-    │   ├── migration.dart             ← Migration, SqlMigration, MigrationRunner
-    │   ├── secure_key_manager.dart    ← AES key lifecycle via just_storage
-    │   ├── backup.dart                ← conditional export gateway
-    │   ├── backup_native.dart         ← full BackupManager implementation
-    │   └── backup_web.dart            ← partial stubs + in-memory methods
-    ├── web/
-    │   ├── opfs_support.dart          ← OPFS feature detection (OpfsCapability)
-    │   ├── opfs_storage.dart          ← sync byte I/O driver (OpfsStorageDriver)
-    │   ├── opfs_persistence.dart      ← OPFS PersistenceManager
-    │   ├── wal_manager.dart           ← Write-Ahead Log with CRC32 integrity
-    │   ├── idb_persistence.dart       ← IndexedDB fallback (IdbPersistenceManager)
-    │   ├── worker_protocol.dart       ← request/response message types
-    │   ├── database_worker.dart       ← worker isolate entry point
-    │   └── worker_client.dart         ← main-thread async proxy
-    ├── concurrency/
-    │   └── lock_manager.dart          ← abstract + Standard/ReadFast/WriteFast
-    ├── orm/
-    │   └── db_table.dart              ← DbTable<T>, DbRecord, DbColumn
-    ├── benchmark/
-    │   └── benchmark.dart             ← BenchmarkRunner, QueryStats
-    ├── widgets/
-    │   └── admin_widget.dart          ← JustDatabaseAdminWidget
-    └── ui/
-        ├── database_provider.dart     ← ChangeNotifier state manager
-        ├── ju_database_admin_screen.dart
-        ├── tabs/
-        │   ├── databases_tab.dart
-        │   ├── query_editor_tab.dart
-        │   ├── schema_tab.dart
-        │   └── settings_tab.dart
-        └── pages/
-            ├── benchmark_page.dart
-            └── insert_page.dart
-```
-
----
-
-## Layer Details
-
-### Public API Surface
-
-Two barrel files expose different concerns:
-
-- **`just_database.dart`** — exports every non-UI type: `JustDatabase`, `DatabaseManager`, `DatabaseMode`, `QueryResult`, `BackupManager`, `Migration`, `SecureKeyManager`, `Table`, `TableSchema`, `TableIndex`, `Executor`, `Parser`, all AST nodes, `LockManager`, `BenchmarkRunner`, `DbTable`, `DbRecord`, `DbColumn`, `PersistenceManager`, spatial types, and version info.
-- **`ui.dart`** — exports the admin UI surface: `DatabaseProvider`, `JustDatabaseAdminWidget`, and the admin screen.
-
----
-
-### SQL Pipeline
-
-The SQL engine consists of four sequential stages.
-
-#### 1. Lexer (`lexer.dart`)
-
-A single-pass character scanner that converts a raw SQL string into a flat `List<Token>`. Each token carries a `TokenType` (e.g. `kwSelect`, `opEquals`, `integer`, `string`) and its literal string value. The lexer handles:
-
-- SQL keywords (DDL, DML, aggregate functions, data types, constraint keywords)
-- String literals with single-quote escaping
-- Numeric literals (integer and real)
-- Operators and punctuation
-- SQL comments (`--` single-line)
-- Identifier quoting with backticks and double-quotes
-
-#### 2. AST (`ast.dart`)
-
-A hierarchy of plain Dart classes representing every statement type. Each node carries exactly the fields needed by the executor — nothing more. Key node families:
-
-| Family | Nodes |
-|---|---|
-| DML | `SelectStatement`, `InsertStatement`, `UpdateStatement`, `DeleteStatement` |
-| DDL | `CreateTableStatement`, `DropTableStatement`, `AlterTableStatement` |
-| Index | `CreateIndexStatement`, `DropIndexStatement` |
-| View | `CreateViewStatement`, `DropViewStatement` |
-| Trigger | `CreateTriggerStatement`, `DropTriggerStatement` |
-| Transaction | `BeginStatement`, `CommitStatement`, `RollbackStatement`, `SavepointStatement`, `ReleaseStatement` |
-| Expression | `BinaryExpression`, `UnaryExpression`, `FunctionCall`, `ColumnRef`, `Literal`, `CaseExpression`, `SubqueryExpression` |
-
-#### 3. Parser (`parser.dart`)
-
-A recursive-descent parser that consumes the token list produced by the Lexer and returns a single `Statement` (or a list of statements for multi-statement input via `Parser.parseSQLStatements`). It throws `ParseException` on syntax errors.
-
-Notable capabilities:
-
-- `SELECT` with aliases, DISTINCT, all JOIN types (INNER, LEFT, RIGHT), GROUP BY, HAVING, ORDER BY, LIMIT / OFFSET, subqueries
-- `INSERT` with column list, `VALUES`, multi-row values, and `INSERT OR REPLACE`
-- `UPDATE` / `DELETE` with `WHERE` and sub-expressions
-- `CREATE TABLE` with all constraint types (PK, FK, UNIQUE, NOT NULL, DEFAULT, AUTOINCREMENT), table-level constraints
-- `ALTER TABLE` (ADD COLUMN, DROP COLUMN, RENAME COLUMN, RENAME TO)
-- Views, triggers (BEFORE/AFTER, INSERT/UPDATE/DELETE, `FOR EACH ROW`)
-- Named savepoints
-- Query optimisation hints: `/*+ INDEX(table col) */` and `/*+ COMPOSITE_INDEX(table col1 col2) */`
-
-#### 4. Executor (`executor.dart`)
-
-An AST interpreter that mutates the shared `Map<String, Table>` owned by `JustDatabase`. Every `execute(Statement)` call dispatches to a private handler method (`_executeSelect`, `_executeInsert`, etc.).
-
-The executor also owns:
-
-- **Transaction / WAL state** — a snapshot of all tables taken at `BEGIN`; rolled back atomically on `ROLLBACK`. Named savepoints are additional snapshots within a transaction.
-- **View store** — `Map<String, SelectStatement>` mapping view name to its stored query. Views are resolved transparently during `SELECT`.
-- **Trigger store** — `Map<String, List<CreateTriggerStatement>>` per table. Triggers fire before or after the DML statement, with `NEW`/`OLD` row context exposed to the trigger body.
-- **`QueryTracker`** — receives column-usage events during `WHERE` evaluation and can request automatic index creation after a threshold is reached.
-
----
-
-### Storage Engine
-
-#### `Table`
-
-The central mutable data structure. Each `Table` holds:
-
-- `TableSchema` — column definitions, constraints, primary key columns
-- `List<DatabaseRow>` — ordered row list
-- `Map<int, int> _rowIdToIndex` — O(1) rowId → list position lookup
-- `Map<String, TableIndex> _indices` — named hash indexes (auto-created for PK, UNIQUE, FK, and auto-index candidates)
-- `int _nextRowId` / `int _autoIncrementValue` — internal counters
-
-On construction, `Table` auto-creates indexes for every PK, UNIQUE, and FK column defined in the schema.
-
-#### `DatabaseRow`
-
-An immutable value type wrapping `Map<String, dynamic>`. Carries the internal `rowId`, the column map, and an optional spatial `BoundingBox` for geometry columns.
-
-#### `TableSchema`
-
-Carries the list of `ColumnDefinition` objects (name, `DataType`, `ConstraintDefinition`) and the list of table-level constraints (`TableConstraint` for composite PK / UNIQUE / FK).
-
-#### `TableIndex`
-
-A hash-bucket index mapping column values (or composite key tuples for multi-column indexes) to `List<int>` row IDs. Supports insert, update, and delete maintenance, plus range and equality lookup. Carries `IndexMetadata` (type, usage count, creation time, last-used time).
-
-`IndexType` values: `primary`, `unique`, `foreign`, `auto`, `spatial`, `manual`.
-
-#### `QueryTracker`
-
-Observes WHERE-clause column usage across every SELECT. When a single column or multi-column combination exceeds `autoIndexThreshold` (default 100), the tracker signals the executor to create an `auto`-type index. Already-indexed columns are tracked to avoid duplicates.
-
----
-
-### Core Layer
-
-#### `JustDatabase`
-
-The entry point for all database operations. Created via `JustDatabase.open(name, ...)`.
-
-Public methods:
-
-| Method | Description |
-|---|---|
-| `query(sql)` | Executes SELECT; acquires read lock |
-| `execute(sql)` | Executes DDL/DML; acquires write lock |
-| `from(table)` | Returns a `QueryBuilder` for fluent API |
-| `beginTransaction()` / `commit()` / `rollback()` | Transaction management |
-| `savepoint(name)` / `release(name)` / `rollbackTo(name)` | Savepoint management |
-| `close()` | Persists to disk (if `persist: true`) and releases resources |
-
-`JustDatabase` owns a `LockManager`, a `QueryTracker`, and an `Executor`. The `_tables` map is shared by reference between `JustDatabase` and `Executor`.
-
-#### `QueryBuilder`
-
-A fluent builder that accumulates `SELECT`, `WHERE`, `ORDER BY`, `LIMIT`, and `OFFSET` clauses and renders them to a SQL string before delegating to `JustDatabase.query` or `execute`. It also exposes `.insert()`, `.update()`, and `.delete()` for DML via the same fluent chain.
-
-#### `DatabaseManager`
-
-A static registry of all open `JustDatabase` instances keyed by name. Prevents opening the same database twice. Exposes:
-
-- `DatabaseManager.open(name, ...)` — opens/creates and registers a database
-- `DatabaseManager.close(name)` — persists and deregisters
-- `DatabaseManager.listDatabases()` — returns `List<DatabaseInfo>` for all known databases (open + persisted)
-- `DatabaseManager.getOpenDatabase(name)` — looks up a live instance
-
-#### `DatabaseInfo`
-
-An immutable snapshot of database metadata (name, mode, table count, row count, file size, open state), used by the admin UI.
-
----
-
-### Concurrency Layer
-
-`LockManager` is an abstract interface with four operations: `acquireRead`, `releaseRead`, `acquireWrite`, `releaseWrite`. The concrete implementation is selected by `LockManager.forMode(DatabaseMode)` at database open time.
-
-See the [Concurrency Model](#concurrency-model) section for full details.
-
----
-
-### ORM Layer
-
-`DbTable<T extends DbRecord>` provides an Active-Record–style API over a `JustDatabase` table.
-
-- **`DbRecord`** — abstract base class; subclasses implement `toMap()` and a factory `fromMap()`.
-- **`DbColumn`** — describes a column: name, SQL type, NOT NULL, UNIQUE, default value. Named factories (`DbColumn.text`, `.integer`, `.real`, `.boolean`, `.datetime`, `.blob`) produce correct SQL type strings.
-- **`DbTable<T>`** — manages `CREATE TABLE`, single/batch insert, update, delete, and typed `findAll` / `findById` / `findWhere` using a caller-supplied `T Function(Map<String, dynamic>)` factory.
-
-The ORM emits raw SQL and delegates to `JustDatabase.execute` / `query`, so all ORM operations go through the same SQL pipeline and benefit from indexes, locks, and persistence.
-
----
-
-### Persistence Layer
-
-Persistence is split into platform-conditional export pairs.
-
-#### `persistence.dart` (gateway)
-
-```dart
-export 'persistence_native.dart'
-    if (dart.library.js_interop) 'persistence_web.dart';
-```
-
-- `dart.library.js_interop` is `true` on JS-web **and** WASM.
-- `dart.library.html` (the old guard) is `false` on WASM, so it was replaced.
-
-#### `persistence_native.dart`
-
-Full implementation for Android, iOS, macOS, Linux, Windows:
-
-- **Storage format** — JSON-serialised `DatabaseSnapshot` containing table schemas and row data. Written to `<app_documents>/just_database/<name>.jdb` through a uniquely named `.tmp` file and a rename, so the file always holds a complete snapshot.
-- **Encryption** — When `DatabaseMode.secure` is used, the JSON bytes are AES-256-GCM encrypted before writing. The IV is prepended to the ciphertext and stored together.
-- **API** — `save(snapshot, name, key)`, `load(name, key)`, `delete(name)`, `listPersistedNames()`, `getFileSize(name)`, `peekMode(name)`.
-
-#### `persistence_web.dart`
-
-IndexedDB-backed implementation. Delegates to `IdbPersistenceManager` for
-snapshot storage as JSON blobs. When IndexedDB is unavailable (restricted
-contexts), gracefully degrades to no-op behaviour. The `DatabaseSnapshot` type
-matches the native variant so the rest of the codebase compiles unchanged.
-
-#### `database.dart` (gateway)
-
-```dart
-export 'database_native.dart'
-    if (dart.library.js_interop) 'database_web.dart';
-```
-
-- **`database_native.dart`** — the original `JustDatabase` + `QueryBuilder` classes for native platforms. Unchanged from the previous release.
-- **`database_web.dart`** — web-specific `JustDatabase` that selects the best storage backend at `open()` time:
-  1. **OPFS Worker** — spawns a Dart isolate (compiled to a Web Worker) running the full SQL engine with synchronous OPFS I/O and WAL. Maximum performance.
-  2. **IndexedDB** — runs the SQL engine on the main thread with async IDB persistence.
-  3. **In-memory** — no persistence fallback.
-
-  Exposes a `storageBackend` getter (`WebStorageBackend` enum) so callers can inspect the chosen path.
-
-#### Web Worker Architecture
-
-```
-Main Thread                         Worker Isolate
-─────────────                       ──────────────
-JustDatabase (web)                  databaseWorkerMain()
-  │                                   │
-  ├── WorkerClient                    ├── Parser + Executor
-  │     send request ──► SendPort ──► │   (full SQL engine)
-  │     ◄── ReceivePort ◄── reply     │
-  │                                   ├── OpfsStorageDriver
-  │                                   │   (sync read/write via
-  │                                   │    FileSystemSyncAccessHandle)
-  │                                   │
-  │                                   └── WalManager
-  │                                       (binary WAL with CRC32)
-  └── storageBackend == opfsWorker
-```
-
-The `WorkerClient` maps every public API method (`query`, `execute`,
-`beginTransaction`, `commit`, `rollback`, etc.) to a message-passing protocol
-(`worker_protocol.dart`). Each request carries an auto-incrementing `id`;
-the client correlates responses via a `Map<int, Completer>`.
-
-#### WAL (Write-Ahead Log)
-
-The `WalManager` writes a binary log alongside the main `.jdb` file in OPFS:
-
-- **Entry format:** `[4B length][4B CRC32][8B sequence][1B type][NB JSON payload]` (17-byte header)
-- **Entry types:** `statement` (individual DML/DDL) and `checkpoint` (full snapshot)
-- **Auto-checkpoint:** triggered when the WAL exceeds 1 MB or 1 000 entries
-- **Replay on open:** all entries after the last checkpoint are replayed to recover uncommitted writes
-
-#### IndexedDB Fallback
-
-`IdbPersistenceManager` stores each database as a single JSON blob in an
-IndexedDB object store (`databases` in DB `just_database`). Full CRUD with
-`save()`, `load()`, `peekMode()`, `delete()`, `listPersistedNames()`,
-`getFileSize()`. Uses `package:web` bindings (`IDBFactory`, `IDBDatabase`,
-`IDBTransaction`).
-
-#### `DatabaseSerializer`
-
-Shared JSON encode/decode logic extracted into `serialization.dart`. Used by
-both `persistence_native.dart` and the web persistence classes to avoid
-duplication.
-
-#### `BackupManager` / `backup_native.dart` / `backup_web.dart`
-
-Same conditional export pattern as persistence. On native:
-
-- `exportSql(db)` — generates a SQL dump (CREATE TABLE + INSERT statements)
-- `importSql(db, sql)` — executes the dump against a database
-- `exportJson(db)` — serialises all tables to JSON
-- `importJson(db, json)` — restores tables from JSON
-- `backupToFile(db, path)` / `restoreFromFile(db, path)` — file I/O wrappers
-- `backupToJsonFile(db, path)` / `restoreFromJsonFile(db, path)` — JSON file wrappers
-
-On web: in-memory methods (`exportSql`, `importSql`, `exportJson`, `importJson`) are fully implemented; file methods throw `UnsupportedError`.
-
-#### `SecureKeyManager`
-
-Manages AES-256 key material using `just_storage` (which itself uses browser storage on web and `flutter_secure_storage` / `shared_preferences` on native):
-
-- `resolveKey({dbName, password})` — derives a key from a password via PBKDF2 using a per-database salt stored in `just_storage`.
-- `resolveAutoKey({dbName})` — generates and persists a random 256-bit key (no password needed); used by the admin UI for one-click secure databases.
-- `clearSalt` / `clearAutoKey` — remove stored key material.
-
----
-
-### Benchmark Layer
-
-`BenchmarkRunner` runs arbitrary SQL or executor operations for a configurable number of iterations and collects per-iteration `Duration` values. `QueryStats` computes mean, median, min, max, p95, p99, and throughput (ops/sec). Used by the admin UI's benchmark page and available to application developers for profiling.
-
----
-
-### UI / Admin Layer
-
-The admin UI is an optional Flutter widget that can be embedded anywhere in an app's widget tree.
-
-#### `JustDatabaseAdminWidget`
-
-A thin wrapper that creates a `ChangeNotifierProvider<DatabaseProvider>` and renders `JustDatabaseAdminScreen`. Consuming it requires no routing changes — it is just a widget.
-
-#### `DatabaseProvider` (`ChangeNotifier`)
-
-The single source of truth for all admin UI state:
-
-- `databases` — list of `DatabaseInfo` for the sidebar
-- `currentDatabase` — the currently selected `JustDatabase`
-- `lastQueryResult` / `lastError` — result and error from the most recent operation
-- `isLoading` — activity indicator flag
-- `queryHistory` — recent SQL strings
-
-All async operations call `notifyListeners()` on completion. The provider handles secure database creation transparently by calling `SecureKeyManager.resolveAutoKey` before `DatabaseManager.open`.
-
-#### Screen & Tabs
-
-`JustDatabaseAdminScreen` renders a tab bar with four tabs:
-
-| Tab | Responsibility |
-|---|---|
-| **Databases** | List, create, open, close, delete databases |
-| **Query Editor** | Type and execute raw SQL; display results in a table |
-| **Schema** | Browse table schemas, column types, and index definitions |
-| **Settings** | Default mode, persist toggle |
-
-Two additional pages are navigated to from within the tabs:
-
-| Page | Trigger |
-|---|---|
-| **Benchmark** | Launched from the Query Editor or Databases tab |
-| **Insert** | Row-insertion form launched from the Schema tab |
-
----
-
-## Data Flow
-
-### SQL Query (SELECT)
-
-```
-app code
-  │
-  ▼
-JustDatabase.query(sql)
-  │  acquires read lock via LockManager
-  │
-  ▼
-Executor.executeSQL(sql)
-  │
-  ├─► Lexer.tokenize(sql)  →  List<Token>
-  │
-  ├─► Parser.parseSQL(tokens)  →  SelectStatement
-  │
-  └─► Executor._executeSelect(stmt)
-        │
-        ├── resolve view? → recurse with stored SelectStatement
-        ├── scan base Table rows
-        ├── apply JOINs (nested loop, index-accelerated if available)
-        ├── evaluate WHERE (check TableIndex; record usage in QueryTracker)
-        ├── GROUP BY + HAVING
-        ├── ORDER BY
-        ├── LIMIT / OFFSET
-        └── project columns (functions, aliases, DISTINCT)
-              │
-              ▼
-          QueryResult { columns, rows, affectedRows, success }
-  │
-  ▼ releases read lock
-```
-
-### Write Statement (INSERT / UPDATE / DELETE)
-
-```
-JustDatabase.execute(sql)
-  │  acquires write lock
-  │
-  ▼
-Executor executes DML statement
-  │
-  ├── fire BEFORE triggers (if registered)
-  ├── mutate Table rows
-  ├── update all TableIndex buckets
-  ├── fire AFTER triggers
-  └── (if in transaction) changes are staged in live tables;
-      snapshot at BEGIN is kept for ROLLBACK
-  │
-  ▼ releases write lock
-  │
-  ▼ auto-persist (if persist: true and not in transaction)
-```
-
----
-
-## Concurrency Model
-
-The concurrency model is selected once at `JustDatabase.open` time and cannot be changed. `LockManager.forMode` instantiates the correct implementation.
-
-### `DatabaseMode.standard` / `DatabaseMode.secure`
-
-`StandardLockManager` — simple async mutex per table. Both reads and writes acquire the same exclusive lock. Correct and low-overhead for general use. `secure` mode shares this implementation (encryption is a storage concern, not a concurrency one).
-
-### `DatabaseMode.readFast`
-
-`ReadFastLockManager` — readers-writer lock per table. Multiple concurrent readers are allowed. Writers are exclusive. Writer-preference prevents reader starvation of writers.
-
-### `DatabaseMode.writeFast`
-
-`WriteFastLockManager` — writes are buffered in a per-table queue and flushed on a 100ms timer. A read that targets a buffered table flushes it first. Best for write-heavy workloads where durable per-write consistency is not required.
-
----
-
-## Persistence & Encryption
-
-```
-successful write / migration step / flush() / close()
-      │
-      ▼
-JustDatabase save queue — one save at a time per database; writes made
-      │                   while a save waits share it (it snapshots on start)
-      ▼
-PersistenceManager.save(snapshot, name, encryptionKey)
-      │
-      ├── serialize to DatabaseSnapshot JSON (synchronously, at call time)
-      │
-      ├── [secure mode] AES-256-GCM encrypt
-      │     key  → supplied at open() / auto-managed by SecureKeyManager
-      │     IV   → 12 random bytes prepended to ciphertext
-      │
-      ├── wait for earlier save/load/peekMode/delete calls on <name>
-      │
-      └── write <name>.jdb.<pid>-<µs>-<n>.tmp (flushed), rename over
-          <app_documents>/just_database/<name>.jdb
-```
-
-Writes return before their save lands; `flush()` waits for it and throws if
-it fails, while `close()` waits for pending saves but ignores failures.
-
-On load (`JustDatabase.open` with `persist: true`):
-
-```
-PersistenceManager.load(name, encryptionKey)
-      │
-      ├── read .jdb file bytes
-      ├── [secure mode] strip IV + AES-256-GCM decrypt
-      ├── JSON-decode → DatabaseSnapshot
-      └── reconstruct Table objects + re-instantiate indices
-```
-
-If the file exists but cannot be read, decrypted or decoded, `load` throws a
-`StateError` and `open` passes it on, leaving the file untouched. Starting
-empty instead would let the next save overwrite it.
-
-**Key management** for `DatabaseMode.secure`:
-
-- Password-based: `SecureKeyManager.resolveKey(dbName, password)` derives a key via PBKDF2 (SHA-256, 100 000 iterations) using a per-database random salt stored in `just_storage`.
-- Auto-key: `SecureKeyManager.resolveAutoKey(dbName)` generates a random 256-bit key on first call and stores it in `just_storage`. Subsequent calls retrieve the stored key. Used by the admin UI's one-click secure-database flow.
-
----
-
-## Platform Portability
-
-| Platform | Persistence | Encryption key storage | Backup files |
-|---|---|---|---|
-| Android | ✅ `dart:io` + `path_provider` | ✅ `just_storage` (secure storage) | ✅ |
-| iOS | ✅ | ✅ | ✅ |
-| macOS | ✅ | ✅ | ✅ |
-| Linux | ✅ | ✅ | ✅ |
-| Windows | ✅ | ✅ | ✅ |
-| Web (JS) | ✅ OPFS + Worker / IndexedDB | ✅ `just_storage` (localStorage) | ⚠️ in-memory only |
-| Web (WASM) | ✅ OPFS + Worker / IndexedDB | ✅ `just_storage` (localStorage) | ⚠️ in-memory only |
-
-The conditional export guard `if (dart.library.js_interop)` covers both JS-web and WASM. `dart.library.html` is not used because it evaluates to `false` under WASM.
-
-On web, `JustDatabase.open()` probes the environment and selects the best
-available storage backend (OPFS → IndexedDB → in-memory). The `storageBackend`
-getter on the web `JustDatabase` reveals which backend was chosen.
-
----
-
-## Index Strategy
-
-Every `Table` maintains a `Map<String, TableIndex>` of hash-bucket indexes. Indexes are created in three ways:
-
-| Trigger | Type | Notes |
+| Layer | Features | What they hold |
 |---|---|---|
-| Schema declaration (PK, UNIQUE, FK) | `primary`, `unique`, `foreign` | Created automatically at table construction |
-| `CREATE INDEX` statement | `manual` | User-controlled; can be composite |
-| `QueryTracker` threshold | `auto` | Created after a column appears in > 100 WHERE clauses |
+| 0 | `sql` | lexer, parser, syntax tree, `SqlException` |
+| 0 | `storage` | values and affinity, schemas, tables, indexes, the R-tree, the catalog, the undo log |
+| 1 | `engine` | the SQL engine: compiles and runs statements against a catalog |
+| 1 | `persistence` | the file codec (formats 1 and 2), the encryption envelope, the SQL dump, the store interface |
+| 2 | `io`, `web` | the platform stores: files with `dart:io`, IndexedDB and WebCrypto with `package:web` |
+| 3 | `core` | `JustDatabase`, `DatabaseManager`, migrations, the query builder, `SecureKeyManager` |
+| 4 | `orm`, `benchmark` | `DbTable`, benchmarks |
+| 5 | `ui` | the admin UI (only exported by `ui.dart`) |
 
-The executor checks for an applicable index before performing a full table scan. Composite indexes are used when the WHERE clause references all indexed columns. The query hint `/*+ INDEX(table col) */` forces index use; `/*+ COMPOSITE_INDEX(table col1 col2) */` forces a composite index.
+`lib/just_database.dart` exports the public API of layers 0–4;
+`lib/ui.dart` exports the UI.
 
----
+## A statement's life
 
-## Spatial Support
+1. `JustDatabase.execute(sql, params)` takes the database's async lock
+   (`AsyncLock`, first come first served). Inside `transaction()` the zone
+   marks the caller as the lock's holder, so its statements run at once.
+2. `Parser.parseOne` tokenizes (`lexer.dart`) and parses (`parser.dart`) the
+   text into a `Statement`, numbering its parameters. Anything after the
+   statement but a `;` is an error.
+3. Parameters are bound to a positional list (`bindValue` turns `bool`,
+   `DateTime` and `List<int>` into SQL values).
+4. `Engine.execute` runs the statement synchronously:
+   * It takes an undo-log *hold* and a *mark*.
+   * The statement is compiled: every expression becomes a closure
+     (`_Eval = Object? Function(_Frame)`) with its column references
+     resolved to (scope depth, source, column) at compile time.
+   * It runs. Every change to a table or the catalog records how to undo
+     itself in the `UndoLog`.
+   * On any error the log is rolled back to the mark, so the statement
+     changed nothing (`OR FAIL` keeps what it did; `OR ROLLBACK` and
+     `RAISE(ROLLBACK)` also end the transaction).
+   * Deferred foreign key checks (`NO ACTION`) run before it returns.
+5. `JustDatabase` wraps the outcome in a `QueryResult` and, if something
+   changed and no transaction is open, starts a save.
 
-`spatial.dart` defines the geometric primitives: `Point`, `BoundingBox`, `Polygon`, `Circle`.
+Because a statement runs without yielding, no other statement ever sees it
+half done.
 
-`rtree.dart` implements an in-memory **R-tree** spatial index over `BoundingBox` entries backed by `DatabaseRow` references. Supported spatial queries via SQL functions:
+## Values
 
-- `ST_MAKEPOINT(x, y)` — construct a Point
-- `ST_DISTANCE(a, b)` — Euclidean distance between two Points
-- `ST_CONTAINS(bbox, point)` — containment test
-- `ST_INTERSECTS(a, b)` — bounding box intersection
-- `ST_WITHIN(point, bbox)` — point-in-box test
-- `ST_DWITHIN(point, centre, radius)` — radius search via R-tree
+Values are SQLite's storage classes: `null`, `int`, `double`, `String`,
+`Uint8List` (`storage/values.dart`). Column affinity (`Affinity.of`) decides
+what a stored value becomes (`applyAffinity`); comparisons apply SQLite's
+rules (`_comparisonConverters`): numeric affinity converts the other side,
+text affinity converts an untyped side. `compareValues` orders NULL <
+numbers < text < blobs, text by collation (`BINARY`, `NOCASE`, `RTRIM`).
+`keyOf` maps values SQL treats as equal (`1` and `1.0`; strings equal
+under a collation) to one hashable key, used by `GROUP BY`, `DISTINCT`,
+joins and indexes.
 
-The `spatial` index type in `IndexType` links a `TableIndex` with an `RTree` for geometry-typed columns.
+## Storage
 
----
+* `TableData` keeps rows in a `SplayTreeMap<int, List<Object?>>` by rowid, a
+  list per row in column order. Row lists are never changed in place;
+  updates replace them.
+* `TableIndex` is a hash index from a key to one rowid or a set of rowids.
+  Rows with a NULL in the key are not indexed (NULL never matches and never
+  conflicts). Constraint indexes are named `sqlite_autoindex_<table>_<n>`;
+  internal `sqlite_fkindex_…` indexes on foreign key columns make cascades
+  fast and are never listed or saved.
+* `SpatialIndex` wraps an `RTree` (Guttman, quadratic split) over two
+  numeric columns.
+* `Catalog` holds tables, views and triggers (views and triggers as their
+  SQL text) and bumps `schemaVersion` on every schema change, which drops
+  the engine's compiled views and triggers.
+* `UndoLog` records undo closures while a statement or transaction holds
+  it. `rollbackTo(mark)` undoes newer entries. A transaction holds it from
+  `BEGIN` to `COMMIT`; savepoints are marks. `mutations` counts changes (and
+  un-counts undone ones), which tells `JustDatabase` whether anything needs
+  saving.
 
-## Transaction Model
+## The engine
 
-Transactions are WAL-lite: the executor takes a **deep copy of all tables** at `BEGIN` and stores it as `_txSnapshot`. All mutations during the transaction operate on the live tables directly. On `COMMIT` the snapshot is discarded. On `ROLLBACK` the live tables are replaced with the snapshot, restoring the prior state atomically.
+`engine/engine.dart` is one library split into parts:
 
-**Savepoints** work the same way — each `SAVEPOINT name` stores an additional snapshot. `ROLLBACK TO name` restores that snapshot without ending the transaction. `RELEASE name` discards the savepoint snapshot.
+* `scope.dart`: sources (a table, view, subquery, or a trigger's NEW/OLD),
+  scopes (the sources a query sees, with its parent for correlated
+  subqueries) and frames (the current row of each source at run time).
+  Name resolution raises "ambiguous column name" and "no such column".
+* `compiler.dart`: expressions to closures, with three-valued logic,
+  overflow-checked integer arithmetic, `LIKE`/`GLOB`, `IN` (hashed when its
+  list is constant), subqueries (results cached per execution unless
+  correlated), `CASE`, `CAST`, and aggregate calls, which become reads of
+  the group's results.
+* `select.dart`: flattens `FROM` into levels and runs nested loops. A join
+  level with equality keys hashes its rows once per run (or uses a table
+  index); the first level uses a rowid, index or spatial lookup when `WHERE`
+  allows; `WHERE` conjuncts are checked at the earliest level that has
+  their columns (at the end when a `RIGHT`/`FULL` join is present). Then
+  grouping, `HAVING`, `DISTINCT` (hashed), `ORDER BY` (keys computed from
+  the source rows, so a sort column need not be selected), `LIMIT`. Compound
+  selects combine the rows of their cores.
+* `dml.dart`: `INSERT`/`UPDATE`/`DELETE`, conflict handling and upserts,
+  `CHECK`/`NOT NULL`/`UNIQUE` (after affinity), triggers (no recursion, depth
+  limit 1000, `RAISE`), foreign keys (child checks, parent actions,
+  `NO ACTION` deferred to the statement's end) and `INSTEAD OF` triggers
+  on views.
+* `ddl.dart`: `CREATE`/`DROP`/`ALTER` with SQLite's rules; `rename.dart`
+  rewrites stored view, trigger and `CHECK` text token by token when a table
+  or column is renamed.
+* `functions.dart`, `datetime.dart`, `geometry.dart`, `aggregates.dart`: the
+  built-in functions.
 
-Persistence is deferred while a transaction is active; `close()` or an explicit flush after `COMMIT` triggers the disk write.
+## Persistence
 
----
+* `JustDatabase` saves the whole catalog after each committed change. The
+  snapshot is encoded under the lock, between statements and never during
+  a transaction; encryption and the write happen outside the lock. Saves
+  that pile up merge into one (`_startSave`); `writeFast` delays them.
+* `persistence/codec.dart` encodes format 2 and decodes formats 1 and 2.
+* The platform store (`io/file_store.dart`, `web/idb_store.dart`) reads,
+  writes atomically (temp file, flush, rename; retried briefly on Windows),
+  lists and deletes, takes a lock per database (an OS file lock; Web
+  Locks), and provides PBKDF2 and AES-GCM (background isolates; WebCrypto).
 
-## Migration System
+### Format 2 (plain)
 
-`Migration` is an abstract class with `version`, `name`, `up(Executor)`, and optional `down(Executor)`. `SqlMigration` is a concrete subclass backed by raw SQL strings (supports `downSql` for rollback).
+UTF-8 JSON:
 
-`MigrationRunner` applies a list of migrations in version order:
+```json
+{"format": "just_database", "version": 2, "userVersion": 0,
+ "tables": [{"schema": {"name": "t", "columns": [{"name": "id", "type": "INTEGER", "primaryKey": true}],
+             "constraints": []},
+             "sequence": 0,
+             "rows": [[1, …], …],
+             "indexes": [{"name": "ix", "columns": ["a"], "unique": false}],
+             "spatial": [{"name": "sx", "x": "lng", "y": "lat"}]}],
+ "views": [{"name": "v", "sql": "CREATE VIEW …"}],
+ "triggers": [{"name": "tr", "table": "t", "sql": "CREATE TRIGGER …"}]}
+```
 
-1. Ensures a `_migrations` meta-table exists.
-2. Skips any migration whose version is already recorded in `_migrations`.
-3. Executes `up(executor)` and records the version, name and `checksum` (SHA-256 of the SQL for `SqlMigration`) on success. Migrations are not wrapped in a transaction, and checksums are recorded but not validated.
-4. Stops at the first failure and returns a `List<MigrationResult>` with per-step status (`applied`, `skipped`, `failed`).
+Each row starts with its rowid. A blob is `{"$blob": "<base64>"}`; an
+infinite real is `{"$real": "Infinity"}` or `"-Infinity"`. A reader refuses
+a `version` it does not know.
 
-`JustDatabase.migrationRunner(migrations)` builds a runner over the database's own `Executor` with a guard that saves persistent databases after every operation; `JustDatabase.migrate(migrations)` is the shorthand for applying them.
-
----
-
-## Dependency Graph
+### Format 2 (encrypted)
 
 ```
-just_database
-├── flutter/foundation (ChangeNotifier for UI layer)
-├── provider ^6.1.2 (admin widget DI)
-├── path_provider ^2.1.4 (native persistence only — excluded on web/WASM)
-├── encrypt ^5.0.3 (AES-256-GCM — native only)
-├── crypto ^3.0.3 (PBKDF2 key derivation, migration checksums)
-├── web ^1.1.0 (OPFS + IndexedDB bindings for web persistence)
-└── just_storage ^1.1.2 (SecureKeyManager — cross-platform, WASM-ready)
+"JDB" 0x02 | kdf 0x01 (PBKDF2-HMAC-SHA256) | iterations (uint32, big-endian)
+| salt length (1 byte) | salt | nonce (12) | AES-256-GCM(ciphertext + 16-byte tag)
 ```
 
-Internal layers only depend downward:
+The whole header is the GCM additional data.
 
-```
-UI  →  Core  →  SQL Pipeline  →  Storage Engine
-             →  Concurrency
-             →  Persistence   →  just_storage (cross-platform)
-                              →  dart:io (native only)
-             →  Web Layer     →  package:web (web only)
-                              →  dart:js_interop (web only)
-```
+### Format 1 (1.x)
+
+Plain files are JSON with `"version": 1` and tables keyed by name; columns
+carry a `DataType`, rows are arrays without rowids, values use
+`{"__type": "blob" | "datetime", "data": …}`. Encrypted files are
+`IV (12) | ciphertext | tag` with the key `SHA-256(passphrase)`.
+`_decodeV1` converts them: types become declared types, booleans `1`/`0`,
+dates ISO text, an `INTEGER PRIMARY KEY` the rowid; keys the data breaks are
+dropped with a warning.
+
+## Concurrency
+
+All statements of a database run on one engine, one at a time. The async
+lock orders callers; `transaction()` holds it for its whole callback. Saves
+take it only to encode. `readFast` lets a `SELECT` skip the queue when no
+transaction is open. A process-wide registry returns the open instance for
+a name (reference-counted `close`), and the store's lock keeps other
+processes and tabs out. Isolates of one process are not kept apart on
+POSIX systems (file locks there belong to the process).
+
+## Known trade-offs
+
+* Whole-database saves: simple and atomic, but their cost grows with the
+  database.
+* Hash indexes only: no range scans, no index-ordered `ORDER BY`.
+* Renames rewrite stored SQL by tokens; a name reused for something else in
+  a trigger can be renamed with it.
+* Integers are 64-bit on native platforms and 53-bit on the web.
