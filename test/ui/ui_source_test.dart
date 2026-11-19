@@ -13,21 +13,36 @@ void main() {
     File('lib/ui.dart'),
   ];
 
-  test('ui.dart exports every public UI type', () {
+  test('ui.dart exports the screen, its controller and the seed callback', () {
     // Compiles only while every type is exported.
     const types = [
       JustDatabaseAdminScreen,
+      JustDatabaseAdminController,
       SeedDatabaseCallback,
-      DatabaseProvider,
-      DatabaseDetailPage,
-      InsertPage,
-      BenchmarkPage,
-      DatabasesTab,
-      SchemaTab,
-      QueryEditorTab,
-      SettingsTab,
     ];
-    expect(types, hasLength(10));
+    expect(types, hasLength(3));
+    final exported = RegExp(r"^export '([^']+)'", multiLine: true)
+        .allMatches(File('lib/src/ui/ui.dart').readAsStringSync())
+        .map((m) => m.group(1)!)
+        .toList();
+    expect(exported, [
+      'just_database_admin_controller.dart',
+      'just_database_admin_screen.dart',
+    ]);
+  });
+
+  test('the admin UI needs no just_signals', () {
+    for (final f in sources) {
+      expect(
+        f.readAsStringSync(),
+        isNot(contains('just_signals')),
+        reason: f.path,
+      );
+    }
+    expect(
+      File('pubspec.yaml').readAsStringSync(),
+      isNot(contains('just_signals')),
+    );
   });
 
   test('the core library does not export the UI', () {

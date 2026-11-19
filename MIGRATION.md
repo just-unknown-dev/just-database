@@ -11,8 +11,8 @@ dependencies:
   just_database: ^2.0.0
 ```
 
-2.0 needs Flutter 3.47.1 or newer, `just_signals` 2.x and `just_storage`
-2.x. It no longer depends on `encrypt`.
+2.0 needs Flutter 3.47.1 or newer and `just_storage` 2.x. It no longer
+depends on `encrypt` or `just_signals`.
 
 ## 2. Encryption is not a mode
 
@@ -136,8 +136,9 @@ it). Other callers wait until the transaction ends.
 | `Executor`, `Parser`, the AST classes, `Table`, `TableIndex`, `DatabaseRow`, `LockManager`, `QueryTracker`, `PersistenceManager`, `RTreeIndex`, `BoundingBox`, `Point` | internal; use `JustDatabase` |
 | `BackupManager` | `db.exportSql()`, `exportJson()`, `importSql()`, `importJson()` |
 | `JustDatabaseAdminWidget` | `JustDatabaseAdminScreen` |
-| `JUDatabaseAdminScreen` | `JustDatabaseAdminScreen({theme, onSeedDatabase, provider, title})` |
-| `DatabaseProvider` actions returning `void` | `Future<bool>`; on failure `lastError` (queries: `lastQueryError`) |
+| `JUDatabaseAdminScreen` | `JustDatabaseAdminScreen({controller, readOnly, theme, title, onSeedDatabase})` |
+| `DatabaseProvider` | `JustDatabaseAdminController` (`refresh()`, `selectDatabase(name)`, `database`, `lastError`) |
+| `DatabaseDetailPage`, `InsertPage`, `BenchmarkPage`, the admin tabs | parts of the workbench, no longer public |
 | UI exports in `just_database.dart` | `import 'package:just_database/ui.dart';` |
 | `DataType`, `ConstraintDefinition` | `ColumnDefinition` (`type`, `affinity`, `notNull`, …), `TableConstraint`, `ForeignKeyDefinition` |
 | `TableSchema.tableName` | `TableSchema.name` |

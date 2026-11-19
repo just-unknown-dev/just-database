@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart' show internal;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -13,6 +14,7 @@ import '../widgets/admin_widgets.dart';
 /// touched; it yields to the event loop between runs, so the page stays
 /// responsive. A custom query must be a SELECT (it runs through
 /// `JustDatabase.query`, which refuses anything else).
+@internal
 class BenchmarkPage extends StatefulWidget {
   /// Creates the page. Without a [database] only the standard suite runs.
   const BenchmarkPage({super.key, this.database});
@@ -29,8 +31,16 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
   final _rowCount = TextEditingController(text: '1000');
   final _warmup = TextEditingController(text: '3');
   final _iterations = TextEditingController(text: '50');
-  final _query = TextEditingController(text: 'SELECT * FROM users LIMIT 100');
+  late final _query = TextEditingController(text: _defaultQuery());
   final _label = TextEditingController(text: 'My query');
+
+  String _defaultQuery() {
+    final db = widget.database;
+    final table = db != null && db.isOpen ? db.tableNames.firstOrNull : null;
+    return table == null
+        ? 'SELECT 1'
+        : 'SELECT * FROM "${table.replaceAll('"', '""')}" LIMIT 100';
+  }
 
   bool _custom = false;
   bool _running = false;

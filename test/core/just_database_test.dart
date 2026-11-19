@@ -197,6 +197,19 @@ void main() {
       await b.close();
     });
 
+    test('while open, a second opener gives the new key', () async {
+      final db = await JustDatabase.open('rekey_open', encryptionKey: 'old');
+      await db.changeEncryptionKey('new');
+      await expectLater(
+        JustDatabase.open('rekey_open', encryptionKey: 'old'),
+        throwsStateError,
+      );
+      final again = await JustDatabase.open('rekey_open', encryptionKey: 'new');
+      expect(identical(again, db), isTrue);
+      await again.close();
+      await db.close();
+    });
+
     test('the key never appears in errors', () async {
       Directory(paths.databases).createSync(recursive: true);
       final db = await JustDatabase.open('k', encryptionKey: 'TOP-SECRET-KEY');

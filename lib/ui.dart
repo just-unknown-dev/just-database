@@ -1,10 +1,12 @@
-/// The Flutter admin UI of just_database.
+/// The database workbench of just_database, for Flutter.
 ///
 /// [JustDatabaseAdminScreen] lists every database of the app (the ones it
-/// has open and the saved ones) and lets you browse and edit rows, inspect
-/// schemas, run SQL, benchmark, and create and delete databases. Its parts
-/// can also be used on their own: [DatabaseProvider] (the state), the tabs,
-/// and the [DatabaseDetailPage], [InsertPage] and [BenchmarkPage] pages.
+/// has open and the saved ones). It browses and edits rows, edits schemas,
+/// runs SQL, exports and imports, encrypts, benchmarks, and creates and
+/// deletes databases: a sidebar and panes on wide screens, drill-down pages
+/// on phones. [JustDatabaseAdminController] holds its state; pass one to
+/// share it or to choose what the screen shows. `readOnly: true` makes a
+/// screen that cannot change anything.
 ///
 /// ```dart
 /// import 'package:just_database/ui.dart';

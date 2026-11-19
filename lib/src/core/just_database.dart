@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter/foundation.dart' show debugPrint, internal;
 
 import '../engine/engine.dart';
 import '../persistence/codec.dart';
@@ -15,6 +15,8 @@ import '../storage/catalog.dart';
 import '../storage/schema.dart';
 import '../storage/values.dart';
 import 'async_lock.dart';
+import 'database_change.dart';
+import 'database_manager.dart';
 import 'database_mode.dart';
 import 'migration.dart';
 import '../io/file_store.dart'
@@ -49,7 +51,8 @@ final class JustDatabase {
   /// False for an in-memory database, and after storage became unavailable.
   bool persist;
 
-  final String? _encryptionKey;
+  // The passphrase openers must give (changeEncryptionKey replaces it).
+  String? _encryptionKey;
 
   /// How long [DatabaseMode.writeFast] waits to batch changes into one
   /// save.
@@ -85,6 +88,14 @@ final class JustDatabase {
   Timer? _batchTimer;
   Object? _saveError;
   StackTrace? _saveStack;
+
+  // Change events.
+  final StreamController<DatabaseChange> _changes =
+      StreamController<DatabaseChange>.broadcast();
+  int _notifiedMutations = 0;
+  int _notifiedSchema = 0;
+  bool _changeScheduled = false;
+  Set<String>? _replacedTables;
 
   // ---------------------------------------------------------------------------
   // Opening and closing
@@ -158,7 +169,12 @@ final class JustDatabase {
     _opening[key] = future;
     try {
       await future;
+      db
+        .._notifiedMutations = db._catalog.log.mutations
+        .._notifiedSchema = db._catalog.schemaVersion;
+      db._catalog.log.takeTouched();
       _registry[key] = db;
+      DatabaseManager.notifyListChanged();
       return db;
     } finally {
       _opening.remove(key);
@@ -262,6 +278,7 @@ final class JustDatabase {
     _releaseLock = null;
     unawaited(release?.call());
     onStorageDowngrade?.call(name, reason);
+    DatabaseManager.notifyListChanged();
     debugPrint('just_database: $name is in memory only: $reason');
   }
 
@@ -316,6 +333,8 @@ final class JustDatabase {
       await release?.call();
       if (identical(_closing[key], done.future)) _closing.remove(key);
       done.complete();
+      unawaited(_changes.close());
+      DatabaseManager.notifyListChanged();
     }
     final e = _saveError;
     if (e != null) {
@@ -428,6 +447,7 @@ final class JustDatabase {
         ),
       );
     }
+    final watch = Stopwatch()..start();
     try {
       final r = _engine.execute(parsed, bound);
       return QueryResult.success(
@@ -435,12 +455,14 @@ final class JustDatabase {
         values: r.rows,
         affectedRows: r.changes,
         lastInsertRowId: r.lastInsertRowId,
+        elapsed: watch.elapsed,
       );
     } on SqlException catch (e) {
-      return QueryResult.failure(e);
+      return QueryResult.failure(e, elapsed: watch.elapsed);
     } catch (e, st) {
       return QueryResult.failure(
         SqlException('internal error: $e\n$st', sql: parsed.sql),
+        elapsed: watch.elapsed,
       );
     } finally {
       _afterStatement();
@@ -583,6 +605,7 @@ final class JustDatabase {
   // ---------------------------------------------------------------------------
 
   void _afterStatement() {
+    _scheduleChanges();
     if (!persist || _engine.inTransaction) return;
     if (_catalog.log.mutations == _savedMutations) return;
     if (mode == DatabaseMode.writeFast) {
@@ -669,6 +692,65 @@ final class JustDatabase {
     }
   }
 
+  /// Why the last save failed, or null when it succeeded (or nothing was
+  /// saved yet). Background failures also go to [onSaveError].
+  Object? get saveError => _saveError;
+
+  /// How many openers hold this database: [close] closes it when the last
+  /// one does.
+  @internal
+  int get openerCount => _isOpen ? _refs : 0;
+
+  // ---------------------------------------------------------------------------
+  // Change events
+  // ---------------------------------------------------------------------------
+
+  /// The changes made to this database: an event after each statement,
+  /// script or transaction that changed something. A transaction's changes
+  /// arrive when it commits; one rolled back sends nothing. Events come
+  /// asynchronously (statements run together send one), and the stream
+  /// closes when the database does.
+  ///
+  /// ```dart
+  /// db.changes.listen((change) {
+  ///   if (change.touches('scores')) refreshLeaderboard();
+  /// });
+  /// ```
+  Stream<DatabaseChange> get changes => _changes.stream;
+
+  void _scheduleChanges() {
+    if (_changeScheduled) return;
+    _changeScheduled = true;
+    scheduleMicrotask(_emitChanges);
+  }
+
+  void _emitChanges() {
+    _changeScheduled = false;
+    // A transaction's changes are reported when it ends.
+    if (_changes.isClosed || _engine.inTransaction) return;
+    final log = _catalog.log;
+    final touched = log.takeTouched();
+    final replaced = _replacedTables;
+    _replacedTables = null;
+    final mutations = log.mutations;
+    final schema = _catalog.schemaVersion;
+    if (replaced == null && mutations == _notifiedMutations) return;
+    final schemaChanged = replaced != null || schema != _notifiedSchema;
+    _notifiedMutations = mutations;
+    _notifiedSchema = schema;
+    _changes.add(
+      DatabaseChange(
+        tables: Set.unmodifiable({
+          ...?replaced,
+          if (replaced != null)
+            for (final t in _catalog.tables) t.name,
+          ...touched,
+        }),
+        schemaChanged: schemaChanged,
+      ),
+    );
+  }
+
   /// Changes the encryption: [newKey] encrypts the file with a new
   /// passphrase (or encrypts a plain one), null decrypts it. Saves at once.
   Future<void> changeEncryptionKey(String? newKey) async {
@@ -683,9 +765,11 @@ final class JustDatabase {
     final key = newKey == null ? null : await FileKey.create(store, newKey);
     await _lock.run(() {
       _fileKey = key;
+      _encryptionKey = newKey;
       _savedMutations = -1;
     });
     await flush();
+    DatabaseManager.notifyListChanged();
   }
 
   // ---------------------------------------------------------------------------
@@ -703,6 +787,27 @@ final class JustDatabase {
 
   /// The schema of [table], or null when there is no such table.
   TableSchema? getTableSchema(String table) => _catalog.table(table)?.schema;
+
+  /// The `CREATE VIEW` statement of [view], or null when there is no such
+  /// view.
+  String? getViewSql(String view) => _catalog.view(view)?.sql;
+
+  /// The `CREATE TRIGGER` statement of [trigger], or null when there is no
+  /// such trigger.
+  String? getTriggerSql(String trigger) => _catalog.trigger(trigger)?.sql;
+
+  /// The table or view [trigger] is on, or null when there is no such
+  /// trigger.
+  String? getTriggerTable(String trigger) => _catalog.trigger(trigger)?.table;
+
+  /// The triggers on [table] (a table or a view), in creation order.
+  List<String> triggerNamesForTable(String table) {
+    final lower = table.toLowerCase();
+    return [
+      for (final t in _catalog.triggers)
+        if (t.table.toLowerCase() == lower) t.name,
+    ];
+  }
 
   /// The indexes of [table] (constraint indexes included).
   List<IndexInfo> indexesForTable(String table) =>
@@ -827,9 +932,14 @@ final class JustDatabase {
         throw StateError('cannot import while a transaction is open');
       }
       final fk = _engine.foreignKeys;
+      _replacedTables = {
+        ...?_replacedTables,
+        for (final t in _catalog.tables) t.name,
+      };
       _catalog = fresh;
       _engine = Engine(fresh)..foreignKeys = fk;
       _savedMutations = -1;
+      _scheduleChanges();
     });
     if (persist) await flush();
   }

@@ -1,6 +1,8 @@
 import 'package:flutter_test/flutter_test.dart';
 
-import '../../example/example.dart';
+// The tour lives in the example app's own lib/ (example/ is a package).
+// ignore: avoid_relative_lib_imports
+import '../../example/lib/tour.dart';
 
 void main() {
   test('the example tour runs and prints what it promises', () async {

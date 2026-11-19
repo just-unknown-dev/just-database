@@ -42,6 +42,12 @@ final class TableData {
   /// The table's schema.
   TableSchema get schema => _schema;
 
+  /// Records [undo] and notes that this table changed.
+  void _record(void Function() undo) {
+    _log.touch(name);
+    _log.record(undo);
+  }
+
   /// The table's name.
   String get name => _schema.name;
 
@@ -88,15 +94,15 @@ final class TableData {
     if (rowid > sequence && _schema.autoIncrement) {
       final old = sequence;
       sequence = rowid;
-      _log.record(() => sequence = old);
+      _record(() => sequence = old);
     }
-    _log.record(() => _rawDelete(rowid));
+    _record(() => _rawDelete(rowid));
   }
 
   /// Deletes the row with [rowid] and returns it.
   List<Object?> delete(int rowid) {
     final old = _rawDelete(rowid);
-    _log.record(() => _rawInsert(rowid, old));
+    _record(() => _rawInsert(rowid, old));
     return old;
   }
 
@@ -109,9 +115,9 @@ final class TableData {
     if (target > sequence && _schema.autoIncrement) {
       final oldSeq = sequence;
       sequence = target;
-      _log.record(() => sequence = oldSeq);
+      _record(() => sequence = oldSeq);
     }
-    _log.record(() {
+    _record(() {
       _rawDelete(target);
       _rawInsert(rowid, old);
     });
@@ -145,7 +151,7 @@ final class TableData {
     final n = _rows.length;
     _rows.clear();
     _rebuildAll();
-    _log.record(() {
+    _record(() {
       _rows
         ..clear()
         ..addAll(saved);
@@ -187,7 +193,7 @@ final class TableData {
   void setSchema(TableSchema schema) {
     final old = _schema;
     _schema = schema;
-    _log.record(() => _schema = old);
+    _record(() => _schema = old);
   }
 
   /// Appends a column to the schema and [value] to every row.
@@ -198,7 +204,7 @@ final class TableData {
     for (final k in oldRows.keys) {
       _rows[k] = [...oldRows[k]!, value];
     }
-    _log.record(() {
+    _record(() {
       _schema = oldSchema;
       _rows.addAll(oldRows);
     });
@@ -224,7 +230,7 @@ final class TableData {
     }
 
     shift(-1);
-    _log.record(() {
+    _record(() {
       _schema = oldSchema;
       shift(1);
       _rows.addAll(oldRows);
@@ -238,7 +244,7 @@ final class TableData {
     final dup = index.rebuild(_rows.entries);
     if (dup != null) return dup;
     indexes.add(index);
-    _log.record(() => indexes.remove(index));
+    _record(() => indexes.remove(index));
     return null;
   }
 
@@ -247,14 +253,14 @@ final class TableData {
     final at = indexes.indexOf(index);
     if (at < 0) return;
     indexes.removeAt(at);
-    _log.record(() => indexes.insert(at, index));
+    _record(() => indexes.insert(at, index));
   }
 
   /// Adds [index] and fills it.
   void addSpatialIndex(SpatialIndex index) {
     index.rebuild(_rows.entries);
     spatialIndexes.add(index);
-    _log.record(() => spatialIndexes.remove(index));
+    _record(() => spatialIndexes.remove(index));
   }
 
   /// Removes [index].
@@ -262,14 +268,14 @@ final class TableData {
     final at = spatialIndexes.indexOf(index);
     if (at < 0) return;
     spatialIndexes.removeAt(at);
-    _log.record(() => spatialIndexes.insert(at, index));
+    _record(() => spatialIndexes.insert(at, index));
   }
 
   /// Renames an index (used by `ALTER TABLE … RENAME TO`).
   void renameIndex(TableIndex index, String name) {
     final old = index.name;
     index.name = name;
-    _log.record(() => index.name = old);
+    _record(() => index.name = old);
   }
 
   /// Describes every index, for introspection.
@@ -364,7 +370,7 @@ final class TableData {
       );
       index.rebuild(_rows.entries);
       indexes.add(index);
-      _log.record(() => indexes.remove(index));
+      _record(() => indexes.remove(index));
     }
   }
 

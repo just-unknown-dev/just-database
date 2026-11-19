@@ -3,7 +3,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:just_database/just_database.dart';
-import 'package:just_database/ui.dart';
+import 'package:just_database/src/ui/pages/benchmark_page.dart';
 
 import 'ui_test_support.dart';
 

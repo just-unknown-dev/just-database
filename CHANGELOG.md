@@ -20,11 +20,13 @@ Every 1.x database file still opens. See [MIGRATION.md](MIGRATION.md).
   documents directory, shared by every app on desktop). A 1.x file is
   copied over the first time it is opened. The file format is now 2; the
   first save converts a 1.x file.
-- **UI only in `package:just_database/ui.dart`.** `JUDatabaseAdminScreen` is
-  `JustDatabaseAdminScreen({theme, onSeedDatabase, provider, title})`;
-  `JustDatabaseAdminWidget` is removed; `DatabaseProvider` actions return
-  `Future<bool>` and report failures in `lastError`; the pages take the
-  database they show.
+- **The admin UI is a new workbench, only in
+  `package:just_database/ui.dart`.** `JUDatabaseAdminScreen` is
+  `JustDatabaseAdminScreen({controller, readOnly, theme, title,
+  onSeedDatabase})`; `JustDatabaseAdminController` replaces
+  `DatabaseProvider`; `JustDatabaseAdminWidget`, the tabs and the pages
+  (`DatabaseDetailPage`, `InsertPage`, `BenchmarkPage`) are no longer
+  public.
 - **Internals are no longer public:** `Executor`, `Parser`, the AST,
   `Table`, `TableIndex`, `DatabaseRow`, `LockManager`, `QueryTracker`,
   `PersistenceManager`, `BackupManager`, `RTreeIndex`, `BoundingBox`,
@@ -40,8 +42,8 @@ Every 1.x database file still opens. See [MIGRATION.md](MIGRATION.md).
 - ORM `fromRow` receives stored values (use the new row helpers); queries
   take `whereArgs`.
 - Automatic query-pattern indexes are gone.
-- Requires Flutter 3.47.1, `just_signals` ^2.0.0 and `just_storage` ^2.0.0;
-  the `encrypt` dependency is replaced by `pointycastle`.
+- Requires Flutter 3.47.1 and `just_storage` ^2.0.0; `just_signals` is no
+  longer a dependency, and `encrypt` is replaced by `pointycastle`.
 
 ### Added
 
@@ -63,8 +65,26 @@ Every 1.x database file still opens. See [MIGRATION.md](MIGRATION.md).
   `lastInsertRowId`/`orThrow()`, `SqlException` with `SqlErrorKind`.
 - `exportSql()`, `exportJson()`, `importSql()`, `importJson()` on the
   database (atomic replace).
-- `changeEncryptionKey()`, `onSaveError`, `findOpen()`, `indexesForTable()`,
-  `rowCount()`, `JustDatabase.nameProblem()`, `SecureKeyManager.hasAutoKey()`.
+- `changeEncryptionKey()`, `onSaveError`, `saveError`, `findOpen()`,
+  `indexesForTable()`, `rowCount()`, `getViewSql()`, `getTriggerSql()`,
+  `getTriggerTable()`, `triggerNamesForTable()`,
+  `JustDatabase.nameProblem()`, `SecureKeyManager.hasAutoKey()`.
+- `JustDatabase.changes`: a `DatabaseChange` (tables touched, schema
+  changed) after each committed statement, script or transaction;
+  `DatabaseManager.listChanges` when a database is opened, closed,
+  deleted or encrypted. `QueryResult.elapsed`.
+- The admin workbench: a sidebar and panes on wide screens, drill-down
+  pages on phones; a data browser with search, `WHERE` filters,
+  sorting, resizable columns, in-place editing, a side-panel row
+  editor, a value inspector (text, JSON, hex) and CSV/JSON export;
+  structure editing (columns, indexes, tables) and a create-table
+  designer; a SQL console with highlighting, completion, run selection
+  or statement, per-statement results and timing, error positions,
+  parameters, history and snippets; database tools (create with a
+  random key or a passphrase, open with a passphrase, close, change
+  mode, duplicate, export/import as files or downloads, encryption,
+  save now, benchmark); a `readOnly` mode; live updates; settings kept
+  with just_storage.
 - A new saved database is written at once, so it exists (and is listed)
   before its first change.
 - Opening an open database returns the same instance (reference-counted
@@ -101,6 +121,8 @@ Every 1.x database file still opens. See [MIGRATION.md](MIGRATION.md).
 - `SecureKeyManager`: concurrent first calls could create two keys;
   passwords outside Latin-1 collided.
 - Database names could escape the database directory.
+- `changeEncryptionKey()` left the old key as the one later openers had
+  to give while the database stayed open.
 - Admin UI: it opened a second instance of databases the app had open;
   deleting one of two identical rows deleted both; editing trimmed text
   and turned `''` into `NULL`; a failed open showed another database's

@@ -1,11 +1,11 @@
 // Opens a sample database (saved, so it is there on the next run) and
-// shows the just_database admin UI. The "Run the tour" button runs
-// example/example.dart and shows what it printed.
+// shows the just_database workbench. The bar above it runs the API tour
+// (lib/tour.dart) and switches the workbench to read-only.
 import 'package:flutter/material.dart';
 import 'package:just_database/just_database.dart';
 import 'package:just_database/ui.dart';
 
-import '../example.dart';
+import 'tour.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -32,6 +32,10 @@ Future<void> seedSample(JustDatabase db) async {
         person_id INTEGER REFERENCES people (id) ON DELETE CASCADE,
         body TEXT NOT NULL
       )''');
+    await tx.execute('CREATE INDEX notes_person ON notes (person_id)');
+    await tx.execute('''
+      CREATE VIEW active_people AS
+        SELECT id, name, email FROM people WHERE active = 1''');
     for (final (name, email) in [
       ('Ann', 'ann@example.com'),
       ("Bob O'Neil", 'bob@example.com'),
@@ -64,38 +68,74 @@ class ExampleApp extends StatelessWidget {
   );
 }
 
-class _Home extends StatelessWidget {
+class _Home extends StatefulWidget {
   const _Home();
 
   @override
-  Widget build(BuildContext context) => Stack(
-    children: [
-      JustDatabaseAdminScreen(onSeedDatabase: seedSample),
-      Positioned(
-        right: 16,
-        bottom: 16,
-        child: FloatingActionButton.extended(
-          onPressed: () async {
-            final log = await runTour();
-            if (!context.mounted) return;
-            await showDialog<void>(
-              context: context,
-              builder: (context) => AlertDialog(
-                title: const Text('API tour'),
-                content: SingleChildScrollView(child: Text(log.join('\n'))),
-                actions: [
-                  TextButton(
-                    onPressed: () => Navigator.of(context).pop(),
-                    child: const Text('Close'),
+  State<_Home> createState() => _HomeState();
+}
+
+class _HomeState extends State<_Home> {
+  bool _readOnly = false;
+
+  Future<void> _tour() async {
+    final log = await runTour();
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('API tour'),
+        content: SingleChildScrollView(child: Text(log.join('\n'))),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Column(
+      children: [
+        Material(
+          color: cs.surfaceContainerHighest,
+          child: SafeArea(
+            bottom: false,
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8),
+              child: Row(
+                children: [
+                  TextButton.icon(
+                    onPressed: _tour,
+                    icon: const Icon(Icons.play_arrow),
+                    label: const Text('Run the API tour'),
+                  ),
+                  const Spacer(),
+                  const Text('Read-only'),
+                  Switch(
+                    value: _readOnly,
+                    onChanged: (v) => setState(() => _readOnly = v),
                   ),
                 ],
               ),
-            );
-          },
-          icon: const Icon(Icons.play_arrow),
-          label: const Text('Run the tour'),
+            ),
+          ),
         ),
-      ),
-    ],
-  );
+        Expanded(
+          child: MediaQuery.removePadding(
+            context: context,
+            removeTop: true,
+            child: JustDatabaseAdminScreen(
+              readOnly: _readOnly,
+              onSeedDatabase: seedSample,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 }

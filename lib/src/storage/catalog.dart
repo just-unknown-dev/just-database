@@ -130,6 +130,7 @@ final class Catalog {
   void addTable(TableData table) {
     final key = table.name.toLowerCase();
     _tables[key] = table;
+    log.touch(table.name);
     _bump();
     log.record(() => _tables.remove(key));
   }
@@ -140,6 +141,7 @@ final class Catalog {
     final keys = _tables.keys.toList();
     final at = keys.indexOf(key);
     final t = _tables.remove(key)!;
+    log.touch(t.name);
     _bump();
     log.record(() => _reinsert(_tables, keys, at, key, t));
     return t;
@@ -154,6 +156,9 @@ final class Catalog {
     final at = keys.indexOf(oldKey);
     _tables.remove(oldKey);
     _tables[newKey] = table;
+    log
+      ..touch(oldName)
+      ..touch(table.name);
     _bump();
     log.record(() {
       _tables.remove(newKey);

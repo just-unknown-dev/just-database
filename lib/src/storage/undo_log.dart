@@ -15,6 +15,20 @@ final class UndoLog {
   /// before and after to tell whether anything changed.
   int mutations = 0;
 
+  final Set<String> _touched = {};
+
+  /// Notes that the rows or definition of [table] changed (for
+  /// `JustDatabase.changes`).
+  void touch(String table) => _touched.add(table);
+
+  /// The tables noted by [touch] since the last call, which forgets them.
+  /// Changes undone since are still listed.
+  Set<String> takeTouched() {
+    final touched = Set.of(_touched);
+    _touched.clear();
+    return touched;
+  }
+
   /// Whether changes are being recorded.
   bool get recording => _holds > 0;
 

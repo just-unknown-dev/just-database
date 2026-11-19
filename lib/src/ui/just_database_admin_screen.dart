@@ -1,26 +1,27 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:just_signals/just_signals.dart';
+import 'package:flutter/services.dart';
 
-import '../core/just_database.dart';
-import 'admin_utils.dart';
-import 'database_provider.dart';
-import 'tabs/databases_tab.dart';
-import 'tabs/query_editor_tab.dart';
-import 'tabs/schema_tab.dart';
-import 'tabs/settings_tab.dart';
+import 'admin_style.dart';
+import 'dialogs/backup_dialogs.dart';
+import 'dialogs/database_dialogs.dart';
+import 'just_database_admin_controller.dart';
+import 'pages/settings_page.dart';
+import 'shell/compact_pages.dart';
+import 'shell/sidebar.dart';
+import 'shell/workspace.dart';
 import 'widgets/admin_widgets.dart';
 
-/// Fills a database with sample data (the Databases tab's "Seed sample
-/// data" action).
-typedef SeedDatabaseCallback = Future<void> Function(JustDatabase db);
-
-/// The admin screen: lists every database of the app and lets you browse,
-/// edit, query, benchmark, create and delete them.
+/// The database workbench: every database of the app, their tables, views
+/// and triggers, a data browser and editor, a SQL console, schema editing,
+/// backups, encryption and benchmarks.
 ///
-/// It shows the databases the app has open (and uses those instances) as
-/// well as the saved ones. Use it as a page of its own:
+/// On a wide screen (840 logical pixels or more) it shows a sidebar of
+/// databases and objects beside the selected one's panes; on a phone the
+/// same pieces are pages you drill into. It shows the databases the app
+/// has open (sharing those instances) as well as the saved ones, and stays
+/// current while the app works.
 ///
 /// ```dart
 /// Navigator.push(context, MaterialPageRoute(
@@ -28,142 +29,140 @@ typedef SeedDatabaseCallback = Future<void> Function(JustDatabase db);
 /// ));
 /// ```
 ///
-/// or as `home`. The back button only appears when there is a page to go
-/// back to.
+/// Pass `readOnly: true` (or a read-only [controller]) for a screen that
+/// cannot change anything, such as a debug menu in a shipped game.
 class JustDatabaseAdminScreen extends StatefulWidget {
-  /// Creates the admin screen.
+  /// Creates the screen.
   const JustDatabaseAdminScreen({
     super.key,
+    this.controller,
+    this.readOnly = false,
     this.theme,
-    this.onSeedDatabase,
-    this.provider,
     this.title = 'Just Database',
+    this.onSeedDatabase,
   });
 
-  /// A theme for the screen and every page it opens; the app's theme when
-  /// null.
+  /// The state to show. When null the screen makes its own (with
+  /// [readOnly]) and disposes it, closing the databases it opened, when it
+  /// goes away.
+  final JustDatabaseAdminController? controller;
+
+  /// Whether the screen's own controller is read-only (a given
+  /// [controller] has its own setting).
+  final bool readOnly;
+
+  /// A theme for the screen and the pages and dialogs it opens; the app's
+  /// theme when null.
   final ThemeData? theme;
-
-  /// Adds a "Seed sample data" action to each database when given.
-  final SeedDatabaseCallback? onSeedDatabase;
-
-  /// The state to show. When null the screen makes its own and disposes it
-  /// (closing the databases it opened) when it goes away.
-  final DatabaseProvider? provider;
 
   /// The app bar title.
   final String title;
+
+  /// Adds a "Seed sample data" action to each database when given.
+  final SeedDatabaseCallback? onSeedDatabase;
 
   @override
   State<JustDatabaseAdminScreen> createState() =>
       _JustDatabaseAdminScreenState();
 }
 
-class _JustDatabaseAdminScreenState extends State<JustDatabaseAdminScreen>
-    with SingleTickerProviderStateMixin {
-  late final TabController _tabController = TabController(
-    length: 4,
-    vsync: this,
-  );
-  late DatabaseProvider _provider;
-  late bool _ownsProvider;
-
-  static const _tabs = [
-    Tab(icon: Icon(Icons.storage), text: 'Databases'),
-    Tab(icon: Icon(Icons.schema), text: 'Schema'),
-    Tab(icon: Icon(Icons.code), text: 'Query'),
-    Tab(icon: Icon(Icons.settings), text: 'Settings'),
-  ];
+class _JustDatabaseAdminScreenState extends State<JustDatabaseAdminScreen> {
+  late JustDatabaseAdminController _controller;
+  late bool _ownsController;
+  double _sidebarWidth = 290;
 
   @override
   void initState() {
     super.initState();
-    _attach(widget.provider);
+    _attach();
   }
 
-  void _attach(DatabaseProvider? provider) {
-    _ownsProvider = provider == null;
-    _provider = provider ?? DatabaseProvider();
-    unawaited(_provider.refreshDatabases());
+  void _attach() {
+    final given = widget.controller;
+    _ownsController = given == null;
+    _controller =
+        given ?? JustDatabaseAdminController(readOnly: widget.readOnly);
   }
 
   @override
   void didUpdateWidget(JustDatabaseAdminScreen oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.provider != widget.provider) {
-      if (_ownsProvider) unawaited(_provider.dispose());
-      _attach(widget.provider);
+    if (oldWidget.controller != widget.controller ||
+        (widget.controller == null && oldWidget.readOnly != widget.readOnly)) {
+      if (_ownsController) _controller.dispose();
+      _attach();
     }
   }
 
   @override
   void dispose() {
-    _tabController.dispose();
-    if (_ownsProvider) unawaited(_provider.dispose());
+    if (_ownsController) _controller.dispose();
     super.dispose();
   }
 
+  Future<void> _refresh(BuildContext context) async {
+    final ok = await _controller.refresh();
+    if (!ok && context.mounted) {
+      showAdminError(context, _controller.lastError ?? 'Refresh failed.');
+    }
+  }
+
+  List<Widget> _actions(BuildContext context) => [
+    if (_controller.isBusy)
+      const Padding(
+        padding: EdgeInsets.symmetric(horizontal: 14),
+        child: Center(
+          child: SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      )
+    else
+      IconButton(
+        key: const ValueKey('jdb-refresh'),
+        icon: const Icon(Icons.refresh),
+        tooltip: 'Refresh (F5)',
+        onPressed: () => _refresh(context),
+      ),
+    IconButton(
+      key: const ValueKey('jdb-settings'),
+      icon: const Icon(Icons.settings_outlined),
+      tooltip: 'Settings',
+      onPressed: () =>
+          pushAdminPage<void>(context, SettingsPage(controller: _controller)),
+    ),
+  ];
+
+  Widget _title(BuildContext context) => Row(
+    children: [
+      Flexible(child: Text(widget.title, overflow: TextOverflow.ellipsis)),
+      if (_controller.readOnly) ...[
+        const SizedBox(width: 10),
+        AdminTag.readOnly(context),
+      ],
+    ],
+  );
+
   @override
   Widget build(BuildContext context) {
-    final screen = SignalBuilder<int>(
-      signal: _provider.revision,
-      builder: (context, _, _) {
-        final db = _provider.currentDatabase;
-        return Scaffold(
-          appBar: AppBar(
-            title: Row(
-              children: [
-                Flexible(
-                  child: Text(widget.title, overflow: TextOverflow.ellipsis),
-                ),
-                if (db != null) ...[
-                  const SizedBox(width: 8),
-                  Flexible(
-                    child: _CurrentDatabaseChip(
-                      db: db,
-                      encrypted: _provider.isEncrypted(db.name),
-                    ),
-                  ),
-                ],
-              ],
+    final screen = LayoutBuilder(
+      builder: (context, constraints) {
+        final wide = constraints.maxWidth >= AdminStyle.wideBreakpoint;
+        return AdminLayoutScope(
+          wide: wide,
+          child: ListenableBuilder(
+            listenable: _controller,
+            builder: (context, _) => CallbackShortcuts(
+              bindings: {
+                const SingleActivator(LogicalKeyboardKey.f5): () =>
+                    unawaited(_refresh(context)),
+              },
+              child: wide
+                  ? _wide(context, constraints.maxWidth)
+                  : _compact(context),
             ),
-            actions: [
-              if (_provider.isLoading)
-                const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 16),
-                  child: Center(
-                    child: SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    ),
-                  ),
-                )
-              else
-                IconButton(
-                  icon: const Icon(Icons.refresh),
-                  tooltip: 'Refresh',
-                  onPressed: () => _refresh(context),
-                ),
-            ],
-            bottom: TabBar(
-              controller: _tabController,
-              tabs: _tabs,
-              indicatorSize: TabBarIndicatorSize.tab,
-            ),
-          ),
-          body: TabBarView(
-            controller: _tabController,
-            physics: const NeverScrollableScrollPhysics(),
-            children: [
-              DatabasesTab(
-                provider: _provider,
-                seedCallback: widget.onSeedDatabase,
-              ),
-              SchemaTab(provider: _provider),
-              QueryEditorTab(provider: _provider),
-              SettingsTab(provider: _provider),
-            ],
           ),
         );
       },
@@ -172,62 +171,84 @@ class _JustDatabaseAdminScreenState extends State<JustDatabaseAdminScreen>
     return theme == null ? screen : Theme(data: theme, child: screen);
   }
 
-  Future<void> _refresh(BuildContext context) async {
-    final ok = await _provider.refreshDatabases();
-    if (!ok && context.mounted) {
-      showAdminError(context, _provider.lastError ?? 'Refresh failed.');
-    }
+  Widget _wide(BuildContext context, double width) {
+    final sidebar = _sidebarWidth.clamp(220.0, width * 0.45);
+    return Scaffold(
+      appBar: AppBar(title: _title(context), actions: _actions(context)),
+      body: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          SizedBox(
+            width: sidebar,
+            child: DatabaseSidebar(
+              controller: _controller,
+              onSeed: widget.onSeedDatabase,
+            ),
+          ),
+          MouseRegion(
+            cursor: SystemMouseCursors.resizeColumn,
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onHorizontalDragUpdate: (d) => setState(() {
+                _sidebarWidth = (sidebar + d.delta.dx).clamp(
+                  220.0,
+                  width * 0.45,
+                );
+              }),
+              child: const VerticalDivider(width: 6, thickness: 1),
+            ),
+          ),
+          Expanded(
+            child: AdminWorkspace(
+              controller: _controller,
+              onSeed: widget.onSeedDatabase,
+            ),
+          ),
+        ],
+      ),
+    );
   }
-}
 
-class _CurrentDatabaseChip extends StatelessWidget {
-  const _CurrentDatabaseChip({required this.db, required this.encrypted});
-
-  final JustDatabase db;
-  final bool encrypted;
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Tooltip(
-      message:
-          '${db.name}: ${modeLabel(db.mode)} mode, '
-          '${db.persist ? 'saved' : 'in memory'}'
-          '${encrypted ? ', encrypted' : ''}',
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-        decoration: BoxDecoration(
-          color: cs.secondaryContainer,
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(
-              encrypted ? Icons.lock_outline : Icons.storage,
-              size: 14,
-              color: cs.onSecondaryContainer,
+  Widget _compact(BuildContext context) {
+    final c = _controller;
+    return Scaffold(
+      appBar: AppBar(
+        title: _title(context),
+        actions: [
+          if (!c.readOnly)
+            IconButton(
+              key: const ValueKey('jdb-import-database'),
+              tooltip: 'Import a database',
+              icon: const Icon(Icons.download_outlined),
+              onPressed: () => showImportDialog(context, c),
             ),
-            const SizedBox(width: 4),
-            Flexible(
-              child: Text(
-                db.name,
-                overflow: TextOverflow.ellipsis,
-                style: TextStyle(fontSize: 13, color: cs.onSecondaryContainer),
-              ),
-            ),
-            const SizedBox(width: 6),
-            Text(
-              modeShortLabel(db.mode),
-              style: TextStyle(
-                fontSize: 11,
-                fontWeight: FontWeight.bold,
-                color: cs.onSecondaryContainer,
-              ),
-            ),
-          ],
+          ..._actions(context),
+        ],
+      ),
+      body: SafeArea(
+        child: CompactDatabaseList(
+          controller: c,
+          onSeed: widget.onSeedDatabase,
         ),
       ),
+      floatingActionButton: c.readOnly
+          ? null
+          : FloatingActionButton.extended(
+              key: const ValueKey('jdb-new-database'),
+              onPressed: () async {
+                final name = await showCreateDatabaseDialog(context, c);
+                if (name != null && context.mounted) {
+                  await openCompactDatabase(
+                    context,
+                    c,
+                    name,
+                    onSeed: widget.onSeedDatabase,
+                  );
+                }
+              },
+              icon: const Icon(Icons.add),
+              label: const Text('New database'),
+            ),
     );
   }
 }

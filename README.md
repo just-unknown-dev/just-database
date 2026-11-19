@@ -3,7 +3,7 @@
 A SQL database for Flutter written in pure Dart: SQLite-style SQL over an
 in-memory engine, saved to a file (IndexedDB on the web) after every
 committed change, with optional AES-256-GCM encryption, migrations, backups,
-a typed ORM and an admin UI.
+a typed ORM and a database workbench UI.
 
 [![pub.dev](https://img.shields.io/pub/v/just_database.svg)](https://pub.dev/packages/just_database)
 [![License: BSD 3-Clause](https://img.shields.io/badge/License-BSD-blue.svg)](LICENSE)
@@ -21,6 +21,11 @@ a typed ORM and an admin UI.
   file + rename); nothing uncommitted ever reaches the file.
 * **Encryption**: AES-256-GCM with a PBKDF2-HMAC-SHA256 key (600 000
   iterations, random salt per file).
+* **Change events**: `db.changes` says which tables each committed
+  statement or transaction changed.
+* **A database workbench** (`package:just_database/ui.dart`): browse and
+  edit rows, edit schemas, a SQL console, backups and encryption, laid
+  out for desktops and for phones.
 * Runs everywhere Flutter does: Android, iOS, macOS, Windows, Linux and the
   web (JS and WASM). No native code.
 
@@ -112,6 +117,7 @@ A `QueryResult` has:
 | `values` | rows as lists, in column order |
 | `scalar` | first column of the first row (`SELECT COUNT(*) …`) |
 | `affectedRows`, `lastInsertRowId` | for `INSERT`/`UPDATE`/`DELETE` |
+| `elapsed` | how long the engine took to run it |
 | `orThrow()` | the result, or throws its error |
 
 Values come back as SQL stores them: `int`, `double`, `String`,
@@ -119,8 +125,9 @@ Values come back as SQL stores them: `int`, `double`, `String`,
 holds text. The ORM's [row helpers](#orm) convert them.
 
 Introspection: `tableNames`, `viewNames`, `triggerNames`,
-`getTableSchema(table)`, `indexesForTable(table)`, `rowCount(table)`,
-`totalRows`, `estimatedSizeBytes`.
+`getTableSchema(table)`, `getViewSql(view)`, `getTriggerSql(trigger)`,
+`triggerNamesForTable(table)`, `indexesForTable(table)`,
+`rowCount(table)`, `totalRows`, `estimatedSizeBytes`.
 
 ## Transactions
 
@@ -180,8 +187,20 @@ Pass `persist: false` for a database that is never saved.
 | `DatabaseMode.readFast` | a `SELECT` does not queue behind writes called before it |
 | `DatabaseMode.writeFast` | saves are batched (at most one per `JustDatabase.writeFastDelay`, 250 ms); `flush()` to save now |
 
+`db.changes` is a stream of what changed: a `DatabaseChange` (the
+`tables` touched, and whether the schema changed) after each statement,
+script or committed transaction, and nothing for a rollback. Statements
+run together send one event.
+
+```dart
+db.changes.listen((change) {
+  if (change.touches('scores')) refreshLeaderboard();
+});
+```
+
 `DatabaseManager` opens, lists (`listDatabases()`), closes and deletes
-databases by name; the admin UI uses it.
+databases by name; `DatabaseManager.listChanges` fires when a database
+is opened, closed, deleted or encrypted. The admin UI uses both.
 
 ## Encryption
 
@@ -407,23 +426,48 @@ await db.from('users').whereEquals('id', 3).update({'name': 'Bo'});
 ```dart
 import 'package:just_database/ui.dart';
 
-MaterialApp(home: const JustDatabaseAdminScreen());
+Navigator.push(context, MaterialPageRoute(
+  builder: (_) => const JustDatabaseAdminScreen(),
+));
 ```
 
-A screen to create, open, browse (paged), edit, insert into, query,
-benchmark and delete databases. Databases your app already opened appear
-there and are used as they are, never opened twice. Rows are edited and
-deleted by rowid with bound values. It is only in
-`package:just_database/ui.dart`; the main library has no UI.
+A database workbench for your app, only in `package:just_database/ui.dart`
+(the main library has no UI). On a wide screen it shows a sidebar of
+databases, tables, views and triggers beside the selected one's panes; on a
+phone the same pieces are pages you drill into.
 
-`JustDatabaseAdminScreen({theme, onSeedDatabase, provider, title})` takes a
-theme for the screen and every page it opens, an optional seeding callback
-(adds a "Seed sample data" action), and a `DatabaseProvider` when you want
-to drive it yourself. `DatabaseDetailPage`, `InsertPage`, `BenchmarkPage`
-and the four tabs are exported too.
+* **Data**: browse a table or view a page at a time; search every column or
+  filter with a `WHERE` expression; sort by a header; resize columns; edit
+  a cell in place (double-click or F2) or a row in a side panel; view long
+  text, JSON and BLOBs in full; select and delete rows; export rows as CSV
+  or JSON.
+* **Structure**: columns, keys, checks, indexes, triggers, and the tables
+  that reference this one; add, rename and drop columns; create and drop
+  indexes; rename, empty and drop tables; a designer for new tables with a
+  live SQL preview.
+* **SQL console**: highlighting, completion of tables and columns (Tab),
+  Ctrl+Enter runs the selection or everything and Ctrl+Shift+Enter the
+  statement at the caret; one result per statement with its time; the
+  line and column of an error; a field per `?` or `:name` parameter;
+  history and snippets kept between runs, and templates from the schema.
+* **Databases**: create (plain, with a random key, or with a passphrase),
+  open (asking for a passphrase when needed), close, change the mode,
+  duplicate, export and import (SQL or JSON: copy, a file, or a browser
+  download), encrypt, re-key or decrypt, save now, benchmark, delete.
+* It lists the databases your app has open (and uses those instances) as
+  well as the saved ones, and stays current while the app writes.
 
-Name new databases with `JustDatabase.nameProblem(name)` to check them
-first (null means the name is fine).
+`JustDatabaseAdminScreen({controller, readOnly, theme, title,
+onSeedDatabase})`: `readOnly: true` hides everything that writes (the
+console then only runs reads), which suits a debug menu in a shipped game;
+`onSeedDatabase` adds a "Seed sample data" action. Pass a
+`JustDatabaseAdminController` to share the state between screens or to
+choose what is shown (`selectDatabase(name)`); unless you turn
+`rememberSettings` off, its settings, SQL history and snippets are kept
+with just_storage.
+
+Check names for new databases with `JustDatabase.nameProblem(name)` (null
+means the name is fine).
 
 ## Benchmarks
 

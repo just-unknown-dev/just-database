@@ -17,7 +17,7 @@ layer or below (checked by `test/library_layout_test.dart`):
 | 2 | `io`, `web` | the platform stores: files with `dart:io`, IndexedDB and WebCrypto with `package:web` |
 | 3 | `core` | `JustDatabase`, `DatabaseManager`, migrations, the query builder, `SecureKeyManager` |
 | 4 | `orm`, `benchmark` | `DbTable`, benchmarks |
-| 5 | `ui` | the admin UI (only exported by `ui.dart`) |
+| 5 | `ui` | the admin workbench (only exported by `ui.dart`) |
 
 `lib/just_database.dart` exports the public API of layers 0–4;
 `lib/ui.dart` exports the UI.
@@ -183,3 +183,32 @@ POSIX systems (file locks there belong to the process).
 * Renames rewrite stored SQL by tokens; a name reused for something else in
   a trigger can be renamed with it.
 * Integers are 64-bit on native platforms and 53-bit on the web.
+
+## The admin workbench
+
+`lib/src/ui` holds the screen (`just_database_admin_screen.dart`) and its
+state (`just_database_admin_controller.dart`, a `ChangeNotifier`); every
+other file is internal.
+
+* The controller lists databases (`DatabaseManager.listDatabases`), holds
+  the selection (`AdminSelection`: a database, maybe a table, view or
+  trigger, and a pane), the databases it opened itself (closed on
+  `dispose`), passphrases typed this session, per-pane state that survives
+  switching panes (`paneState`), and the settings, history and snippets
+  (`AdminPreferences`, kept with just_storage). It listens to
+  `DatabaseManager.listChanges` and to each open database's `changes`, so
+  the screen follows what the app does.
+* The screen picks a layout from its own width (`AdminLayoutScope`, 840
+  logical pixels): `shell/sidebar.dart` and `shell/workspace.dart` side by
+  side, or `shell/compact_pages.dart` as pushed pages, which remove
+  themselves when the window grows wide.
+* The panes (`panes/`) are the same in both layouts: `OverviewPane`,
+  `DataPane` (queries go through `query()`, so a filter can never write;
+  rows are addressed by rowid), `StructurePane` and `SqlConsole`.
+  Dialogs that change things live in `dialogs/`.
+* SQL text helpers (`sql_text.dart`) reuse the engine's lexer for
+  highlighting, statement splitting (trigger bodies stay whole) and
+  completion.
+* Files are saved and read through `io/exports.dart` or `web/exports.dart`
+  (a conditional import): a folder in Downloads (or Documents) natively, a
+  download and a file picker in the browser. No plugin is needed.

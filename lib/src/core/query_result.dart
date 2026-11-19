@@ -13,6 +13,7 @@ final class QueryResult {
     this.affectedRows,
     this.lastInsertRowId,
     this.error,
+    this.elapsed,
   );
 
   /// A successful result.
@@ -21,6 +22,7 @@ final class QueryResult {
     List<List<Object?>> values = const [],
     int affectedRows = 0,
     int? lastInsertRowId,
+    Duration elapsed = Duration.zero,
   }) => QueryResult._(
     List.unmodifiable(columns),
     List.unmodifiable([
@@ -29,11 +31,14 @@ final class QueryResult {
     affectedRows,
     lastInsertRowId,
     null,
+    elapsed,
   );
 
   /// A failed result.
-  factory QueryResult.failure(SqlException error) =>
-      QueryResult._(const [], const [], 0, null, error);
+  factory QueryResult.failure(
+    SqlException error, {
+    Duration elapsed = Duration.zero,
+  }) => QueryResult._(const [], const [], 0, null, error, elapsed);
 
   /// The result column names, unique: a repeated name gets `:1`, `:2`, …
   /// (`SELECT a.id, b.id` gives `id` and `id:1`).
@@ -50,6 +55,11 @@ final class QueryResult {
 
   /// Why the statement failed; null on success.
   final SqlException? error;
+
+  /// How long the engine took to run the statement (not counting the wait
+  /// for statements queued before it). Zero when it never ran, such as a
+  /// statement that did not parse.
+  final Duration elapsed;
 
   /// The rows as maps from column name to value.
   late final List<Map<String, Object?>> rows = List.unmodifiable([

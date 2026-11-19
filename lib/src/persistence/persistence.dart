@@ -4,5 +4,6 @@ library;
 
 export 'codec.dart';
 export 'crypto.dart';
+export 'export_file.dart';
 export 'sql_dump.dart';
 export 'store.dart';

@@ -1,6 +1,7 @@
 /// Formatting and validation helpers shared by the admin UI.
 library;
 
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart' show internal;
@@ -136,3 +137,70 @@ IconData modeIcon(DatabaseMode mode) => switch (mode) {
   DatabaseMode.readFast => Icons.menu_book_outlined,
   DatabaseMode.writeFast => Icons.edit_note,
 };
+
+/// A value as text for the clipboard: in full, BLOBs as `X'…'`.
+@internal
+String clipboardText(Object? value) => switch (value) {
+  null => 'NULL',
+  Uint8List() => "X'${hexOfBytes(value)}'",
+  double() => _formatDouble(value),
+  _ => '$value',
+};
+
+/// [rows] under [columns] as CSV (RFC 4180, CRLF line ends): NULL is an
+/// empty field, a BLOB is hex.
+@internal
+String rowsToCsv(List<String> columns, List<List<Object?>> rows) {
+  String field(Object? v) {
+    final text = switch (v) {
+      null => '',
+      Uint8List() => hexOfBytes(v),
+      double() => _formatDouble(v),
+      _ => '$v',
+    };
+    final needsQuotes =
+        text.contains(',') ||
+        text.contains('"') ||
+        text.contains('\n') ||
+        text.contains('\r');
+    return needsQuotes ? '"${text.replaceAll('"', '""')}"' : text;
+  }
+
+  final b = StringBuffer()..write(columns.map(field).join(','));
+  for (final r in rows) {
+    final fields = [
+      for (var i = 0; i < columns.length; i++)
+        field(i < r.length ? r[i] : null),
+    ];
+    b
+      ..write('\r\n')
+      ..write(fields.join(','));
+  }
+  return b.toString();
+}
+
+/// [rows] under [columns] as a JSON array of objects. A BLOB is
+/// `{"$blob": base64}`; an infinite or NaN real is a string.
+@internal
+String rowsToJson(List<String> columns, List<List<Object?>> rows) {
+  Object? json(Object? v) => switch (v) {
+    Uint8List() => {r'$blob': base64Encode(v)},
+    double() when !v.isFinite => _formatDouble(v),
+    _ => v,
+  };
+  return const JsonEncoder.withIndent('  ').convert([
+    for (final r in rows)
+      {
+        for (var i = 0; i < columns.length; i++)
+          columns[i]: json(i < r.length ? r[i] : null),
+      },
+  ]);
+}
+
+/// A file name for an export of [name]: `name-20261120-1530.ext`.
+@internal
+String exportFileName(String name, String extension, [DateTime? at]) {
+  final t = at ?? DateTime.now();
+  String two(int v) => v.toString().padLeft(2, '0');
+  return '$name-${t.year}${two(t.month)}${two(t.day)}-${two(t.hour)}${two(t.minute)}${two(t.second)}.$extension';
+}

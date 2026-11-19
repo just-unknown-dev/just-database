@@ -1,3 +1,7 @@
+import 'dart:async';
+
+import 'package:flutter/foundation.dart' show internal;
+
 import '../persistence/crypto.dart' show looksEncrypted;
 import '../persistence/store.dart';
 import 'database_mode.dart';
@@ -51,6 +55,17 @@ final class DatabaseInfo {
 /// `JustDatabase.open` stays open for the app.
 abstract final class DatabaseManager {
   static final Map<String, JustDatabase> _held = {};
+  static final StreamController<void> _listChanges =
+      StreamController<void>.broadcast();
+
+  /// An event whenever a database is opened, closed, deleted or encrypted
+  /// in this app, so a list of databases can refresh itself. Events come
+  /// asynchronously.
+  static Stream<void> get listChanges => _listChanges.stream;
+
+  /// Sends a [listChanges] event.
+  @internal
+  static void notifyListChanged() => _listChanges.add(null);
   // A fresh store each time: it resolves the storage directory anew.
   static DatabaseStore get _store => createPlatformStore();
 
@@ -155,6 +170,7 @@ abstract final class DatabaseManager {
     final open = JustDatabase.findOpen(name);
     if (open != null) await open.closeAll();
     await _store.delete(name);
+    notifyListChanged();
   }
 
   /// Deletes every database this app saved (and closes the open ones).
@@ -169,5 +185,6 @@ abstract final class DatabaseManager {
       if (open != null) await open.closeAll();
       if (open == null || open.persist) await _store.delete(name);
     }
+    notifyListChanged();
   }
 }

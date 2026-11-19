@@ -27,7 +27,6 @@ dependencies:
   flutter:
     sdk: flutter
   crypto: ^3.0.3
-  just_signals: ^2.0.0
   just_storage: ^2.0.0
   path_provider: ^2.1.5
   # 3.x too, so apps that pin pointycastle 3 can still use this package.
