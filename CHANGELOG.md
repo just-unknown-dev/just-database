@@ -1,6 +1,6 @@
 ﻿# Changelog
 
-## [2.0.0] - Unreleased
+## [2.0.0] - 2026-11-20
 
 A new SQL engine that follows SQLite, new persistence, and a tidier API.
 Every 1.x database file still opens. See [MIGRATION.md](MIGRATION.md).
@@ -72,7 +72,8 @@ Every 1.x database file still opens. See [MIGRATION.md](MIGRATION.md).
 - `JustDatabase.changes`: a `DatabaseChange` (tables touched, schema
   changed) after each committed statement, script or transaction;
   `DatabaseManager.listChanges` when a database is opened, closed,
-  deleted or encrypted. `QueryResult.elapsed`.
+  deleted or encrypted, or another opener starts or stops using an open
+  one. `QueryResult.elapsed`.
 - The admin workbench: a sidebar and panes on wide screens, drill-down
   pages on phones; a data browser with search, `WHERE` filters,
   sorting, resizable columns, in-place editing, a side-panel row
@@ -84,9 +85,15 @@ Every 1.x database file still opens. See [MIGRATION.md](MIGRATION.md).
   random key or a passphrase, open with a passphrase, close, change
   mode, duplicate, export/import as files or downloads, encryption,
   save now, benchmark); a `readOnly` mode; live updates; its own look
-  (black and grey with coral accents), dark by default, with light and the device's setting a click away
-  (or the app's colours through `theme:`); settings kept with
-  just_storage.
+  (black and grey with coral accents), dark by default, with light and
+  the device's setting a click away (or the app's colours through
+  `theme:`); settings kept with just_storage.
+- The workbench in Flutter DevTools: a **just_database** tab, on the
+  databases of an app running in a debug build (phones and emulators
+  too). The app registers one Dart VM service extension when it opens its
+  first database and does no work for it until the tab connects;
+  `JustDatabase.debugDevToolsWorkbench = false` turns it off. Release and
+  profile builds have none of it.
 - A new saved database is written at once, so it exists (and is listed)
   before its first change.
 - Opening an open database returns the same instance (reference-counted

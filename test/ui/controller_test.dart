@@ -6,10 +6,12 @@ import 'dart:convert';
 import 'package:flutter/material.dart' show ThemeMode;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:just_database/just_database.dart';
+import 'package:just_database/src/core/workbench_service.dart'
+    show AdminEncryption;
 import 'package:just_database/src/ui/admin_preferences.dart';
 import 'package:just_database/src/ui/admin_selection.dart';
 import 'package:just_database/src/ui/just_database_admin_controller.dart'
-    show AdminEncryption, BackupFormat;
+    show BackupFormat;
 import 'package:just_database/ui.dart';
 
 import 'ui_test_support.dart';
@@ -20,7 +22,7 @@ Future<JustDatabaseAdminController> _controller({
   bool remember = false,
   bool persistByDefault = true,
 }) async {
-  final c = JustDatabaseAdminController(
+  final c = testController(
     readOnly: readOnly,
     rememberSettings: remember,
     persistByDefault: persistByDefault,
@@ -63,7 +65,9 @@ void main() {
       expect(c.infoFor(app.name)?.isOpen, isTrue);
 
       expect(await c.selectDatabase(saved), isTrue);
-      final db = c.database!;
+      final db = JustDatabase.findOpen(saved)!;
+      // A workbench connected to another app has no JustDatabase of its own.
+      expect(c.database, remoteWorkbench ? isNull : same(db));
       expect(db.persist, isTrue, reason: 'a saved database opens from storage');
       expect(db.rowCount('notes'), 2);
       expect(c.opened(saved), isTrue);
@@ -108,7 +112,8 @@ void main() {
       c.dispose();
       await _until(() => JustDatabase.findOpen(name) == null);
       await DatabaseManager.deleteDatabase(name);
-    });
+      // Four passphrase key derivations (600 000 rounds each).
+    }, timeout: const Timeout(Duration(minutes: 3)));
   });
 
   group('creating', () {
@@ -130,7 +135,8 @@ void main() {
       final c = await _controller();
       final mem = uniqueName('mem');
       expect(await c.create(mem, persist: false), isTrue);
-      expect(c.database!.persist, isFalse);
+      expect(JustDatabase.findOpen(mem)!.persist, isFalse);
+      expect(c.shown!.persist, isFalse);
       expect(c.selection, AdminSelection(mem));
 
       final keyed = uniqueName('keyed');
@@ -179,7 +185,7 @@ void main() {
       expect(db.mode, DatabaseMode.writeFast);
 
       final app = await JustDatabase.open(name, mode: DatabaseMode.writeFast);
-      expect(c.canChangeMode(name), isFalse);
+      await _until(() => !c.canChangeMode(name), reason: 'the app uses it too');
       expect(await c.reopen(name, DatabaseMode.standard), isFalse);
       await app.close();
       c.dispose();

@@ -6,9 +6,8 @@ library;
 import 'package:flutter/foundation.dart' show internal;
 import 'package:flutter/material.dart';
 
+import '../../core/workbench_service.dart' show AdminEncryption;
 import '../../core/database_mode.dart';
-import '../../core/just_database.dart';
-import '../../core/secure_key_manager.dart';
 import '../admin_selection.dart';
 import '../admin_style.dart';
 import '../admin_utils.dart';
@@ -44,7 +43,7 @@ List<PopupMenuEntry<DatabaseAction>> databaseMenuItems(
   String name, {
   required bool canSeed,
 }) {
-  final db = JustDatabase.findOpen(name);
+  final db = controller.findOpen(name);
   final info = controller.infoFor(name);
   final writable = !controller.readOnly;
   final persisted = db?.persist ?? info?.isPersisted ?? false;
@@ -142,7 +141,7 @@ Future<void> runDatabaseAction(
         );
       }
     case DatabaseAction.changeMode:
-      final db = JustDatabase.findOpen(name);
+      final db = controller.findOpen(name);
       final mode = await showModeDialog(
         context,
         title: 'Mode of "$name"',
@@ -159,7 +158,7 @@ Future<void> runDatabaseAction(
         );
       }
     case DatabaseAction.newTable:
-      final db = JustDatabase.findOpen(name);
+      final db = controller.findOpen(name);
       if (db == null) return;
       final table = await showCreateTableDialog(context, db);
       if (table != null && context.mounted) {
@@ -199,7 +198,10 @@ Future<void> runDatabaseAction(
     case DatabaseAction.benchmark:
       await pushAdminPage<void>(
         context,
-        BenchmarkPage(database: JustDatabase.findOpen(name)),
+        BenchmarkPage(
+          host: controller.host,
+          database: controller.findOpen(name),
+        ),
       );
     case DatabaseAction.seed:
       final seed = onSeed;
@@ -225,7 +227,7 @@ Future<void> confirmAndDelete(
   JustDatabaseAdminController controller,
   String name,
 ) async {
-  final open = JustDatabase.findOpen(name) != null;
+  final open = controller.findOpen(name) != null;
   final mine = controller.opened(name);
   final confirmed = await confirmAction(
     context,
@@ -278,7 +280,7 @@ Future<bool> selectWithPrompt(
   JustDatabaseAdminController controller,
   AdminSelection selection,
 ) async {
-  if (JustDatabase.findOpen(selection.database) == null &&
+  if (controller.findOpen(selection.database) == null &&
       !await openWithPrompt(context, controller, selection.database)) {
     return false;
   }
@@ -794,7 +796,7 @@ class _DuplicateDialogState extends State<_DuplicateDialog> {
 
   @override
   Widget build(BuildContext context) {
-    final db = JustDatabase.findOpen(widget.source);
+    final db = widget.controller.findOpen(widget.source);
     final inMemory = db != null && !db.persist;
     return AdminDialog(
       title: 'Duplicate "${widget.source}"',
@@ -907,7 +909,7 @@ class _EncryptionDialogState extends State<_EncryptionDialog> {
     if (encrypted) {
       var auto = false;
       try {
-        auto = await SecureKeyManager.hasAutoKey(dbName: widget.name);
+        auto = await widget.controller.host.hasStoredKey(widget.name);
       } catch (_) {}
       current = auto ? AdminEncryption.randomKey : AdminEncryption.passphrase;
     }

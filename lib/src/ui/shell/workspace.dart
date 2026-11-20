@@ -6,7 +6,6 @@ library;
 import 'package:flutter/foundation.dart' show internal;
 import 'package:flutter/material.dart';
 
-import '../../core/just_database.dart';
 import '../admin_selection.dart';
 import '../admin_style.dart';
 import '../dialogs/database_dialogs.dart';
@@ -17,12 +16,13 @@ import '../panes/overview_pane.dart';
 import '../panes/sql_console.dart';
 import '../panes/structure_pane.dart';
 import '../widgets/admin_widgets.dart';
+import '../backend/admin_backend.dart';
 
 /// The pane for [selection] of the open [database].
 @internal
 Widget paneFor(
   JustDatabaseAdminController controller,
-  JustDatabase database,
+  AdminDatabase database,
   AdminSelection selection, {
   SeedDatabaseCallback? onSeed,
 }) {
@@ -98,7 +98,7 @@ class AdminWorkspace extends StatelessWidget {
             'its overview.',
       );
     }
-    final db = JustDatabase.findOpen(sel.database);
+    final db = c.findOpen(sel.database);
     if (db == null) {
       return EmptyState(
         icon: Icons.storage,
@@ -130,7 +130,7 @@ class _Header extends StatelessWidget {
   });
 
   final JustDatabaseAdminController controller;
-  final JustDatabase database;
+  final AdminDatabase database;
   final AdminSelection selection;
   final SeedDatabaseCallback? onSeed;
 

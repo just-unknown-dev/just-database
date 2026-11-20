@@ -6,13 +6,13 @@ library;
 import 'package:flutter/foundation.dart' show internal;
 import 'package:flutter/material.dart';
 
-import '../../core/just_database.dart';
 import '../../storage/schema.dart';
 import '../admin_style.dart';
 import '../admin_utils.dart';
 import '../sql_text.dart';
 import '../widgets/admin_widgets.dart';
 import '../widgets/column_input.dart';
+import '../backend/admin_backend.dart';
 
 /// Shows the row editor for [table] in a dialog (full screen on phones):
 /// an insert when [rowid] is null, else an edit of the row whose visible
@@ -20,7 +20,7 @@ import '../widgets/column_input.dart';
 @internal
 Future<bool> showRowEditorDialog(
   BuildContext context,
-  JustDatabase db,
+  AdminDatabase db,
   String table, {
   int? rowid,
   List<Object?>? values,
@@ -67,7 +67,7 @@ class RowEditor extends StatefulWidget {
     required this.onDone,
   });
 
-  final JustDatabase db;
+  final AdminDatabase db;
   final String table;
   final int? rowid;
   final List<Object?>? values;

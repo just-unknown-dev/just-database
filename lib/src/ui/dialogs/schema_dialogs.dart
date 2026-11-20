@@ -6,7 +6,6 @@ library;
 import 'package:flutter/foundation.dart' show internal;
 import 'package:flutter/material.dart';
 
-import '../../core/just_database.dart';
 import '../../storage/schema.dart';
 import '../admin_selection.dart';
 import '../admin_style.dart';
@@ -17,13 +16,14 @@ import '../sql_text.dart';
 import '../widgets/admin_widgets.dart';
 import 'backup_dialogs.dart';
 import 'row_editor.dart';
+import '../backend/admin_backend.dart';
 
 /// Runs one statement that changes [db] and reports a failure (and
 /// [success], when given). Returns whether it worked.
 @internal
 Future<bool> runSchemaSql(
   BuildContext context,
-  JustDatabase db,
+  AdminDatabase db,
   String sql, {
   String? success,
 }) async {
@@ -39,7 +39,7 @@ Future<bool> runSchemaSql(
 
 /// Why [name] cannot name a new table, view or index of [db], or null.
 @internal
-String? newObjectNameProblem(JustDatabase db, String name) {
+String? newObjectNameProblem(AdminDatabase db, String name) {
   if (name.trim().isEmpty) return 'Enter a name.';
   if (name != name.trim()) return 'No spaces at the start or end.';
   final lower = name.toLowerCase();
@@ -163,7 +163,7 @@ List<PopupMenuEntry<ObjectAction>> objectMenuItems(
 
 /// The `CREATE` statement of an object.
 @internal
-String? createSqlOf(JustDatabase db, AdminObjectKind kind, String name) =>
+String? createSqlOf(AdminDatabase db, AdminObjectKind kind, String name) =>
     switch (kind) {
       AdminObjectKind.table => db.getTableSchema(name)?.sql,
       AdminObjectKind.view => db.getViewSql(name),
@@ -175,7 +175,7 @@ String? createSqlOf(JustDatabase db, AdminObjectKind kind, String name) =>
 Future<void> runObjectAction(
   BuildContext context,
   JustDatabaseAdminController controller,
-  JustDatabase db,
+  AdminDatabase db,
   AdminObjectKind kind,
   String name,
   ObjectAction action,
@@ -389,7 +389,7 @@ class _ColumnDraftEditor extends StatelessWidget {
   });
 
   final _ColumnDraft draft;
-  final JustDatabase db;
+  final AdminDatabase db;
   final VoidCallback onChanged;
   final int index;
   final VoidCallback? onRemove;
@@ -625,7 +625,7 @@ class _ColumnDraftEditor extends StatelessWidget {
 @internal
 Future<String?> showCreateTableDialog(
   BuildContext context,
-  JustDatabase db, {
+  AdminDatabase db, {
   JustDatabaseAdminController? controller,
 }) => showDialog<String>(
   context: context,
@@ -635,7 +635,7 @@ Future<String?> showCreateTableDialog(
 class _CreateTableDialog extends StatefulWidget {
   const _CreateTableDialog({required this.db, required this.controller});
 
-  final JustDatabase db;
+  final AdminDatabase db;
   final JustDatabaseAdminController? controller;
 
   @override
@@ -843,7 +843,7 @@ class _CreateTableDialogState extends State<_CreateTableDialog> {
 @internal
 Future<bool> showAddColumnDialog(
   BuildContext context,
-  JustDatabase db,
+  AdminDatabase db,
   String table,
 ) async =>
     await showDialog<bool>(
@@ -855,7 +855,7 @@ Future<bool> showAddColumnDialog(
 class _AddColumnDialog extends StatefulWidget {
   const _AddColumnDialog({required this.db, required this.table});
 
-  final JustDatabase db;
+  final AdminDatabase db;
   final String table;
 
   @override
@@ -971,7 +971,7 @@ class _AddColumnDialogState extends State<_AddColumnDialog> {
 @internal
 Future<bool> showCreateIndexDialog(
   BuildContext context,
-  JustDatabase db,
+  AdminDatabase db,
   String table,
 ) async =>
     await showDialog<bool>(
@@ -983,7 +983,7 @@ Future<bool> showCreateIndexDialog(
 class _CreateIndexDialog extends StatefulWidget {
   const _CreateIndexDialog({required this.db, required this.table});
 
-  final JustDatabase db;
+  final AdminDatabase db;
   final String table;
 
   @override
@@ -1161,7 +1161,7 @@ class _CreateIndexDialogState extends State<_CreateIndexDialog> {
 @internal
 Future<void> renameColumn(
   BuildContext context,
-  JustDatabase db,
+  AdminDatabase db,
   String table,
   String column,
 ) async {
@@ -1196,7 +1196,7 @@ Future<void> renameColumn(
 @internal
 Future<void> dropColumn(
   BuildContext context,
-  JustDatabase db,
+  AdminDatabase db,
   String table,
   String column,
 ) async {
@@ -1223,7 +1223,7 @@ Future<void> dropColumn(
 @internal
 Future<void> dropIndex(
   BuildContext context,
-  JustDatabase db,
+  AdminDatabase db,
   IndexInfo index,
 ) async {
   if (!await confirmAction(

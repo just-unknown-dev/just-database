@@ -58,7 +58,7 @@ class ExampleApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => MaterialApp(
-    title: 'just_database example',
+    title: 'Just Database example',
     theme: ThemeData(colorSchemeSeed: Colors.indigo),
     darkTheme: ThemeData(
       colorSchemeSeed: Colors.indigo,

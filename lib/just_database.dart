@@ -11,7 +11,6 @@
 /// The admin UI is in `package:just_database/ui.dart`.
 library;
 
-export 'src/benchmark/benchmark.dart';
 export 'src/core/core.dart';
 export 'src/orm/orm.dart';
 export 'src/sql/sql.dart';

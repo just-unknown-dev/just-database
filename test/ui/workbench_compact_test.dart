@@ -25,10 +25,7 @@ Future<JustDatabase> _people(String prefix) async {
 
 Future<JustDatabaseAdminController> _pump(WidgetTester tester) async {
   useLargeWindow(tester, size: _phone);
-  final c = JustDatabaseAdminController(
-    rememberSettings: false,
-    persistByDefault: false,
-  );
+  final c = testController(persistByDefault: false);
   await tester.pumpWidget(
     MaterialApp(home: JustDatabaseAdminScreen(controller: c)),
   );

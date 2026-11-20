@@ -461,9 +461,10 @@ phone the same pieces are pages you drill into.
 * It lists the databases your app has open (and uses those instances) as
   well as the saved ones, and stays current while the app writes.
 * **Its own look**: black and grey with coral accents, dark by default,
-  in the app's font. The user can switch to light or the device's setting (the sun and
-  moon button, or Settings). Pass `theme:` for your own colours; a theme
-  without the brightness picked is remade in it from its colours.
+  in the app's font. The user can switch to light or the device's setting
+  (the sun and moon button, or Settings). Pass `theme:` for your own
+  colours; a theme without the brightness picked is remade in it from its
+  colours.
 
 ![The workbench in light mode: a parameterised query with highlighting and its results in the SQL console](assets/screenshots/workbench_desktop_light.png)
 
@@ -479,6 +480,28 @@ with just_storage.
 
 Check names for new databases with `JustDatabase.nameProblem(name)` (null
 means the name is fine).
+
+### The workbench in Flutter DevTools
+
+While your app runs in a debug build, the same workbench is a tab in
+Flutter DevTools, on the app's databases. Open DevTools from the link
+`flutter run` prints (or run "Dart: Open DevTools" in VS Code) and choose
+**just_database**; DevTools asks once whether to enable it. It works for
+apps on phones and emulators too, and you add nothing to your app.
+
+* It does what the in-app screen does, from your browser: the databases
+  the app has open and the saved ones, kept current as the app writes;
+  editing, the SQL console, structure changes, import and export,
+  encryption (random keys never leave the app) and benchmarks, which run on
+  the device.
+* The console says so when the app opens its first database.
+* Release and profile builds have none of it. In a debug build it is one
+  service extension on the Dart VM service: nothing runs on the app's
+  writes until the workbench connects, and the app stops watching when it
+  disconnects. While it is connected, each change sends a summary of the
+  schema and row counts, and each page of rows travels as JSON.
+* `JustDatabase.debugDevToolsWorkbench = false`, before the first database
+  opens, turns it off.
 
 ## Benchmarks
 

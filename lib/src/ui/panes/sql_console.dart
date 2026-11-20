@@ -8,7 +8,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import '../../core/just_database.dart';
 import '../../core/query_result.dart';
 import '../../sql/parser.dart';
 import '../../sql/sql_exception.dart';
@@ -23,6 +22,7 @@ import '../just_database_admin_controller.dart';
 import '../sql_text.dart';
 import '../widgets/admin_widgets.dart';
 import '../widgets/result_grid.dart';
+import '../backend/admin_backend.dart';
 
 /// One statement's outcome in the console.
 @internal
@@ -151,7 +151,7 @@ class SqlConsole extends StatefulWidget {
   });
 
   final JustDatabaseAdminController controller;
-  final JustDatabase database;
+  final AdminDatabase database;
 
   @override
   State<SqlConsole> createState() => _SqlConsoleState();
@@ -168,7 +168,7 @@ class _SqlConsoleState extends State<SqlConsole> {
   String? _paramProblem;
   String? _lastText;
 
-  JustDatabase get _db => widget.database;
+  AdminDatabase get _db => widget.database;
   JustDatabaseAdminController get _c => widget.controller;
 
   @override

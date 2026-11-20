@@ -10,7 +10,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../../core/database_change.dart';
-import '../../core/just_database.dart';
 import '../../core/query_result.dart';
 import '../../storage/schema.dart';
 import '../admin_preferences.dart';
@@ -24,6 +23,7 @@ import '../sql_text.dart';
 import '../widgets/admin_widgets.dart';
 import '../widgets/column_input.dart';
 import '../widgets/result_grid.dart';
+import '../backend/admin_backend.dart';
 
 /// What the data pane of one table keeps between visits.
 @internal
@@ -54,7 +54,7 @@ class DataPane extends StatefulWidget {
   });
 
   final JustDatabaseAdminController controller;
-  final JustDatabase database;
+  final AdminDatabase database;
   final String object;
   final bool isView;
 
@@ -87,7 +87,7 @@ class _DataPaneState extends State<DataPane> {
   StreamSubscription<DatabaseChange>? _sub;
   Timer? _reloadTimer;
 
-  JustDatabase get _db => widget.database;
+  AdminDatabase get _db => widget.database;
   String get _table => widget.object;
   bool get _isView => widget.isView;
   bool get _writable => !widget.controller.readOnly && !_isView;
@@ -573,19 +573,7 @@ class _DataPaneState extends State<DataPane> {
       return;
     }
     try {
-      await _db.transaction((tx) async {
-        for (final rowid in rowids) {
-          final r = await tx.execute(
-            'DELETE FROM ${sqlName(_table)} WHERE rowid = ?',
-            [rowid],
-          );
-          if (r.affectedRows != 1) {
-            throw StateError(
-              'row $rowid no longer exists; nothing was deleted',
-            );
-          }
-        }
-      });
+      await _db.deleteRows(_table, rowids);
       if (!mounted) return;
       setState(_selected.clear);
       showAdminMessage(context, 'Deleted ${plural(rowids.length, 'row')}.');

@@ -29,11 +29,7 @@ Future<JustDatabaseAdminController> _pump(
   bool readOnly = false,
 }) async {
   useLargeWindow(tester, size: const Size(1400, 900));
-  final c = JustDatabaseAdminController(
-    readOnly: readOnly,
-    rememberSettings: false,
-    persistByDefault: false,
-  );
+  final c = testController(readOnly: readOnly, persistByDefault: false);
   await tester.pumpWidget(
     MaterialApp(home: JustDatabaseAdminScreen(controller: c)),
   );
@@ -634,10 +630,7 @@ void main() {
   testWidgets('a given theme is kept as it is, and made light from its '
       'colours when asked', (tester) async {
     useLargeWindow(tester, size: const Size(1400, 900));
-    final c = JustDatabaseAdminController(
-      rememberSettings: false,
-      persistByDefault: false,
-    );
+    final c = testController(persistByDefault: false);
     final given = ThemeData(
       colorSchemeSeed: Colors.teal,
       brightness: Brightness.dark,

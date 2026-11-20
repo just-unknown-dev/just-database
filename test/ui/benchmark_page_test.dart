@@ -3,6 +3,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:just_database/just_database.dart';
+import 'package:just_database/src/ui/backend/local_host.dart';
 import 'package:just_database/src/ui/pages/benchmark_page.dart';
 
 import 'ui_test_support.dart';
@@ -17,7 +18,14 @@ Future<JustDatabase> _openDb(WidgetTester tester) async {
 
 Future<void> _pumpPage(WidgetTester tester, JustDatabase db) async {
   useLargeWindow(tester);
-  await tester.pumpWidget(MaterialApp(home: BenchmarkPage(database: db)));
+  await tester.pumpWidget(
+    MaterialApp(
+      home: BenchmarkPage(
+        host: LocalAdminHost(),
+        database: LocalAdminDatabase.of(db),
+      ),
+    ),
+  );
   await tester.pumpAndSettle();
 }
 
@@ -54,7 +62,7 @@ void main() {
       await _setField(tester, 'Iterations', '2');
       await _run(tester);
 
-      expect(find.text('just_database, 10 rows'), findsOneWidget);
+      expect(find.text('Just Database, 10 rows'), findsOneWidget);
       expect(find.text('SELECT by primary key'), findsOneWidget);
       expect(db.tableNames, ['t']);
       expect(

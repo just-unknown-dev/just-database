@@ -9,7 +9,6 @@ import 'package:flutter/foundation.dart' show internal;
 import 'package:flutter/material.dart';
 
 import '../../core/database_manager.dart';
-import '../../core/just_database.dart';
 import '../admin_selection.dart';
 import '../admin_style.dart';
 import '../admin_utils.dart';
@@ -18,6 +17,7 @@ import '../dialogs/database_dialogs.dart';
 import '../dialogs/schema_dialogs.dart';
 import '../just_database_admin_controller.dart';
 import '../widgets/admin_widgets.dart';
+import '../backend/admin_backend.dart';
 
 /// Shows [items] as a menu at [position] and runs the chosen one.
 Future<void> _menuAt<T>(
@@ -143,7 +143,7 @@ class _DatabaseSidebarState extends State<DatabaseSidebar> {
     final cs = Theme.of(context).colorScheme;
     final sel = c.selection;
     final isSelected = sel?.database.toLowerCase() == info.name.toLowerCase();
-    final db = JustDatabase.findOpen(info.name);
+    final db = c.findOpen(info.name);
     final subtitle = [
       if (db != null) modeShortLabel(db.mode) else 'closed',
       if (!info.isPersisted) 'in memory',
@@ -193,7 +193,7 @@ class _DatabaseSidebarState extends State<DatabaseSidebar> {
     return [tile, ..._tree(context, db)];
   }
 
-  List<Widget> _tree(BuildContext context, JustDatabase db) {
+  List<Widget> _tree(BuildContext context, AdminDatabase db) {
     final c = _c;
     final sel = c.selection!;
     final filter = _filter.text.trim().toLowerCase();

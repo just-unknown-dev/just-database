@@ -1,10 +1,55 @@
 // Shared set-up for the admin UI widget tests.
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:just_database/just_database.dart';
+import 'package:just_database/src/core/workbench_service.dart';
+import 'package:just_database/src/ui/backend/remote_host.dart';
+import 'package:just_database/ui.dart';
 import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
+
+/// Whether the workbench tests reach the databases through the workbench
+/// service, as the DevTools extension does (see remote_workbench_test.dart),
+/// instead of directly.
+bool remoteWorkbench = false;
+
+/// A controller for a test: on this app's databases, or (with
+/// [remoteWorkbench]) on the same databases through [LoopbackTransport].
+JustDatabaseAdminController testController({
+  bool readOnly = false,
+  bool rememberSettings = false,
+  bool persistByDefault = true,
+}) => remoteWorkbench
+    ? JustDatabaseAdminController.withHost(
+        RemoteAdminHost(LoopbackTransport()),
+        readOnly: readOnly,
+        rememberSettings: rememberSettings,
+        persistByDefault: persistByDefault,
+      )
+    : JustDatabaseAdminController(
+        readOnly: readOnly,
+        rememberSettings: rememberSettings,
+        persistByDefault: persistByDefault,
+      );
+
+/// Calls this app's workbench service directly, sending every call, reply
+/// and event through JSON as the Dart VM service would.
+final class LoopbackTransport implements WorkbenchTransport {
+  static Map<String, Object?> _wire(Map<String, Object?> json) =>
+      jsonDecode(jsonEncode(json)) as Map<String, Object?>;
+
+  @override
+  Future<Map<String, Object?>> call(
+    String method,
+    Map<String, Object?> args,
+  ) async => _wire(await WorkbenchService.handle(method, _wire(args)));
+
+  @override
+  Stream<(String, Map<String, Object?>)> get events =>
+      WorkbenchService.events.map((e) => (e.$1, _wire(e.$2)));
+}
 
 /// Points path_provider at fresh temporary directories (created up front,
 /// so listing databases needs no asynchronous file system work).

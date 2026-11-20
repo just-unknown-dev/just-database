@@ -15,8 +15,8 @@ layer or below (checked by `test/library_layout_test.dart`):
 | 1 | `engine` | the SQL engine: compiles and runs statements against a catalog |
 | 1 | `persistence` | the file codec (formats 1 and 2), the encryption envelope, the SQL dump, the store interface |
 | 2 | `io`, `web` | the platform stores: files with `dart:io`, IndexedDB and WebCrypto with `package:web` |
-| 3 | `core` | `JustDatabase`, `DatabaseManager`, migrations, the query builder, `SecureKeyManager` |
-| 4 | `orm`, `benchmark` | `DbTable`, benchmarks |
+| 3 | `core` | `JustDatabase`, `DatabaseManager`, migrations, the query builder, `SecureKeyManager`, benchmarks, the workbench service |
+| 4 | `orm` | `DbTable` |
 | 5 | `ui` | the admin workbench (only exported by `ui.dart`) |
 
 `lib/just_database.dart` exports the public API of layers 0–4;
@@ -190,14 +190,20 @@ POSIX systems (file locks there belong to the process).
 state (`just_database_admin_controller.dart`, a `ChangeNotifier`); every
 other file is internal.
 
-* The controller lists databases (`DatabaseManager.listDatabases`), holds
-  the selection (`AdminSelection`: a database, maybe a table, view or
-  trigger, and a pane), the databases it opened itself (closed on
-  `dispose`), passphrases typed this session, per-pane state that survives
-  switching panes (`paneState`), and the settings, history and snippets
-  (`AdminPreferences`, kept with just_storage). It listens to
-  `DatabaseManager.listChanges` and to each open database's `changes`, so
-  the screen follows what the app does.
+* The controller reaches the databases through an `AdminHost`
+  (`backend/admin_backend.dart`), which hands out `AdminDatabase`s: what
+  the screen uses of `JustDatabase`. `LocalAdminHost` is the app's own
+  databases, a direct pass-through; `RemoteAdminHost` is another app's,
+  for the DevTools extension (below). The screen never touches
+  `JustDatabase` itself.
+* The controller lists databases (`AdminHost.listDatabases`), holds the
+  selection (`AdminSelection`: a database, maybe a table, view or trigger,
+  and a pane), the databases it opened itself (given back on `dispose`),
+  passphrases typed this session, per-pane state that survives switching
+  panes (`paneState`), and the settings, history and snippets
+  (`AdminPreferences`, kept with just_storage). It listens to the host's
+  `listChanges` and to each open database's `changes`, so the screen
+  follows what the app does.
 * The screen picks a layout from its own width (`AdminLayoutScope`, 840
   logical pixels): `shell/sidebar.dart` and `shell/workspace.dart` side by
   side, or `shell/compact_pages.dart` as pushed pages, which remove
@@ -209,13 +215,41 @@ other file is internal.
 * `admin_theme.dart` themes the screen in the brightness the
   controller's `themeMode` asks for (dark by default): the workbench's own
   colours (Material's neutral greys, with the logo's coral as the accent)
-  in the app's font; or a given
-  theme, remade from its colours when it has the other brightness. Pages
-  the screen pushes get their own `AdminTheme`, so a change reaches pages
-  already open.
+  in the app's font; or a given theme, remade from its colours when it has
+  the other brightness. Pages the screen pushes get their own
+  `AdminTheme`, so a change reaches pages already open.
 * SQL text helpers (`sql_text.dart`) reuse the engine's lexer for
   highlighting, statement splitting (trigger bodies stay whole) and
   completion.
 * Files are saved and read through `io/exports.dart` or `web/exports.dart`
   (a conditional import): a folder in Downloads (or Documents) natively, a
   download and a file picker in the browser. No plugin is needed.
+
+### In Flutter DevTools
+
+The same screen runs as a DevTools extension on the databases of an app in
+a debug build:
+
+* `core/workbench_service.dart` is the app's side. `JustDatabase.open`
+  registers it in debug builds (an `assert`, so release and profile builds
+  have none of it) unless `JustDatabase.debugDevToolsWorkbench` is false:
+  one service extension, `ext.just_database.call`, with a method and JSON
+  arguments. It does the key handling the in-app screen does, so random
+  keys never leave the app. Once a workbench connects it posts
+  `just_database.list` and `just_database.change` events (a change event
+  per database at most every 100 ms); when the last one disconnects it
+  stops listening.
+* `core/workbench_wire.dart` is what travels: values (blobs, non-finite
+  doubles and integers beyond 2^53 tagged), results, errors (rethrown as
+  the same kind), listings and `DatabaseSnapshot`s: a database's state,
+  schema and counts, so `RemoteAdminDatabase` answers the screen's getters
+  at once. Every call that may change a database returns a fresh snapshot.
+* `devtools_extension/` is the extension: `JustDatabaseAdminScreen` on a
+  `RemoteAdminHost` whose transport is DevTools' VM service connection.
+  `devtools_extension/tool/build.dart` builds it into
+  `extension/devtools/build` (git-ignored, published), where DevTools finds
+  it with `extension/devtools/config.yaml`.
+* `test/ui/remote_workbench_test.dart` runs the controller and workbench
+  tests again through the service, with every call and event sent through
+  JSON; `test/core/workbench_service_test.dart` calls it over a real VM
+  service (`flutter test --enable-vmservice`).

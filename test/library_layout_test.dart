@@ -42,7 +42,7 @@ const _layers = [
   // JustDatabase and the rest of the API.
   ['core'],
   // Built on the API.
-  ['orm', 'benchmark'],
+  ['orm'],
   // The admin screen.
   ['ui'],
 ];

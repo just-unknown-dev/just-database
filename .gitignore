@@ -37,3 +37,7 @@ example/pubspec.lock
 
 # Audit notes (not part of the package)
 .audit/
+
+# The DevTools extension's build (made before publishing, see
+# devtools_extension/README.md; .pubignore still publishes it)
+/extension/devtools/build/

@@ -6,9 +6,9 @@
 .vscode/
 *.iml
 
-# Build and tool output
+# Build and tool output (anchored: extension/devtools/build/ is published)
 .dart_tool/
-build/
+/build/
 coverage/
 doc/api/
 .flutter-plugins
@@ -28,6 +28,8 @@ pubspec.lock
 pubspec_overrides.yaml
 example/pubspec.lock
 example/pubspec_overrides.yaml
+/devtools_options.yaml
+example/devtools_options.yaml
 
 # Temporary files
 *.tmp
@@ -37,3 +39,7 @@ Thumbs.db
 
 # Audit notes (not part of the package)
 .audit/
+
+# The DevTools extension's source; its build in extension/devtools/build/
+# is published (build it first: devtools_extension/README.md)
+devtools_extension/

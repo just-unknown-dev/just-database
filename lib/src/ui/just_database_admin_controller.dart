@@ -8,28 +8,16 @@ import '../core/database_change.dart';
 import '../core/database_manager.dart';
 import '../core/database_mode.dart';
 import '../core/just_database.dart';
-import '../core/secure_key_manager.dart';
+import '../core/workbench_service.dart' show AdminEncryption;
 import 'admin_preferences.dart';
 import 'admin_selection.dart';
 import 'admin_utils.dart';
+import 'backend/admin_backend.dart';
+import 'backend/local_host.dart';
 
 /// Fills a database with sample data (the admin screen's "Seed sample
 /// data" action).
 typedef SeedDatabaseCallback = Future<void> Function(JustDatabase db);
-
-/// How the admin screen protects a database it creates or re-encrypts.
-@internal
-enum AdminEncryption {
-  /// Not encrypted.
-  none,
-
-  /// A random key kept by `SecureKeyManager.resolveAutoKey` in the app's
-  /// private storage.
-  randomKey,
-
-  /// A passphrase the user types (kept in memory for this session only).
-  passphrase,
-}
 
 /// The formats a database can be exported to and imported from.
 @internal
@@ -86,6 +74,25 @@ class JustDatabaseAdminController extends ChangeNotifier {
   /// settings, SQL history and snippets are kept between runs (with
   /// just_storage) and override them.
   JustDatabaseAdminController({
+    bool readOnly = false,
+    DatabaseMode defaultMode = DatabaseMode.standard,
+    bool persistByDefault = true,
+    ThemeMode themeMode = ThemeMode.dark,
+    bool rememberSettings = true,
+  }) : this.withHost(
+         LocalAdminHost(),
+         readOnly: readOnly,
+         defaultMode: defaultMode,
+         persistByDefault: persistByDefault,
+         themeMode: themeMode,
+         rememberSettings: rememberSettings,
+       );
+
+  /// A controller for the databases [host] reaches: a running app's, for
+  /// the workbench in DevTools. It disposes [host].
+  @internal
+  JustDatabaseAdminController.withHost(
+    this.host, {
     this.readOnly = false,
     DatabaseMode defaultMode = DatabaseMode.standard,
     bool persistByDefault = true,
@@ -97,10 +104,15 @@ class JustDatabaseAdminController extends ChangeNotifier {
          persistByDefault: persistByDefault,
          themeMode: themeMode,
        ) {
-    _listSub = DatabaseManager.listChanges.listen((_) => _scheduleReload());
+    _listSub = host.listChanges.listen((_) => _scheduleReload());
     unawaited(_prefs.load().then((_) => _notify()));
     unawaited(refresh());
   }
+
+  /// Where the databases are: this app, or one the workbench is connected
+  /// to.
+  @internal
+  final AdminHost host;
 
   /// Whether the screen offers only actions that do not write.
   final bool readOnly;
@@ -118,7 +130,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
 
   /// Databases this controller opened (one reference each), by lower-case
   /// name.
-  final Map<String, JustDatabase> _held = {};
+  final Map<String, AdminDatabase> _held = {};
 
   /// Passphrases typed this session, by lower-case name.
   final Map<String, String> _passphrases = {};
@@ -145,11 +157,23 @@ class JustDatabaseAdminController extends ChangeNotifier {
   /// Why the last action failed, or null.
   String? get lastError => _lastError;
 
+  /// The database shown, or null (also when it was closed, and in a
+  /// workbench connected to another app).
+  JustDatabase? get database => switch (shown) {
+    LocalAdminDatabase(:final db) => db,
+    _ => null,
+  };
+
   /// The database shown, or null (also when it was closed).
-  JustDatabase? get database {
+  @internal
+  AdminDatabase? get shown {
     final s = _selection;
-    return s == null ? null : JustDatabase.findOpen(s.database);
+    return s == null ? null : host.findOpen(s.database);
   }
+
+  /// The open database [name], or null.
+  @internal
+  AdminDatabase? findOpen(String name) => host.findOpen(name);
 
   /// What the screen shows.
   @internal
@@ -311,7 +335,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
   Future<bool> refresh() => _run('Could not list the databases', _reload);
 
   Future<void> _reload() async {
-    final list = await DatabaseManager.listDatabases();
+    final list = await host.listDatabases();
     if (_disposed) return;
     _databases = List.unmodifiable(list);
     _hasLoaded = true;
@@ -319,7 +343,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
     _watchOpenDatabases();
     final s = _selection;
     if (s != null &&
-        JustDatabase.findOpen(s.database) == null &&
+        host.findOpen(s.database) == null &&
         infoFor(s.database) == null) {
       _selection = null;
     }
@@ -345,7 +369,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
 
   void _watchOpenDatabases() {
     final open = {
-      for (final db in JustDatabase.openDatabases) db.name.toLowerCase(): db,
+      for (final db in host.openDatabases) db.name.toLowerCase(): db,
     };
     _watching.removeWhere((key, sub) {
       if (open.containsKey(key)) return false;
@@ -377,7 +401,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
     final s = _selection;
     final kind = s?.kind;
     if (s == null || kind == null) return;
-    final db = JustDatabase.findOpen(s.database);
+    final db = host.findOpen(s.database);
     if (db == null) return;
     final exists = switch (kind) {
       AdminObjectKind.table => db.getTableSchema(s.object!) != null,
@@ -392,7 +416,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
   /// [passphraseNeededFor]).
   @internal
   Future<bool> select(AdminSelection selection) async {
-    if (JustDatabase.findOpen(selection.database) == null) {
+    if (host.findOpen(selection.database) == null) {
       if (!await open(selection.database)) return false;
     }
     _selection = selection;
@@ -439,43 +463,37 @@ class JustDatabaseAdminController extends ChangeNotifier {
   Future<bool> open(String name, {DatabaseMode? mode, String? passphrase}) {
     passphraseNeededFor = null;
     return _run('Could not open "$name"', () async {
-      if (JustDatabase.findOpen(name) != null) return;
+      if (host.findOpen(name) != null) return;
       await _reload();
       final info = infoFor(name);
       if (info == null) throw StateError('There is no database named "$name".');
-      if (JustDatabase.findOpen(name) != null) return;
+      if (host.findOpen(name) != null) return;
       final lower = info.name.toLowerCase();
-      var key = passphrase;
-      if (key == null && info.isEncrypted) {
-        key = _passphrases[lower];
-        if (key == null &&
-            await SecureKeyManager.hasAutoKey(dbName: info.name)) {
-          key = await SecureKeyManager.resolveAutoKey(dbName: info.name);
-        }
-        if (key == null) {
-          passphraseNeededFor = info.name;
-          throw _NeedsPassphrase(info.name);
-        }
-      }
-      final db = await JustDatabase.open(
+      final db = await host.open(
         info.name,
         mode: mode ?? defaultMode,
-        encryptionKey: key,
+        passphrase:
+            passphrase ?? (info.isEncrypted ? _passphrases[lower] : null),
+        encrypted: info.isEncrypted,
       );
+      if (db == null) {
+        passphraseNeededFor = info.name;
+        throw _NeedsPassphrase(info.name);
+      }
       if (passphrase != null) _passphrases[lower] = passphrase;
       await _hold(db);
       await _reloadQuietly();
     });
   }
 
-  Future<void> _hold(JustDatabase db) async {
+  Future<void> _hold(AdminDatabase db) async {
     final lower = db.name.toLowerCase();
     if (_disposed) {
-      await db.close();
+      await host.release(db);
       throw StateError('The admin screen was closed.');
     }
     if (identical(_held[lower], db)) {
-      await db.close(); // two opens raced: keep one reference
+      await host.release(db); // two opens raced: keep one reference
     } else {
       _held[lower] = db;
     }
@@ -491,7 +509,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
         '"$name" was opened by the app; only the app closes it.',
       );
     }
-    await db.close();
+    await host.release(db);
     await _reloadQuietly();
   });
 
@@ -499,6 +517,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
   @internal
   Future<bool> reopen(String name, DatabaseMode mode) async {
     final ok = await _run('Could not reopen "$name"', () async {
+      await _reload(); // a connected workbench learns of other openers here
       if (!canChangeMode(name)) {
         throw StateError(
           'the app uses "$name" too; its mode can only change while the '
@@ -506,7 +525,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
         );
       }
       final db = _held.remove(name.toLowerCase())!;
-      await db.close();
+      await host.release(db);
     });
     if (!ok) return false;
     return open(name, mode: mode);
@@ -519,8 +538,8 @@ class JustDatabaseAdminController extends ChangeNotifier {
     await _reloadQuietly();
   });
 
-  JustDatabase _openOrThrow(String name) =>
-      JustDatabase.findOpen(name) ?? (throw StateError('"$name" is not open.'));
+  AdminDatabase _openOrThrow(String name) =>
+      host.findOpen(name) ?? (throw StateError('"$name" is not open.'));
 
   // ---------------------------------------------------------------------------
   // Creating, duplicating, deleting
@@ -531,7 +550,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
   String? checkNewName(String name) {
     final problem = databaseNameProblem(name);
     if (problem != null) return problem;
-    if (infoFor(name) != null || JustDatabase.findOpen(name) != null) {
+    if (infoFor(name) != null || host.findOpen(name) != null) {
       return 'A database named "$name" already exists.';
     }
     return null;
@@ -562,7 +581,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
     await _reloadQuietly();
   });
 
-  Future<JustDatabase> _create(
+  Future<AdminDatabase> _create(
     String name, {
     DatabaseMode? mode,
     bool? persist,
@@ -573,39 +592,16 @@ class JustDatabaseAdminController extends ChangeNotifier {
     final problem = databaseNameProblem(name);
     if (problem != null) throw ArgumentError(problem);
     await _reload();
-    if (infoFor(name) != null || JustDatabase.findOpen(name) != null) {
+    if (infoFor(name) != null || host.findOpen(name) != null) {
       throw StateError('a database named "$name" already exists');
     }
-    String? key;
-    var createdKey = false;
-    switch (encryption) {
-      case AdminEncryption.none:
-        break;
-      case AdminEncryption.randomKey:
-        createdKey = !await SecureKeyManager.hasAutoKey(dbName: name);
-        key = await SecureKeyManager.resolveAutoKey(dbName: name);
-      case AdminEncryption.passphrase:
-        if (passphrase == null || passphrase.isEmpty) {
-          throw ArgumentError('enter a passphrase');
-        }
-        key = passphrase;
-    }
-    final JustDatabase db;
-    try {
-      db = await JustDatabase.open(
-        name,
-        mode: mode ?? defaultMode,
-        persist: key != null || (persist ?? persistByDefault),
-        encryptionKey: key,
-      );
-    } catch (_) {
-      if (createdKey) {
-        try {
-          await SecureKeyManager.clearAutoKey(dbName: name);
-        } catch (_) {}
-      }
-      rethrow;
-    }
+    final db = await host.create(
+      name,
+      mode: mode ?? defaultMode,
+      persist: persist ?? persistByDefault,
+      encryption: encryption,
+      passphrase: passphrase,
+    );
     if (encryption == AdminEncryption.passphrase) {
       _passphrases[name.toLowerCase()] = passphrase!;
     }
@@ -664,10 +660,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
     });
     // Throws when the file cannot be deleted: the key is then kept, so the
     // database can still be opened.
-    await DatabaseManager.deleteDatabase(name);
-    if (await SecureKeyManager.hasAutoKey(dbName: name)) {
-      await SecureKeyManager.clearAutoKey(dbName: name);
-    }
+    await host.delete(name);
   }
 
   /// Deletes every database (see [delete]). Fails, after deleting what it
@@ -678,7 +671,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
     await _reload();
     final names = {
       for (final d in _databases) d.name,
-      for (final db in JustDatabase.openDatabases) db.name,
+      for (final db in host.openDatabases) db.name,
     };
     final failures = <String>[];
     for (final name in names) {
@@ -698,10 +691,14 @@ class JustDatabaseAdminController extends ChangeNotifier {
   Future<bool> seed(String name, SeedDatabaseCallback seed) =>
       _run('Seeding "$name" failed', () async {
         _checkWritable();
-        if (JustDatabase.findOpen(name) == null && !await open(name)) {
+        if (host.findOpen(name) == null && !await open(name)) {
           throw StateError(_lastError ?? 'could not open "$name"');
         }
-        await seed(_openOrThrow(name));
+        final db = _openOrThrow(name);
+        if (db is! LocalAdminDatabase) {
+          throw StateError('sample data is seeded by the app itself');
+        }
+        await seed(db.db);
         await _reloadQuietly();
       });
 
@@ -719,28 +716,12 @@ class JustDatabaseAdminController extends ChangeNotifier {
   }) => _run('Could not change the encryption of "$name"', () async {
     _checkWritable();
     final db = _openOrThrow(name);
-    if (!db.persist) {
-      throw StateError('an in-memory database has no file to encrypt');
-    }
+    await host.setEncryption(db, encryption, passphrase: passphrase);
     final lower = name.toLowerCase();
-    final hadAutoKey = await SecureKeyManager.hasAutoKey(dbName: name);
-    switch (encryption) {
-      case AdminEncryption.none:
-        await db.changeEncryptionKey(null);
-        _passphrases.remove(lower);
-        if (hadAutoKey) await SecureKeyManager.clearAutoKey(dbName: name);
-      case AdminEncryption.randomKey:
-        final key = await SecureKeyManager.resolveAutoKey(dbName: name);
-        await db.changeEncryptionKey(key);
-        _passphrases.remove(lower);
-      case AdminEncryption.passphrase:
-        if (passphrase == null || passphrase.isEmpty) {
-          throw ArgumentError('enter a passphrase');
-        }
-        await db.changeEncryptionKey(passphrase);
-        _passphrases[lower] = passphrase;
-        // A stale random key would be tried (and fail) before asking.
-        if (hadAutoKey) await SecureKeyManager.clearAutoKey(dbName: name);
+    if (encryption == AdminEncryption.passphrase) {
+      _passphrases[lower] = passphrase!;
+    } else {
+      _passphrases.remove(lower);
     }
     await _reloadQuietly();
   });
@@ -804,7 +785,7 @@ class JustDatabaseAdminController extends ChangeNotifier {
     await _reloadQuietly();
   });
 
-  Future<void> _import(JustDatabase db, String text) async {
+  Future<void> _import(AdminDatabase db, String text) async {
     switch (BackupFormat.detect(text)) {
       case BackupFormat.json:
         final Object? json;
@@ -847,10 +828,14 @@ class JustDatabaseAdminController extends ChangeNotifier {
     final held = List.of(_held.values);
     _held.clear();
     _passphrases.clear();
-    for (final db in held) {
-      // A failed final save was already reported to onSaveError.
-      unawaited(db.close().catchError((Object _) {}));
+    // A connected workbench's databases are given back when it disconnects.
+    if (!host.isRemote) {
+      for (final db in held) {
+        // A failed final save was already reported to onSaveError.
+        unawaited(host.release(db).catchError((Object _) {}));
+      }
     }
+    unawaited(host.dispose());
     super.dispose();
   }
 

@@ -247,7 +247,7 @@ class SettingsPage extends StatelessWidget {
                     children: [
                       ListTile(
                         leading: Icon(Icons.info_outline),
-                        title: Text('just_database $kJustDatabaseVersion'),
+                        title: Text('Just Database $kJustDatabaseVersion'),
                         subtitle: Text(
                           'A pure-Dart SQL database with SQLite semantics: '
                           'saved to a file (IndexedDB on the web), optional '

@@ -7,7 +7,6 @@ library;
 import 'package:flutter/foundation.dart' show internal;
 import 'package:flutter/material.dart';
 
-import '../../core/just_database.dart';
 import '../../storage/schema.dart';
 import '../admin_selection.dart';
 import '../admin_style.dart';
@@ -16,6 +15,7 @@ import '../dialogs/schema_dialogs.dart';
 import '../just_database_admin_controller.dart';
 import '../sql_text.dart';
 import '../widgets/admin_widgets.dart';
+import '../backend/admin_backend.dart';
 
 /// The structure or definition of one object.
 @internal
@@ -29,7 +29,7 @@ class StructurePane extends StatelessWidget {
   });
 
   final JustDatabaseAdminController controller;
-  final JustDatabase database;
+  final AdminDatabase database;
   final AdminObjectKind kind;
   final String object;
 
@@ -593,7 +593,7 @@ class _TriggersCard extends StatelessWidget {
   });
 
   final JustDatabaseAdminController controller;
-  final JustDatabase database;
+  final AdminDatabase database;
   final List<String> triggers;
 
   @override

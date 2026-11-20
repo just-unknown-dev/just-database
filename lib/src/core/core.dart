@@ -2,6 +2,7 @@
 /// migrations, the query builder and key management.
 library;
 
+export 'benchmark.dart';
 export 'database_change.dart';
 export 'database_manager.dart';
 export 'database_mode.dart';

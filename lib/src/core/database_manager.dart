@@ -59,7 +59,8 @@ abstract final class DatabaseManager {
       StreamController<void>.broadcast();
 
   /// An event whenever a database is opened, closed, deleted or encrypted
-  /// in this app, so a list of databases can refresh itself. Events come
+  /// in this app (also when another opener starts or stops using an open
+  /// one), so a list of databases can refresh itself. Events come
   /// asynchronously.
   static Stream<void> get listChanges => _listChanges.stream;
 

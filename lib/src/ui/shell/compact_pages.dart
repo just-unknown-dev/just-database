@@ -9,7 +9,6 @@ import 'package:flutter/foundation.dart' show internal;
 import 'package:flutter/material.dart';
 
 import '../../core/database_manager.dart';
-import '../../core/just_database.dart';
 import '../admin_selection.dart';
 import '../admin_style.dart';
 import '../admin_utils.dart';
@@ -21,6 +20,7 @@ import '../panes/overview_pane.dart';
 import '../panes/sql_console.dart';
 import '../panes/structure_pane.dart';
 import '../widgets/admin_widgets.dart';
+import '../backend/admin_backend.dart';
 
 /// Pops a compact page once the window is wide: the wide layout shows the
 /// same selection.
@@ -123,7 +123,7 @@ class _DatabaseCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    final db = JustDatabase.findOpen(info.name);
+    final db = controller.findOpen(info.name);
     final details = [
       formatBytes(info.sizeBytes),
       if (db != null) plural(db.tableNames.length, 'table'),
@@ -233,7 +233,7 @@ class _CompactDatabasePageState extends State<CompactDatabasePage>
       listenable: widget.controller,
       builder: (context, _) {
         final c = widget.controller;
-        final db = JustDatabase.findOpen(widget.name);
+        final db = c.findOpen(widget.name);
         // "Query in SQL console" elsewhere shows this page's SQL tab.
         final s = c.selection;
         if (s != _seen) {
@@ -357,7 +357,7 @@ class _CompactDatabasePageState extends State<CompactDatabasePage>
 
   Future<void> _openObject(
     BuildContext context,
-    JustDatabase db,
+    AdminDatabase db,
     AdminObjectKind kind,
     String name, {
     AdminPane? pane,
@@ -379,7 +379,7 @@ class _CompactDatabasePageState extends State<CompactDatabasePage>
     );
   }
 
-  Widget _objects(BuildContext context, JustDatabase db) {
+  Widget _objects(BuildContext context, AdminDatabase db) {
     final filter = _filter.text.trim().toLowerCase();
     bool shown(String n) => filter.isEmpty || n.toLowerCase().contains(filter);
     final total =
@@ -522,7 +522,7 @@ class _CompactObjectPageState extends State<CompactObjectPage>
         listenable: widget.controller,
         builder: (context, _) {
           final c = widget.controller;
-          final db = JustDatabase.findOpen(widget.database);
+          final db = c.findOpen(widget.database);
           final gone =
               db == null || createSqlOf(db, widget.kind, widget.object) == null;
           return Scaffold(

@@ -2,11 +2,11 @@ import 'package:flutter/foundation.dart' show internal;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-import '../../benchmark/benchmark.dart';
-import '../../core/just_database.dart';
+import '../../core/benchmark.dart';
 import '../../sql/sql_exception.dart';
 import '../admin_utils.dart';
 import '../widgets/admin_widgets.dart';
+import '../backend/admin_backend.dart';
 
 /// Runs the standard benchmark suite, or times a SELECT on [database].
 ///
@@ -17,10 +17,14 @@ import '../widgets/admin_widgets.dart';
 @internal
 class BenchmarkPage extends StatefulWidget {
   /// Creates the page. Without a [database] only the standard suite runs.
-  const BenchmarkPage({super.key, this.database});
+  const BenchmarkPage({super.key, required this.host, this.database});
+
+  /// Where the benchmarks run: this app, or the app the workbench is
+  /// connected to.
+  final AdminHost host;
 
   /// The database custom queries run on.
-  final JustDatabase? database;
+  final AdminDatabase? database;
 
   @override
   State<BenchmarkPage> createState() => _BenchmarkPageState();
@@ -77,7 +81,8 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
         final label = _label.text.trim().isEmpty
             ? 'Custom query'
             : _label.text.trim();
-        final stats = await db.benchmarkQuery(
+        final stats = await widget.host.benchmarkQuery(
+          db,
           label,
           _query.text,
           warmup: warmup,
@@ -87,17 +92,12 @@ class _BenchmarkPageState extends State<BenchmarkPage> {
         setState(() => _customResult = stats);
       } else {
         final rows = int.parse(_rowCount.text.trim());
-        final result = db != null && db.isOpen
-            ? await db.runStandardBenchmark(
-                rowCount: rows,
-                warmup: warmup,
-                iterations: iterations,
-              )
-            : await runStandardDatabaseBenchmark(
-                rowCount: rows,
-                warmup: warmup,
-                iterations: iterations,
-              );
+        final result = await widget.host.runStandardBenchmark(
+          db != null && db.isOpen ? db : null,
+          rowCount: rows,
+          warmup: warmup,
+          iterations: iterations,
+        );
         if (!mounted) return;
         setState(() => _suiteResult = result);
       }

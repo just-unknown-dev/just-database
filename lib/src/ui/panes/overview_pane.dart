@@ -6,7 +6,6 @@ library;
 import 'package:flutter/foundation.dart' show internal;
 import 'package:flutter/material.dart';
 
-import '../../core/just_database.dart';
 import '../../core/query_result.dart';
 import '../admin_selection.dart';
 import '../admin_style.dart';
@@ -14,6 +13,7 @@ import '../admin_utils.dart';
 import '../dialogs/database_dialogs.dart';
 import '../just_database_admin_controller.dart';
 import '../widgets/admin_widgets.dart';
+import '../backend/admin_backend.dart';
 
 /// The overview of an open database.
 @internal
@@ -26,7 +26,7 @@ class OverviewPane extends StatelessWidget {
   });
 
   final JustDatabaseAdminController controller;
-  final JustDatabase database;
+  final AdminDatabase database;
   final SeedDatabaseCallback? onSeed;
 
   bool get _writable => !controller.readOnly;
@@ -309,7 +309,7 @@ class _VersionsCard extends StatelessWidget {
   const _VersionsCard({required this.controller, required this.database});
 
   final JustDatabaseAdminController controller;
-  final JustDatabase database;
+  final AdminDatabase database;
 
   Future<void> _setUserVersion(BuildContext context, int current) async {
     final text = await promptText(

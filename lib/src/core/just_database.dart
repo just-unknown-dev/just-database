@@ -23,6 +23,7 @@ import '../io/file_store.dart'
     if (dart.library.js_interop) '../web/idb_store.dart';
 import 'query_builder.dart';
 import 'query_result.dart';
+import 'workbench_service.dart';
 
 /// A SQL database: an in-memory SQLite-style engine, saved to a file
 /// (IndexedDB on the web) after every committed change.
@@ -62,6 +63,16 @@ final class JustDatabase {
   /// in some private windows) and [open] fell back to an in-memory
   /// database.
   static void Function(String name, String reason)? onStorageDowngrade;
+
+  /// Whether debug builds let the workbench in Flutter DevTools (the
+  /// "just_database" tab) reach this app's databases.
+  ///
+  /// When the first database opens in a debug build, just_database
+  /// registers a Dart VM service extension for it and says so in the
+  /// console; nothing runs on the app's writes until the workbench
+  /// connects. Set this to false before opening a database to keep it off.
+  /// Release and profile builds never offer it.
+  static bool debugDevToolsWorkbench = true;
 
   /// Called when a save in the background fails. [flush] and [close]
   /// throw the error too.
@@ -161,6 +172,8 @@ final class JustDatabase {
         );
       }
       existing._refs++;
+      // Who uses it changed (the workbench shows whether it may reopen it).
+      DatabaseManager.notifyListChanged();
       return existing;
     }
     final db = JustDatabase._(name, mode, persist, encryptionKey)
@@ -175,6 +188,10 @@ final class JustDatabase {
       db._catalog.log.takeTouched();
       _registry[key] = db;
       DatabaseManager.notifyListChanged();
+      assert(() {
+        if (debugDevToolsWorkbench) WorkbenchService.register();
+        return true;
+      }());
       return db;
     } finally {
       _opening.remove(key);
@@ -305,7 +322,10 @@ final class JustDatabase {
   /// closed anyway).
   Future<void> close() async {
     if (!_isOpen) return;
-    if (--_refs > 0) return;
+    if (--_refs > 0) {
+      DatabaseManager.notifyListChanged();
+      return;
+    }
     await _shutDown();
   }
 

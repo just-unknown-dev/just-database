@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'dart:math';
 
-import '../core/database_mode.dart';
-import '../core/just_database.dart';
+import 'database_mode.dart';
+import 'just_database.dart';
 import '../sql/parser.dart';
 
 /// Timings of one benchmarked operation.
@@ -246,7 +246,7 @@ Future<BenchmarkSuiteResult> runStandardDatabaseBenchmark({
     });
     final suite =
         BenchmarkSuite(
-            name: 'just_database, $rowCount rows',
+            name: 'Just Database, $rowCount rows',
             warmupIterations: warmup,
             measureIterations: iterations,
           )
