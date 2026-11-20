@@ -494,9 +494,16 @@ class PageBar extends StatelessWidget {
                 ? VisualDensity.standard
                 : VisualDensity.compact;
             final sizes = onPageSizeChanged;
+            // The status (when shown) gets all the room the controls leave.
+            final lead = leading != null && wide;
+            final rangeText = Text(
+              range,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 13, color: cs.onSurfaceVariant),
+            );
             return Row(
               children: [
-                if (leading != null && wide) Flexible(child: leading!),
+                if (lead) Expanded(child: leading!),
                 if (sizes != null) ...[
                   if (wide) ...[
                     const SizedBox(width: 12),
@@ -522,14 +529,13 @@ class PageBar extends StatelessWidget {
                           },
                   ),
                 ],
-                const Spacer(),
-                Flexible(
-                  child: Text(
-                    range,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontSize: 13, color: cs.onSurfaceVariant),
-                  ),
-                ),
+                if (lead) ...[
+                  const SizedBox(width: 16),
+                  rangeText,
+                ] else ...[
+                  const Spacer(),
+                  Flexible(child: rangeText),
+                ],
                 IconButton(
                   tooltip: 'First page',
                   visualDensity: density,

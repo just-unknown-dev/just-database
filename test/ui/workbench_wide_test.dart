@@ -532,4 +532,137 @@ void main() {
     await tester.pumpAndSettle();
     await _finish(tester, c, const []);
   });
+
+  testWidgets('light and dark: dark by default; the app bar toggles it; '
+      'Settings picks dark, light or the device; open pages change with it', (
+    tester,
+  ) async {
+    Brightness brightnessAt(Finder f) =>
+        Theme.of(tester.element(f.first)).brightness;
+    final toggle = find.byKey(const ValueKey('jdb-theme-toggle'));
+    final settingsTitle = find.text('Appearance');
+
+    final c = await _pump(tester);
+    expect(c.themeMode, ThemeMode.dark);
+    expect(brightnessAt(toggle), Brightness.dark);
+    expect(find.byTooltip('Light mode'), findsOneWidget);
+
+    await tester.tap(toggle);
+    await tester.pumpAndSettle();
+    expect(c.themeMode, ThemeMode.light);
+    expect(brightnessAt(toggle), Brightness.light);
+    expect(find.byTooltip('Dark mode'), findsOneWidget);
+
+    // A pushed page has the screen's appearance and follows its changes.
+    await tester.tap(find.byKey(const ValueKey('jdb-settings')));
+    await tester.pumpAndSettle();
+    expect(brightnessAt(settingsTitle), Brightness.light);
+    await tester.tap(find.byKey(const ValueKey('jdb-setting-theme-dark')));
+    await tester.pumpAndSettle();
+    expect(c.themeMode, ThemeMode.dark);
+    expect(brightnessAt(settingsTitle), Brightness.dark);
+
+    tester.platformDispatcher.platformBrightnessTestValue = Brightness.light;
+    addTearDown(tester.platformDispatcher.clearPlatformBrightnessTestValue);
+    await tester.tap(find.byKey(const ValueKey('jdb-setting-theme-device')));
+    await tester.pumpAndSettle();
+    expect(c.themeMode, ThemeMode.system);
+    expect(brightnessAt(settingsTitle), Brightness.light);
+    tester.platformDispatcher.platformBrightnessTestValue = Brightness.dark;
+    await tester.pumpAndSettle();
+    expect(brightnessAt(settingsTitle), Brightness.dark);
+
+    await tester.tap(find.byKey(const ValueKey('jdb-setting-theme-light')));
+    await tester.pumpAndSettle();
+    await tester.pageBack();
+    await tester.pumpAndSettle();
+    expect(brightnessAt(toggle), Brightness.light);
+    await _finish(tester, c, const []);
+  });
+
+  testWidgets("the workbench's own colours are black and grey with the "
+      "logo's coral as the accent, not the app's", (tester) async {
+    const coral = Color(0xFFF5746F);
+    void expectGrey(Color c, String role) {
+      expect(
+        (c.r - c.g).abs() + (c.g - c.b).abs(),
+        lessThan(0.01),
+        reason: '$role is $c',
+      );
+    }
+
+    void expectNeutral(ColorScheme cs) {
+      expectGrey(cs.surface, 'surface');
+      expectGrey(cs.surfaceContainerLow, 'surfaceContainerLow');
+      expectGrey(cs.surfaceContainerHighest, 'surfaceContainerHighest');
+      expectGrey(cs.onSurface, 'onSurface');
+      expectGrey(cs.outlineVariant, 'outlineVariant');
+      expectGrey(cs.secondaryContainer, 'secondaryContainer');
+    }
+
+    final c = await _pump(tester);
+    final toggle = find.byKey(const ValueKey('jdb-theme-toggle'));
+    ColorScheme coloursAt() => Theme.of(tester.element(toggle)).colorScheme;
+    final app = Theme.of(tester.element(find.byType(Navigator).first));
+    expect(app.colorScheme.primary, isNot(coral));
+
+    expect(coloursAt().brightness, Brightness.dark);
+    expect(coloursAt().primary, coral);
+    expect(coloursAt().primaryContainer, coral);
+    expect(coloursAt().surface.computeLuminance(), lessThan(0.01));
+    expectNeutral(coloursAt());
+
+    // On light surfaces the coral is the container and a deeper shade of
+    // it the primary, which text and icons can be drawn in.
+    c.setThemeMode(ThemeMode.light);
+    await tester.pumpAndSettle();
+    final light = coloursAt();
+    expect(light.brightness, Brightness.light);
+    expect(light.primaryContainer, coral);
+    expectNeutral(light);
+    expect(
+      HSVColor.fromColor(light.primary).hue,
+      closeTo(HSVColor.fromColor(coral).hue, 5),
+    );
+    expect(
+      light.primary.computeLuminance(),
+      lessThan(coral.computeLuminance() / 2),
+    );
+    await _finish(tester, c, const []);
+  });
+
+  testWidgets('a given theme is kept as it is, and made light from its '
+      'colours when asked', (tester) async {
+    useLargeWindow(tester, size: const Size(1400, 900));
+    final c = JustDatabaseAdminController(
+      rememberSettings: false,
+      persistByDefault: false,
+    );
+    final given = ThemeData(
+      colorSchemeSeed: Colors.teal,
+      brightness: Brightness.dark,
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: JustDatabaseAdminScreen(controller: c, theme: given),
+      ),
+    );
+    await tester.pumpAndSettle();
+    final toggle = find.byKey(const ValueKey('jdb-theme-toggle'));
+    ThemeData themeAt() => Theme.of(tester.element(toggle));
+    expect(themeAt().colorScheme.primary, given.colorScheme.primary);
+
+    c.setThemeMode(ThemeMode.light);
+    await tester.pumpAndSettle();
+    final light = themeAt();
+    expect(light.brightness, Brightness.light);
+    expect(
+      light.colorScheme.primary,
+      ColorScheme.fromSeed(seedColor: given.colorScheme.primary).primary,
+    );
+    c.setThemeMode(ThemeMode.dark);
+    await tester.pumpAndSettle();
+    expect(themeAt().colorScheme.primary, given.colorScheme.primary);
+    await _finish(tester, c, const []);
+  });
 }

@@ -7,19 +7,24 @@ import 'package:flutter/services.dart';
 
 import '../../core/database_mode.dart';
 import '../admin_style.dart';
+import '../admin_theme.dart';
 import '../admin_utils.dart';
 import '../sql_text.dart';
 
-/// Pushes [page] with the theme in effect at [context], so pages pushed from
-/// a themed admin screen keep its theme.
+/// Pushes [page] with the admin screen's theme, so it follows the screen's
+/// theme and its light or dark setting (or, outside a screen, with the
+/// themes in effect at [context]).
 @internal
 Future<T?> pushAdminPage<T>(BuildContext context, Widget page) {
   final navigator = Navigator.of(context);
-  final themed = InheritedTheme.captureAll(
-    context,
-    page,
-    to: navigator.context,
-  );
+  final admin = AdminTheme.maybeOf(context);
+  final themed = admin == null
+      ? InheritedTheme.captureAll(context, page, to: navigator.context)
+      : AdminTheme(
+          controller: admin.controller,
+          theme: admin.theme,
+          child: page,
+        );
   return navigator.push<T>(MaterialPageRoute<T>(builder: (_) => themed));
 }
 

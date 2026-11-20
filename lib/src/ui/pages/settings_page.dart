@@ -18,8 +18,35 @@ import '../widgets/admin_widgets.dart';
 
 const String _repository = 'https://github.com/just-unknown-dev/just-database';
 
-/// Settings for new databases, the data browser and the console; delete
-/// every database; about.
+/// The choices of the Appearance setting.
+enum _Appearance {
+  dark(
+    'Dark',
+    'Always dark (the default).',
+    Icons.dark_mode_outlined,
+    ThemeMode.dark,
+  ),
+  light('Light', 'Always light.', Icons.light_mode_outlined, ThemeMode.light),
+  device(
+    'Match the device',
+    "Follows the device's light or dark setting.",
+    Icons.brightness_auto_outlined,
+    ThemeMode.system,
+  );
+
+  const _Appearance(this.label, this.description, this.icon, this.mode);
+
+  final String label;
+  final String description;
+  final IconData icon;
+  final ThemeMode mode;
+
+  static _Appearance of(ThemeMode mode) =>
+      values.firstWhere((a) => a.mode == mode);
+}
+
+/// Appearance; settings for new databases, the data browser and the
+/// console; delete every database; about.
 @internal
 class SettingsPage extends StatelessWidget {
   const SettingsPage({super.key, required this.controller});
@@ -66,6 +93,30 @@ class SettingsPage extends StatelessWidget {
               child: ListView(
                 padding: const EdgeInsets.all(16),
                 children: [
+                  SectionCard(
+                    title: 'Appearance',
+                    children: [
+                      RadioGroup<_Appearance>(
+                        groupValue: _Appearance.of(c.themeMode),
+                        onChanged: (v) {
+                          if (v != null) c.setThemeMode(v.mode);
+                        },
+                        child: Column(
+                          children: [
+                            for (final a in _Appearance.values)
+                              RadioListTile<_Appearance>(
+                                key: ValueKey('jdb-setting-theme-${a.name}'),
+                                value: a,
+                                title: Text(a.label),
+                                subtitle: Text(a.description),
+                                secondary: Icon(a.icon),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  gap,
                   SectionCard(
                     title: 'New databases',
                     children: [

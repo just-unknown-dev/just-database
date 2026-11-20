@@ -83,8 +83,10 @@ Every 1.x database file still opens. See [MIGRATION.md](MIGRATION.md).
   parameters, history and snippets; database tools (create with a
   random key or a passphrase, open with a passphrase, close, change
   mode, duplicate, export/import as files or downloads, encryption,
-  save now, benchmark); a `readOnly` mode; live updates; settings kept
-  with just_storage.
+  save now, benchmark); a `readOnly` mode; live updates; its own look
+  (black and grey with coral accents), dark by default, with light and the device's setting a click away
+  (or the app's colours through `theme:`); settings kept with
+  just_storage.
 - A new saved database is written at once, so it exists (and is listed)
   before its first change.
 - Opening an open database returns the same instance (reference-counted

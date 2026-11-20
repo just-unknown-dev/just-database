@@ -7,6 +7,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart' show debugPrint, internal;
+import 'package:flutter/material.dart' show ThemeMode;
 import 'package:just_storage/just_storage.dart';
 
 import '../core/database_mode.dart';
@@ -96,6 +97,7 @@ final class AdminPreferences {
     required this.remember,
     this.defaultMode = DatabaseMode.standard,
     this.persistByDefault = true,
+    this.themeMode = ThemeMode.dark,
   });
 
   /// The just_storage key.
@@ -115,6 +117,9 @@ final class AdminPreferences {
 
   /// Whether new databases are saved.
   bool persistByDefault;
+
+  /// Light, dark or the device's setting.
+  ThemeMode themeMode;
 
   /// Rows per page in the data browser.
   int pageSize = 50;
@@ -154,6 +159,10 @@ final class AdminPreferences {
       if (json['persistByDefault'] is bool) {
         persistByDefault = json['persistByDefault'] as bool;
       }
+      final theme = ThemeMode.values
+          .where((m) => m.name == json['themeMode'])
+          .firstOrNull;
+      if (theme != null) themeMode = theme;
       final size = json['pageSize'];
       if (size is int && pageSizes.contains(size)) pageSize = size;
     }
@@ -177,6 +186,7 @@ final class AdminPreferences {
   Map<String, Object?> toJson() => {
     'defaultMode': defaultMode.name,
     'persistByDefault': persistByDefault,
+    'themeMode': themeMode.name,
     'pageSize': pageSize,
     'history': [for (final h in history) h.toJson()],
     'snippets': [for (final s in snippets) s.toJson()],

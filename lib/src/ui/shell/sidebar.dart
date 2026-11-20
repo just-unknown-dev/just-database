@@ -410,7 +410,7 @@ class _SidebarTile extends StatelessWidget {
                 children: [
                   if (leading != null) ...[
                     IconTheme.merge(
-                      data: IconThemeData(color: selected ? fg : null),
+                      data: IconThemeData(color: selected ? cs.primary : null),
                       child: leading!,
                     ),
                     const SizedBox(width: 10),

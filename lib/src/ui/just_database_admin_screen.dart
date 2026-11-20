@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'admin_style.dart';
+import 'admin_theme.dart';
 import 'dialogs/backup_dialogs.dart';
 import 'dialogs/database_dialogs.dart';
 import 'just_database_admin_controller.dart';
@@ -31,6 +32,11 @@ import 'widgets/admin_widgets.dart';
 ///
 /// Pass `readOnly: true` (or a read-only [controller]) for a screen that
 /// cannot change anything, such as a debug menu in a shipped game.
+///
+/// It has its own look, black and grey with coral accents, and is dark
+/// until the user picks light or the device's setting (the app bar's toggle, or Settings; see
+/// [JustDatabaseAdminController.themeMode]). Give it a [theme] for other
+/// colours.
 class JustDatabaseAdminScreen extends StatefulWidget {
   /// Creates the screen.
   const JustDatabaseAdminScreen({
@@ -51,8 +57,11 @@ class JustDatabaseAdminScreen extends StatefulWidget {
   /// [controller] has its own setting).
   final bool readOnly;
 
-  /// A theme for the screen and the pages and dialogs it opens; the app's
-  /// theme when null.
+  /// A theme for the screen and the pages and dialogs it opens; when null,
+  /// the workbench's own colours (greys with coral accents) in the app's
+  /// font. When the user
+  /// picks the other brightness, a theme with that brightness is made from
+  /// its colours.
   final ThemeData? theme;
 
   /// The app bar title.
@@ -126,6 +135,7 @@ class _JustDatabaseAdminScreenState extends State<JustDatabaseAdminScreen> {
         tooltip: 'Refresh (F5)',
         onPressed: () => _refresh(context),
       ),
+    _themeToggle(context),
     IconButton(
       key: const ValueKey('jdb-settings'),
       icon: const Icon(Icons.settings_outlined),
@@ -134,6 +144,17 @@ class _JustDatabaseAdminScreenState extends State<JustDatabaseAdminScreen> {
           pushAdminPage<void>(context, SettingsPage(controller: _controller)),
     ),
   ];
+
+  Widget _themeToggle(BuildContext context) {
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    return IconButton(
+      key: const ValueKey('jdb-theme-toggle'),
+      icon: Icon(dark ? Icons.light_mode_outlined : Icons.dark_mode_outlined),
+      tooltip: dark ? 'Light mode' : 'Dark mode',
+      onPressed: () =>
+          _controller.setThemeMode(dark ? ThemeMode.light : ThemeMode.dark),
+    );
+  }
 
   Widget _title(BuildContext context) => Row(
     children: [
@@ -167,8 +188,11 @@ class _JustDatabaseAdminScreenState extends State<JustDatabaseAdminScreen> {
         );
       },
     );
-    final theme = widget.theme;
-    return theme == null ? screen : Theme(data: theme, child: screen);
+    return AdminTheme(
+      controller: _controller,
+      theme: widget.theme,
+      child: screen,
+    );
   }
 
   Widget _wide(BuildContext context, double width) {

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart' show ThemeMode;
 
 import '../core/database_change.dart';
 import '../core/database_manager.dart';
@@ -80,18 +81,21 @@ class JustDatabaseAdminController extends ChangeNotifier {
   /// With [readOnly] the screen offers nothing that writes: no inserts,
   /// edits, deletes, imports, schema changes or encryption changes, and its
   /// SQL console only runs reads. [defaultMode] and [persistByDefault] are
-  /// the first defaults for new databases; with [rememberSettings] the
-  /// screen's settings, SQL history and snippets are kept between runs
-  /// (with just_storage) and override them.
+  /// the first defaults for new databases, and [themeMode] the first
+  /// appearance (dark unless given); with [rememberSettings] the screen's
+  /// settings, SQL history and snippets are kept between runs (with
+  /// just_storage) and override them.
   JustDatabaseAdminController({
     this.readOnly = false,
     DatabaseMode defaultMode = DatabaseMode.standard,
     bool persistByDefault = true,
+    ThemeMode themeMode = ThemeMode.dark,
     this.rememberSettings = true,
   }) : _prefs = AdminPreferences(
          remember: rememberSettings,
          defaultMode: defaultMode,
          persistByDefault: persistByDefault,
+         themeMode: themeMode,
        ) {
     _listSub = DatabaseManager.listChanges.listen((_) => _scheduleReload());
     unawaited(_prefs.load().then((_) => _notify()));
@@ -215,6 +219,18 @@ class JustDatabaseAdminController extends ChangeNotifier {
   /// Sets [persistByDefault].
   void setPersistByDefault(bool value) {
     _prefs.persistByDefault = value;
+    _prefs.changed();
+    _notify();
+  }
+
+  /// Whether the screen is light or dark: [ThemeMode.dark] (the default),
+  /// [ThemeMode.light], or [ThemeMode.system] to follow the device. A
+  /// screen `theme` of the other brightness is remade from its colours.
+  ThemeMode get themeMode => _prefs.themeMode;
+
+  /// Sets [themeMode].
+  void setThemeMode(ThemeMode mode) {
+    _prefs.themeMode = mode;
     _prefs.changed();
     _notify();
   }

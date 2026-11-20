@@ -436,6 +436,10 @@ A database workbench for your app, only in `package:just_database/ui.dart`
 databases, tables, views and triggers beside the selected one's panes; on a
 phone the same pieces are pages you drill into.
 
+![The workbench on a desktop, in its dark default with coral accents: the sidebar lists four databases and the tables, views and trigger of save_game; the players table is sorted by level, and row 5 is open in the side-panel editor](assets/screenshots/workbench_desktop.png)
+
+![The workbench on phones, in dark: the tables, views and trigger of save_game; the rows of the players table; a query and its results in the SQL console](assets/screenshots/workbench_phone.png)
+
 * **Data**: browse a table or view a page at a time; search every column or
   filter with a `WHERE` expression; sort by a header; resize columns; edit
   a cell in place (double-click or F2) or a row in a side panel; view long
@@ -456,13 +460,20 @@ phone the same pieces are pages you drill into.
   download), encrypt, re-key or decrypt, save now, benchmark, delete.
 * It lists the databases your app has open (and uses those instances) as
   well as the saved ones, and stays current while the app writes.
+* **Its own look**: black and grey with coral accents, dark by default,
+  in the app's font. The user can switch to light or the device's setting (the sun and
+  moon button, or Settings). Pass `theme:` for your own colours; a theme
+  without the brightness picked is remade in it from its colours.
+
+![The workbench in light mode: a parameterised query with highlighting and its results in the SQL console](assets/screenshots/workbench_desktop_light.png)
 
 `JustDatabaseAdminScreen({controller, readOnly, theme, title,
 onSeedDatabase})`: `readOnly: true` hides everything that writes (the
 console then only runs reads), which suits a debug menu in a shipped game;
 `onSeedDatabase` adds a "Seed sample data" action. Pass a
 `JustDatabaseAdminController` to share the state between screens or to
-choose what is shown (`selectDatabase(name)`); unless you turn
+choose what is shown (`selectDatabase(name)`) or how
+(`themeMode: ThemeMode.light`, `setThemeMode`); unless you turn
 `rememberSettings` off, its settings, SQL history and snippets are kept
 with just_storage.
 

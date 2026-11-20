@@ -11,6 +11,14 @@ topics:
   - encryption
   - persistence
 
+screenshots:
+  - description: "The admin workbench on a desktop: databases and tables in the sidebar, a sorted table, and a row in the side-panel editor."
+    path: assets/screenshots/workbench_desktop.png
+  - description: "The admin workbench on phones: a database's tables, a table's rows, and a query in the SQL console."
+    path: assets/screenshots/workbench_phone.png
+  - description: "The admin workbench in light mode: a parameterised query with highlighting, and its results."
+    path: assets/screenshots/workbench_desktop_light.png
+
 environment:
   sdk: ^3.11.0
   flutter: ">=3.47.1"

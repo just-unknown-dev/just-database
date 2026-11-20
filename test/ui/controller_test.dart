@@ -3,6 +3,7 @@
 // encryption, backups, deleting, read-only, live updates and settings.
 import 'dart:convert';
 
+import 'package:flutter/material.dart' show ThemeMode;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:just_database/just_database.dart';
 import 'package:just_database/src/ui/admin_preferences.dart';
@@ -349,6 +350,7 @@ void main() {
     c
       ..setPageSize(250)
       ..setDefaultMode(DatabaseMode.readFast)
+      ..setThemeMode(ThemeMode.light)
       ..addHistory(
         HistoryEntry(
           sql: 'SELECT 1',
@@ -364,13 +366,15 @@ void main() {
     c = await _controller(remember: true);
     await _until(() => c.pageSize == 250, reason: 'the settings were read');
     expect(c.defaultMode, DatabaseMode.readFast);
+    expect(c.themeMode, ThemeMode.light);
     expect(c.history.single.sql, 'SELECT 1');
     expect(c.snippets.single.name, 'one');
     c
       ..clearHistory()
       ..deleteSnippet('one')
       ..setPageSize(50)
-      ..setDefaultMode(DatabaseMode.standard);
+      ..setDefaultMode(DatabaseMode.standard)
+      ..setThemeMode(ThemeMode.dark);
     c.dispose();
     await Future<void>.delayed(const Duration(milliseconds: 300));
   });

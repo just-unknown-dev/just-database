@@ -206,6 +206,13 @@ other file is internal.
   `DataPane` (queries go through `query()`, so a filter can never write;
   rows are addressed by rowid), `StructurePane` and `SqlConsole`.
   Dialogs that change things live in `dialogs/`.
+* `admin_theme.dart` themes the screen in the brightness the
+  controller's `themeMode` asks for (dark by default): the workbench's own
+  colours (Material's neutral greys, with the logo's coral as the accent)
+  in the app's font; or a given
+  theme, remade from its colours when it has the other brightness. Pages
+  the screen pushes get their own `AdminTheme`, so a change reaches pages
+  already open.
 * SQL text helpers (`sql_text.dart`) reuse the engine's lexer for
   highlighting, statement splitting (trigger bodies stay whole) and
   completion.
