@@ -1,0 +1,24 @@
+name: just_database_devtools_extension
+description: "The just_database workbench as a Flutter DevTools extension. Built into ../extension/devtools; not published."
+publish_to: none
+version: 2.0.0
+
+environment:
+  sdk: ^3.11.0
+  flutter: ">=3.47.1"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  devtools_extensions: ^0.5.1
+  just_database:
+    path: ..
+  vm_service: ^15.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

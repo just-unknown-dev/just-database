@@ -29,3 +29,15 @@ migrate_working_dir/
 .flutter-plugins-dependencies
 /build/
 /coverage/
+
+# Local path overrides for unpublished dependencies
+pubspec_overrides.yaml
+example/pubspec_overrides.yaml
+example/pubspec.lock
+
+# Audit notes (not part of the package)
+.audit/
+
+# The DevTools extension's build (made before publishing, see
+# devtools_extension/README.md; .pubignore still publishes it)
+/extension/devtools/build/

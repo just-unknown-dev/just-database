@@ -1,5 +1,154 @@
 ﻿# Changelog
 
+## [2.0.0] - 2026-11-20
+
+A new SQL engine that follows SQLite, new persistence, and a tidier API.
+Every 1.x database file still opens. See [MIGRATION.md](MIGRATION.md).
+
+### Breaking
+
+- **SQL follows SQLite.** Three-valued `NULL` logic; numeric `+` (`||`
+  joins text); `BOOLEAN` stores `1`/`0` and `DATETIME` ISO-8601 text;
+  SQLite type affinity; `INTEGER PRIMARY KEY` is the rowid; unknown columns,
+  text after a statement and several statements in one `execute` are
+  errors; result columns are named like SQLite names them (duplicates get
+  `:1`); `LIKE`, `NOCASE`, `lower()` and `upper()` fold ASCII only.
+- **Encryption is not a mode:** `DatabaseMode.secure` is gone; pass an
+  `encryptionKey` with any mode. Keys are derived with PBKDF2-HMAC-SHA256
+  (600 000 iterations, a salt per file) instead of one SHA-256.
+- **Files moved** to `<application support>/just_database/` (1.x: the
+  documents directory, shared by every app on desktop). A 1.x file is
+  copied over the first time it is opened. The file format is now 2; the
+  first save converts a 1.x file.
+- **The admin UI is a new workbench, only in
+  `package:just_database/ui.dart`.** `JUDatabaseAdminScreen` is
+  `JustDatabaseAdminScreen({controller, readOnly, theme, title,
+  onSeedDatabase})`; `JustDatabaseAdminController` replaces
+  `DatabaseProvider`; `JustDatabaseAdminWidget`, the tabs and the pages
+  (`DatabaseDetailPage`, `InsertPage`, `BenchmarkPage`) are no longer
+  public.
+- **Internals are no longer public:** `Executor`, `Parser`, the AST,
+  `Table`, `TableIndex`, `DatabaseRow`, `LockManager`, `QueryTracker`,
+  `PersistenceManager`, `BackupManager`, `RTreeIndex`, `BoundingBox`,
+  `Point`. Schemas use `ColumnDefinition`/`TableConstraint`/
+  `ForeignKeyDefinition` (`DataType` and `ConstraintDefinition` are gone).
+- `transaction()` passes a `Transaction` whose statements throw, and rolls
+  back when the callback throws (1.x committed after failed statements).
+- `query()` refuses statements that write.
+- Migrations take a `Transaction`; `MigrationStatus.skipped` is
+  `rolledBack`; `MigrationGuard` is removed.
+- `DatabaseManager.openDatabases` is read-only; `DatabaseInfo` reports
+  `isEncrypted` instead of a mode for closed databases.
+- ORM `fromRow` receives stored values (use the new row helpers); queries
+  take `whereArgs`.
+- Automatic query-pattern indexes are gone.
+- Requires Flutter 3.47.1 and `just_storage` ^2.0.0; `just_signals` is no
+  longer a dependency, and `encrypt` is replaced by `pointycastle`.
+
+### Added
+
+- Bound parameters (`?`, `?NNN`, `:name`, `@name`, `$name`) on `execute`,
+  `query`, the query builder and the ORM.
+- SQL: `CASE`, `CAST`, `IN (SELECT …)`, `EXISTS`, correlated subqueries,
+  `UNION [ALL]`/`INTERSECT`/`EXCEPT`, `VALUES`, `INSERT … SELECT`,
+  `DEFAULT VALUES`, `INSERT OR …`, `REPLACE`, upserts
+  (`ON CONFLICT … DO UPDATE`), `RIGHT`/`FULL`/`NATURAL`/`USING` joins,
+  `CHECK`, `INSTEAD OF` triggers, `RAISE()`, `||`, `LIKE … ESCAPE`, `GLOB`,
+  `COLLATE`, quoted identifiers, blob and hex literals, `ORDER BY … NULLS
+  FIRST/LAST`, `CREATE TABLE … AS SELECT`, `ALTER TABLE … RENAME TO`,
+  `PRAGMA foreign_keys/user_version/table_info/index_list`, and SQLite's
+  string, math, date/time and aggregate functions.
+- Indexes answer equality lookups and joins; spatial indexes answer
+  `ST_WITHIN`/`ST_INTERSECTS`/`ST_CONTAINS`/`ST_DWITHIN`. New
+  `ST_MAKEENVELOPE`, `ST_DISTANCE_SPHERE`, `ST_DWITHIN`, WKT geometries.
+- `executeScript()`, `QueryResult.values`/`error`/`scalar`/
+  `lastInsertRowId`/`orThrow()`, `SqlException` with `SqlErrorKind`.
+- `exportSql()`, `exportJson()`, `importSql()`, `importJson()` on the
+  database (atomic replace).
+- `changeEncryptionKey()`, `onSaveError`, `saveError`, `findOpen()`,
+  `indexesForTable()`, `rowCount()`, `getViewSql()`, `getTriggerSql()`,
+  `getTriggerTable()`, `triggerNamesForTable()`,
+  `JustDatabase.nameProblem()`, `SecureKeyManager.hasAutoKey()`.
+- `JustDatabase.changes`: a `DatabaseChange` (tables touched, schema
+  changed) after each committed statement, script or transaction;
+  `DatabaseManager.listChanges` when a database is opened, closed,
+  deleted or encrypted, or another opener starts or stops using an open
+  one. `QueryResult.elapsed`.
+- The admin workbench: a sidebar and panes on wide screens, drill-down
+  pages on phones; a data browser with search, `WHERE` filters,
+  sorting, resizable columns, in-place editing, a side-panel row
+  editor, a value inspector (text, JSON, hex) and CSV/JSON export;
+  structure editing (columns, indexes, tables) and a create-table
+  designer; a SQL console with highlighting, completion, run selection
+  or statement, per-statement results and timing, error positions,
+  parameters, history and snippets; database tools (create with a
+  random key or a passphrase, open with a passphrase, close, change
+  mode, duplicate, export/import as files or downloads, encryption,
+  save now, benchmark); a `readOnly` mode; live updates; its own look
+  (black and grey with coral accents), dark by default, with light and
+  the device's setting a click away (or the app's colours through
+  `theme:`); settings kept with just_storage.
+- The workbench in Flutter DevTools: a **just_database** tab, on the
+  databases of an app running in a debug build (phones and emulators
+  too). The app registers one Dart VM service extension when it opens its
+  first database and does no work for it until the tab connects;
+  `JustDatabase.debugDevToolsWorkbench = false` turns it off. Release and
+  profile builds have none of it.
+- A new saved database is written at once, so it exists (and is listed)
+  before its first change.
+- Opening an open database returns the same instance (reference-counted
+  `close`); a lock keeps other processes and browser tabs out.
+- Web: encrypted databases are encrypted in IndexedDB (WebCrypto).
+- `DbRowValues` row helpers, `QueryBuilder.whereEquals`.
+- Migrations on an opened database: `migrate()`, `migrationRunner()`
+  (from the unreleased 1.5.0).
+
+### Fixed
+
+- Statements are atomic: a failing multi-row `INSERT`/`UPDATE` or a
+  failing trigger leaves nothing behind.
+- Uncommitted transactions were saved, and `close()` inside a transaction
+  persisted it; views, triggers and `CREATE INDEX` indexes were not saved;
+  one `Infinity` value stopped every later save; `close()` did not wait for
+  running statements; one database could be open twice and lose writes;
+  saves raced and lost writes (fixed in the unreleased 1.5.0, kept).
+- Table-level `PRIMARY KEY`/`UNIQUE`, `CREATE UNIQUE INDEX`, composite keys
+  on `UPDATE` and keys after `ROLLBACK` were not enforced; values were
+  checked before type conversion; column names were case-sensitive in
+  `INSERT`/`UPDATE`; `ALTER TABLE` broke constraints.
+- Scalar functions collapsed results to one row; aggregates failed inside
+  expressions and `ORDER BY`; `DISTINCT` aggregates counted duplicates;
+  `ORDER BY` a column not selected did nothing; joins mixed up same-named
+  columns; `GROUP BY` merged `NULL` with `'NULL'`.
+- `AUTOINCREMENT` did not move past explicit ids; `ON DELETE`/`ON UPDATE`
+  actions, triggers' `NEW.id`, `DEFAULT -1` and `DEFAULT
+  CURRENT_TIMESTAMP` misbehaved.
+- Backups dropped negative numbers, blobs, defaults, keys, indexes, views
+  and triggers.
+- Migrations were not atomic, accepted duplicate versions, skipped
+  out-of-order ones and ignored checksums.
+- `SecureKeyManager`: concurrent first calls could create two keys;
+  passwords outside Latin-1 collided.
+- Database names could escape the database directory.
+- `changeEncryptionKey()` left the old key as the one later openers had
+  to give while the database stayed open.
+- Admin UI: it opened a second instance of databases the app had open;
+  deleting one of two identical rows deleted both; editing trimmed text
+  and turned `''` into `NULL`; a failed open showed another database's
+  pages; the "File Persistence" switch hid saved data; DATETIME input
+  allowed SQL injection; large tables were capped at 500 rows and built
+  every cell; the benchmark froze the UI and dropped `_bench_t` in your
+  database; the back arrow emptied the app; colours ignored dark mode;
+  errors were shown on the wrong tab. All fixed, with widget tests.
+- Quadratic `UPDATE`, cascading `DELETE`, R-tree inserts and joins.
+- Opening a database file that cannot be read throws instead of starting
+  empty and overwriting it (from the unreleased 1.5.0).
+
+### Removed
+
+- The OPFS/Web Worker/WAL web backend, which could never activate.
+- `API.md` and `DOCS.md`; the README and dartdoc cover the API.
+
 ## [1.4.2] - 2026-05-05
 
 ### Fixed

@@ -1,410 +1,357 @@
 import 'dart:math' as math;
-import 'spatial.dart';
 
-/// Entry stored in the R-tree.
-class RTreeEntry {
-  final int id; // user-supplied row/record ID
-  final BoundingBox bbox;
+import 'package:flutter/foundation.dart' show internal;
 
-  const RTreeEntry({required this.id, required this.bbox});
+/// An axis-aligned rectangle; a point is a rectangle of zero size.
+@internal
+final class Rect {
+  /// Creates a rectangle. Throws [ArgumentError] unless every bound is
+  /// finite and min ≤ max.
+  Rect(this.minX, this.minY, this.maxX, this.maxY) {
+    if (!(minX.isFinite && minY.isFinite && maxX.isFinite && maxY.isFinite)) {
+      throw ArgumentError('Rect bounds must be finite');
+    }
+    if (minX > maxX || minY > maxY) {
+      throw ArgumentError('Rect min must not exceed max');
+    }
+  }
 
-  factory RTreeEntry.fromJson(Map<String, dynamic> json) => RTreeEntry(
-    id: json['id'] as int,
-    bbox: BoundingBox.fromJson(json['bbox'] as Map<String, dynamic>),
+  /// A rectangle of zero size at ([x], [y]).
+  Rect.point(double x, double y) : this(x, y, x, y);
+
+  /// The bounds.
+  final double minX, minY, maxX, maxY;
+
+  /// The area.
+  double get area => (maxX - minX) * (maxY - minY);
+
+  /// The smallest rectangle holding this and [o].
+  Rect union(Rect o) => Rect(
+    math.min(minX, o.minX),
+    math.min(minY, o.minY),
+    math.max(maxX, o.maxX),
+    math.max(maxY, o.maxY),
   );
 
-  Map<String, dynamic> toJson() => {'id': id, 'bbox': bbox.toJson()};
+  /// Whether this and [o] share at least a border point.
+  bool intersects(Rect o) =>
+      minX <= o.maxX && o.minX <= maxX && minY <= o.maxY && o.minY <= maxY;
+
+  /// Whether [o] lies inside this rectangle (borders included).
+  bool contains(Rect o) =>
+      minX <= o.minX && o.maxX <= maxX && minY <= o.minY && o.maxY <= maxY;
+
+  @override
+  bool operator ==(Object other) =>
+      other is Rect &&
+      other.minX == minX &&
+      other.minY == minY &&
+      other.maxX == maxX &&
+      other.maxY == maxY;
+
+  @override
+  int get hashCode => Object.hash(minX, minY, maxX, maxY);
+
+  @override
+  String toString() => 'Rect($minX, $minY, $maxX, $maxY)';
 }
 
-/// An in-memory R-tree spatial index using the quadratic split algorithm.
-/// Supports insert, delete, bounding-box search, and k-nearest-neighbour query.
-class RTreeIndex {
-  static const int _maxEntries = 9;
-  static const int _minEntries = 4;
+final class _Entry<T> {
+  _Entry(this.box, {this.value, this.child});
+  Rect box;
+  final T? value;
+  final _Node<T>? child;
+}
 
-  _RTreeNode _root = _RTreeNode(isLeaf: true);
+final class _Node<T> {
+  _Node({required this.leaf});
+  final bool leaf;
+  final List<_Entry<T>> entries = [];
+  _Node<T>? parent;
 
-  RTreeIndex._();
-
-  /// Creates a new empty R-tree index.
-  factory RTreeIndex() => RTreeIndex._();
-
-  /// Returns the number of entries in the index.
-  int get length => _countEntries(_root);
-
-  int _countEntries(_RTreeNode node) {
-    if (node.isLeaf) return node.entries.length;
-    return node.children.fold(0, (sum, child) => sum + _countEntries(child));
-  }
-
-  // ---------------------------------------------------------------------------
-  // Insert
-  // ---------------------------------------------------------------------------
-
-  /// Inserts an entry with the given [id] and [bbox].
-  void insert(int id, BoundingBox bbox) {
-    final entry = RTreeEntry(id: id, bbox: bbox);
-    final overflow = _insert(_root, entry, _treeHeight(_root));
-    if (overflow != null) {
-      // Root was split
-      final newRoot = _RTreeNode(isLeaf: false);
-      newRoot.children.add(_root);
-      newRoot.children.add(overflow);
-      newRoot.bbox = _root.bbox!.expand(overflow.bbox!);
-      _root = newRoot;
-    } else {
-      _updateBBox(_root);
+  Rect get box {
+    var r = entries.first.box;
+    for (var i = 1; i < entries.length; i++) {
+      r = r.union(entries[i].box);
     }
+    return r;
+  }
+}
+
+/// An R-tree (Guttman, quadratic split) mapping rectangles to values.
+@internal
+final class RTree<T> {
+  /// Creates an empty tree whose nodes hold up to [maxEntries] entries.
+  RTree({this.maxEntries = 16})
+    : minEntries = math.max(2, (maxEntries * 0.4).floor());
+
+  /// The most entries a node holds before it splits.
+  final int maxEntries;
+
+  /// The fewest entries a non-root node keeps.
+  final int minEntries;
+
+  _Node<T> _root = _Node<T>(leaf: true);
+  int _size = 0;
+
+  /// The number of stored values.
+  int get size => _size;
+
+  /// Removes everything.
+  void clear() {
+    _root = _Node<T>(leaf: true);
+    _size = 0;
   }
 
-  _RTreeNode? _insert(_RTreeNode node, RTreeEntry entry, int targetLevel) {
-    if (node.isLeaf) {
-      node.entries.add(entry);
-      _updateBBox(node);
-      if (node.entries.length > _maxEntries) {
-        return _splitLeaf(node);
+  /// Stores [value] under [box].
+  void insert(Rect box, T value) {
+    _insertEntry(_Entry<T>(box, value: value), leafLevel: true);
+    _size++;
+  }
+
+  /// Removes one entry with [value] under exactly [box]. Returns whether
+  /// one was found.
+  bool remove(Rect box, T value) {
+    final leaf = _findLeaf(_root, box, value);
+    if (leaf == null) return false;
+    leaf.entries.removeWhere((e) => e.value == value && e.box == box);
+    _size--;
+    _condense(leaf);
+    if (!_root.leaf && _root.entries.length == 1) {
+      _root = _root.entries.first.child!..parent = null;
+    }
+    return true;
+  }
+
+  /// The values whose rectangles intersect [area].
+  List<T> search(Rect area) {
+    final out = <T>[];
+    if (_size == 0) return out;
+    final stack = [_root];
+    while (stack.isNotEmpty) {
+      final n = stack.removeLast();
+      for (final e in n.entries) {
+        if (!e.box.intersects(area)) continue;
+        if (n.leaf) {
+          out.add(e.value as T);
+        } else {
+          stack.add(e.child!);
+        }
       }
-      return null;
     }
+    return out;
+  }
 
-    // Choose sub-tree with minimum enlargement
-    final best = _chooseBestChild(node, entry.bbox);
-    final overflow = _insert(best, entry, targetLevel);
-    _updateBBox(node);
-    if (overflow != null) {
-      node.children.add(overflow);
-      if (node.children.length > _maxEntries) {
-        return _splitInternal(node);
+  int _height(_Node<T> n) {
+    var h = 1;
+    var x = n;
+    while (!x.leaf) {
+      x = x.entries.first.child!;
+      h++;
+    }
+    return h;
+  }
+
+  /// Inserts [entry] into a leaf (or, for a reinserted subtree, into a node
+  /// at [depth] levels above the leaves).
+  void _insertEntry(_Entry<T> entry, {required bool leafLevel, int depth = 0}) {
+    var node = _root;
+    final targetHeight = leafLevel ? 1 : depth + 1;
+    while (_height(node) > targetHeight) {
+      _Entry<T>? best;
+      var bestGrowth = double.infinity;
+      var bestArea = double.infinity;
+      for (final e in node.entries) {
+        final area = e.box.area;
+        final growth = e.box.union(entry.box).area - area;
+        if (growth < bestGrowth || (growth == bestGrowth && area < bestArea)) {
+          best = e;
+          bestGrowth = growth;
+          bestArea = area;
+        }
       }
+      node = best!.child!;
     }
-    return null;
+    node.entries.add(entry);
+    entry.child?.parent = node;
+    _adjust(node);
   }
 
-  _RTreeNode _chooseBestChild(_RTreeNode node, BoundingBox bbox) {
-    _RTreeNode? best;
-    double bestEnlargement = double.infinity;
-    double bestArea = double.infinity;
-    for (final child in node.children) {
-      final enlargement = child.bbox?.enlargement(bbox) ?? double.infinity;
-      final childArea = child.bbox?.area ?? double.infinity;
-      if (enlargement < bestEnlargement ||
-          (enlargement == bestEnlargement && childArea < bestArea)) {
-        best = child;
-        bestEnlargement = enlargement;
-        bestArea = childArea;
+  /// Splits [node] if it overflows and fixes the boxes on the path to the
+  /// root.
+  void _adjust(_Node<T> node) {
+    _Node<T>? n = node;
+    while (n != null) {
+      _Node<T>? sibling;
+      if (n.entries.length > maxEntries) sibling = _split(n);
+      final parent = n.parent;
+      if (parent == null) {
+        if (sibling != null) {
+          final root = _Node<T>(leaf: false);
+          root.entries
+            ..add(_Entry<T>(n.box, child: n))
+            ..add(_Entry<T>(sibling.box, child: sibling));
+          n.parent = root;
+          sibling.parent = root;
+          _root = root;
+        }
+        return;
       }
+      for (final e in parent.entries) {
+        if (identical(e.child, n)) e.box = n.box;
+      }
+      if (sibling != null) {
+        parent.entries.add(_Entry<T>(sibling.box, child: sibling));
+        sibling.parent = parent;
+      }
+      n = parent;
     }
-    return best ?? node.children.first;
   }
 
-  // ---------------------------------------------------------------------------
-  // Quadratic split
-  // ---------------------------------------------------------------------------
-
-  _RTreeNode _splitLeaf(_RTreeNode node) {
-    final sibling = _RTreeNode(isLeaf: true);
-    _quadraticPickSeeds(node.entries, (a, b) {
-      final left = [a];
-      final right = [b];
-      final remaining = List.of(node.entries)
-        ..remove(a)
-        ..remove(b);
-      _distributeEntries(remaining, left, right);
-      node.entries
-        ..clear()
-        ..addAll(left);
-      sibling.entries.addAll(right);
-    });
-    _updateBBox(node);
-    _updateBBox(sibling);
-    return sibling;
-  }
-
-  _RTreeNode _splitInternal(_RTreeNode node) {
-    final sibling = _RTreeNode(isLeaf: false);
-    final allChildren = List.of(node.children);
-    node.children.clear();
-
-    // Find the pair (a, b) that waste most area
-    double worstWaste = double.negativeInfinity;
-    int seedA = 0, seedB = 1;
-    for (int i = 0; i < allChildren.length; i++) {
-      for (int j = i + 1; j < allChildren.length; j++) {
-        final combined = (allChildren[i].bbox ?? const BoundingBox(0, 0, 0, 0))
-            .expand(allChildren[j].bbox ?? const BoundingBox(0, 0, 0, 0));
+  /// Quadratic split: moves about half of [node]'s entries into a new
+  /// sibling, which is returned.
+  _Node<T> _split(_Node<T> node) {
+    final all = List<_Entry<T>>.of(node.entries);
+    // Pick the two seeds that would waste the most area together.
+    var seedA = 0, seedB = 1;
+    var worst = double.negativeInfinity;
+    for (var i = 0; i < all.length; i++) {
+      for (var j = i + 1; j < all.length; j++) {
         final waste =
-            combined.area -
-            (allChildren[i].bbox?.area ?? 0) -
-            (allChildren[j].bbox?.area ?? 0);
-        if (waste > worstWaste) {
-          worstWaste = waste;
+            all[i].box.union(all[j].box).area -
+            all[i].box.area -
+            all[j].box.area;
+        if (waste > worst) {
+          worst = waste;
           seedA = i;
           seedB = j;
         }
       }
     }
-
-    final leftChildren = [allChildren[seedA]];
-    final rightChildren = [allChildren[seedB]];
-    final remaining = List.of(allChildren)
-      ..removeAt(math.max(seedA, seedB))
-      ..removeAt(math.min(seedA, seedB));
-
-    for (final child in remaining) {
-      final leftBBox = leftChildren.fold<BoundingBox?>(
-        null,
-        (acc, c) =>
-            acc == null ? c.bbox : (c.bbox == null ? acc : acc.expand(c.bbox!)),
-      );
-      final rightBBox = rightChildren.fold<BoundingBox?>(
-        null,
-        (acc, c) =>
-            acc == null ? c.bbox : (c.bbox == null ? acc : acc.expand(c.bbox!)),
-      );
-      final leftGrowth =
-          leftBBox?.enlargement(child.bbox ?? const BoundingBox(0, 0, 0, 0)) ??
-          0;
-      final rightGrowth =
-          rightBBox?.enlargement(child.bbox ?? const BoundingBox(0, 0, 0, 0)) ??
-          0;
-      if (leftChildren.length + remaining.length - 1 == _minEntries) {
-        leftChildren.add(child);
-      } else if (rightChildren.length + remaining.length - 1 == _minEntries) {
-        rightChildren.add(child);
-      } else if (leftGrowth < rightGrowth) {
-        leftChildren.add(child);
+    final a = <_Entry<T>>[all[seedA]], b = <_Entry<T>>[all[seedB]];
+    var boxA = all[seedA].box, boxB = all[seedB].box;
+    final rest = [
+      for (var i = 0; i < all.length; i++)
+        if (i != seedA && i != seedB) all[i],
+    ];
+    while (rest.isNotEmpty) {
+      // Keep both groups at least minEntries.
+      if (a.length + rest.length == minEntries) {
+        a.addAll(rest);
+        break;
+      }
+      if (b.length + rest.length == minEntries) {
+        b.addAll(rest);
+        break;
+      }
+      // Next: the entry with the strongest preference.
+      var pick = 0;
+      var bestDiff = double.negativeInfinity;
+      for (var i = 0; i < rest.length; i++) {
+        final dA = boxA.union(rest[i].box).area - boxA.area;
+        final dB = boxB.union(rest[i].box).area - boxB.area;
+        final diff = (dA - dB).abs();
+        if (diff > bestDiff) {
+          bestDiff = diff;
+          pick = i;
+        }
+      }
+      final e = rest.removeAt(pick);
+      final dA = boxA.union(e.box).area - boxA.area;
+      final dB = boxB.union(e.box).area - boxB.area;
+      final toA =
+          dA < dB ||
+          (dA == dB &&
+              (boxA.area < boxB.area ||
+                  (boxA.area == boxB.area && a.length <= b.length)));
+      if (toA) {
+        a.add(e);
+        boxA = boxA.union(e.box);
       } else {
-        rightChildren.add(child);
+        b.add(e);
+        boxB = boxB.union(e.box);
       }
     }
-
-    node.children.addAll(leftChildren);
-    sibling.children.addAll(rightChildren);
-    _updateBBox(node);
-    _updateBBox(sibling);
+    node.entries
+      ..clear()
+      ..addAll(a);
+    final sibling = _Node<T>(leaf: node.leaf);
+    sibling.entries.addAll(b);
+    for (final e in a) {
+      e.child?.parent = node;
+    }
+    for (final e in b) {
+      e.child?.parent = sibling;
+    }
     return sibling;
   }
 
-  void _quadraticPickSeeds<T extends Object>(
-    List<T> items,
-    void Function(T, T) callback,
-  ) {
-    if (items.length < 2) return;
-    T? seedA, seedB;
-    double worstWaste = double.negativeInfinity;
-    for (int i = 0; i < items.length; i++) {
-      for (int j = i + 1; j < items.length; j++) {
-        final bboxA = _bboxOf(items[i]);
-        final bboxB = _bboxOf(items[j]);
-        if (bboxA == null || bboxB == null) continue;
-        final combined = bboxA.expand(bboxB);
-        final waste = combined.area - bboxA.area - bboxB.area;
-        if (waste > worstWaste) {
-          worstWaste = waste;
-          seedA = items[i];
-          seedB = items[j];
-        }
+  _Node<T>? _findLeaf(_Node<T> node, Rect box, T value) {
+    if (node.leaf) {
+      for (final e in node.entries) {
+        if (e.value == value && e.box == box) return node;
+      }
+      return null;
+    }
+    for (final e in node.entries) {
+      if (e.box.contains(box)) {
+        final found = _findLeaf(e.child!, box, value);
+        if (found != null) return found;
       }
     }
-    if (seedA != null && seedB != null) callback(seedA, seedB);
-  }
-
-  void _distributeEntries(
-    List<RTreeEntry> remaining,
-    List<RTreeEntry> left,
-    List<RTreeEntry> right,
-  ) {
-    for (final entry in remaining) {
-      final leftBox = left.fold<BoundingBox?>(
-        null,
-        (acc, e) => acc == null ? e.bbox : acc.expand(e.bbox),
-      );
-      final rightBox = right.fold<BoundingBox?>(
-        null,
-        (acc, e) => acc == null ? e.bbox : acc.expand(e.bbox),
-      );
-      final leftGrow = leftBox?.enlargement(entry.bbox) ?? 0;
-      final rightGrow = rightBox?.enlargement(entry.bbox) ?? 0;
-      if (left.length + remaining.length - remaining.indexOf(entry) ==
-          _minEntries) {
-        left.add(entry);
-      } else if (right.length + remaining.length - remaining.indexOf(entry) ==
-          _minEntries) {
-        right.add(entry);
-      } else if (leftGrow <= rightGrow) {
-        left.add(entry);
-      } else {
-        right.add(entry);
-      }
-    }
-  }
-
-  BoundingBox? _bboxOf(dynamic item) {
-    if (item is RTreeEntry) return item.bbox;
-    if (item is _RTreeNode) return item.bbox;
     return null;
   }
 
-  // ---------------------------------------------------------------------------
-  // Delete
-  // ---------------------------------------------------------------------------
-
-  /// Removes the entry with the given [id]. Returns true if found.
-  bool delete(int id) {
-    final removed = _delete(_root, id);
-    if (removed) _updateBBox(_root);
-    return removed;
-  }
-
-  bool _delete(_RTreeNode node, int id) {
-    if (node.isLeaf) {
-      final before = node.entries.length;
-      node.entries.removeWhere((e) => e.id == id);
-      return node.entries.length < before;
-    }
-    for (final child in node.children) {
-      if (child.bbox != null && _delete(child, id)) {
-        _updateBBox(node);
-        return true;
+  /// After a removal from [leaf]: drops underfull nodes on the path to the
+  /// root, reinserts their entries, and fixes the boxes.
+  void _condense(_Node<T> leaf) {
+    final orphans = <(_Entry<T>, int)>[];
+    var n = leaf;
+    var level = 0;
+    while (n.parent != null) {
+      final parent = n.parent!;
+      if (n.entries.length < minEntries) {
+        parent.entries.removeWhere((e) => identical(e.child, n));
+        for (final e in n.entries) {
+          orphans.add((e, level));
+        }
+      } else {
+        for (final e in parent.entries) {
+          if (identical(e.child, n)) e.box = n.box;
+        }
       }
+      n = parent;
+      level++;
     }
-    return false;
-  }
-
-  // ---------------------------------------------------------------------------
-  // Search
-  // ---------------------------------------------------------------------------
-
-  /// Returns all entries whose bounding boxes intersect [bbox].
-  List<RTreeEntry> search(BoundingBox bbox) {
-    final results = <RTreeEntry>[];
-    _search(_root, bbox, results);
-    return results;
-  }
-
-  void _search(_RTreeNode node, BoundingBox bbox, List<RTreeEntry> results) {
-    if (node.bbox != null && !node.bbox!.intersects(bbox)) return;
-    if (node.isLeaf) {
-      for (final entry in node.entries) {
-        if (entry.bbox.intersects(bbox)) results.add(entry);
-      }
-    } else {
-      for (final child in node.children) {
-        _search(child, bbox, results);
+    if (_root.entries.isEmpty && !_root.leaf) {
+      _root = _Node<T>(leaf: true);
+    }
+    for (final (e, lvl) in orphans) {
+      if (e.child == null) {
+        _insertEntry(e, leafLevel: true);
+      } else {
+        _reinsertSubtree(e, lvl);
       }
     }
   }
 
-  /// Returns the [k] nearest entries to the given [point].
-  List<RTreeEntry> nearest(Point point, int k) {
-    final all = <RTreeEntry>[];
-    _collectAll(_root, all);
-    all.sort((a, b) {
-      final da = _minDist(a.bbox, point);
-      final db = _minDist(b.bbox, point);
-      return da.compareTo(db);
-    });
-    return all.take(k).toList();
-  }
-
-  double _minDist(BoundingBox bbox, Point point) {
-    final cx = point.x.clamp(bbox.minX, bbox.maxX);
-    final cy = point.y.clamp(bbox.minY, bbox.maxY);
-    final dx = point.x - cx;
-    final dy = point.y - cy;
-    return math.sqrt(dx * dx + dy * dy);
-  }
-
-  void _collectAll(_RTreeNode node, List<RTreeEntry> results) {
-    if (node.isLeaf) {
-      results.addAll(node.entries);
-    } else {
-      for (final child in node.children) {
-        _collectAll(child, results);
+  void _reinsertSubtree(_Entry<T> e, int level) {
+    // A subtree whose root was at [level] above the leaves: if the tree has
+    // become too short for it, reinsert its leaf entries one by one.
+    if (_height(_root) < level + 1) {
+      final stack = [e.child!];
+      while (stack.isNotEmpty) {
+        final n = stack.removeLast();
+        for (final c in n.entries) {
+          if (n.leaf) {
+            _insertEntry(c, leafLevel: true);
+          } else {
+            stack.add(c.child!);
+          }
+        }
       }
+      return;
     }
+    _insertEntry(e, leafLevel: false, depth: level);
   }
-
-  // ---------------------------------------------------------------------------
-  // Helpers
-  // ---------------------------------------------------------------------------
-
-  void _updateBBox(_RTreeNode node) {
-    if (node.isLeaf) {
-      if (node.entries.isEmpty) {
-        node.bbox = null;
-        return;
-      }
-      node.bbox = node.entries.fold<BoundingBox?>(
-        null,
-        (acc, e) => acc == null ? e.bbox : acc.expand(e.bbox),
-      );
-    } else {
-      if (node.children.isEmpty) {
-        node.bbox = null;
-        return;
-      }
-      for (final child in node.children) {
-        _updateBBox(child);
-      }
-      node.bbox = node.children.fold<BoundingBox?>(
-        null,
-        (acc, c) =>
-            c.bbox == null ? acc : (acc == null ? c.bbox : acc.expand(c.bbox!)),
-      );
-    }
-  }
-
-  int _treeHeight(_RTreeNode node) {
-    if (node.isLeaf) return 0;
-    return 1 + _treeHeight(node.children.first);
-  }
-
-  // ---------------------------------------------------------------------------
-  // Serialization
-  // ---------------------------------------------------------------------------
-
-  Map<String, dynamic> toJson() => {'root': _serializeNode(_root)};
-
-  factory RTreeIndex.fromJson(Map<String, dynamic> json) {
-    final index = RTreeIndex._();
-    index._root = _deserializeNode(json['root'] as Map<String, dynamic>);
-    return index;
-  }
-
-  static Map<String, dynamic> _serializeNode(_RTreeNode node) {
-    return {
-      'isLeaf': node.isLeaf,
-      'bbox': node.bbox?.toJson(),
-      'entries': node.entries.map((e) => e.toJson()).toList(),
-      'children': node.children.map(_serializeNode).toList(),
-    };
-  }
-
-  static _RTreeNode _deserializeNode(Map<String, dynamic> json) {
-    final node = _RTreeNode(isLeaf: json['isLeaf'] as bool);
-    if (json['bbox'] != null) {
-      node.bbox = BoundingBox.fromJson(json['bbox'] as Map<String, dynamic>);
-    }
-    node.entries.addAll(
-      (json['entries'] as List<dynamic>).cast<Map<String, dynamic>>().map(
-        RTreeEntry.fromJson,
-      ),
-    );
-    node.children.addAll(
-      (json['children'] as List<dynamic>).cast<Map<String, dynamic>>().map(
-        _deserializeNode,
-      ),
-    );
-    return node;
-  }
-}
-
-class _RTreeNode {
-  final bool isLeaf;
-  BoundingBox? bbox;
-  final List<RTreeEntry> entries = [];
-  final List<_RTreeNode> children = [];
-
-  _RTreeNode({required this.isLeaf});
 }

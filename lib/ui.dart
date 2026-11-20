@@ -1,16 +1,20 @@
-/// UI components for just_database admin interface.
+/// The database workbench of just_database, for Flutter.
 ///
-/// This library provides a complete Flutter UI for database management including:
-/// - Database creation, selection, and deletion
-/// - Schema inspection
-/// - Query editor with examples and history
-/// - Settings and configuration
+/// [JustDatabaseAdminScreen] lists every database of the app (the ones it
+/// has open and the saved ones). It browses and edits rows, edits schemas,
+/// runs SQL, exports and imports, encrypts, benchmarks, and creates and
+/// deletes databases: a sidebar and panes on wide screens, drill-down pages
+/// on phones. [JustDatabaseAdminController] holds its state; pass one to
+/// share it or to choose what the screen shows. `readOnly: true` makes a
+/// screen that cannot change anything.
+///
+/// ```dart
+/// import 'package:just_database/ui.dart';
+///
+/// MaterialApp(home: const JustDatabaseAdminScreen());
+/// ```
+///
+/// The database API itself is in `package:just_database/just_database.dart`.
 library;
 
-export 'src/ui/database_provider.dart';
-export 'src/ui/pages/database_detail_page.dart';
-export 'src/ui/tabs/databases_tab.dart';
-export 'src/ui/tabs/schema_tab.dart';
-export 'src/ui/tabs/query_editor_tab.dart';
-export 'src/ui/tabs/settings_tab.dart';
-export 'src/ui/ju_database_admin_screen.dart';
+export 'src/ui/ui.dart';

@@ -69,10 +69,10 @@ or an issue labelled **enhancement**. Describe:
 
 ### Prerequisites
 
-| Tool | Recommended version |
+| Tool | Version |
 |---|---|
-| Flutter SDK | ≥ 3.0.0 |
-| Dart SDK | ≥ 3.11.0 |
+| Flutter SDK | 3.47.1 or newer |
+| Dart SDK | 3.11 or newer |
 | Git | any recent version |
 
 ### Clone and bootstrap
@@ -80,53 +80,48 @@ or an issue labelled **enhancement**. Describe:
 ```bash
 git clone https://github.com/just-unknown-dev/just-database.git
 cd just-database
-
-# Install dependencies for the library
-flutter pub get
-
-# Install dependencies for the admin demo app  (optional)
-cd ../../   # repo root / just_database_admin
 flutter pub get
 ```
 
-### Run the demo app
+### Run the example
 
 ```bash
-cd just_database_admin
+cd example
+flutter pub get
 flutter run
 ```
 
-### Run the tests
+### Run the checks
 
 ```bash
-cd packages/just_database
+flutter analyze
 flutter test
+dart format --output=none --set-exit-if-changed lib test example
 ```
 
 ---
 
 ## Project Structure
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for how the parts work together.
+
 ```
-packages/just_database/
-  lib/
-    just_database.dart          # Public barrel export
-    src/
-      benchmark/                # DatabaseBenchmark, BenchmarkSuite, QueryStats
-      concurrency/              # Mutex, ReadWriteLock
-      core/                     # Database, DatabaseMode, SecureKeyManager, backup, migrations
-      orm/                      # DbTable, DbRecord, DbColumn
-      sql/                      # Lexer, parser, executor, query planner
-      storage/                  # DatabaseRow, Table, Index, persistence
-      ui/                       # Admin UI (DatabaseProvider, tabs, pages)
-      widgets/                  # Reusable Flutter widgets
-  test/                         # Unit & widget tests
-  example/                      # Standalone runnable example
-  CHANGELOG.md
-  README.md
-  DOCS.md
-  API.md
-  MIGRATION.md
+lib/
+  just_database.dart   # the public API (no UI)
+  ui.dart              # the admin UI
+  src/
+    sql/               # lexer, parser, syntax tree, SqlException
+    storage/           # values, schemas, tables, indexes, R-tree, catalog, undo log
+    engine/            # the SQL engine (one library with parts)
+    persistence/       # file format, encryption envelope, SQL dump, store interface
+    io/                # files (dart:io)
+    web/               # IndexedDB and WebCrypto
+    core/              # JustDatabase, DatabaseManager, migrations, query builder
+    orm/               # DbTable, DbRecord, DbColumn
+    benchmark/         # benchmarks
+    ui/                # admin screen, tabs and pages
+test/                  # unit, widget and layout tests
+example/               # a runnable Flutter app
 ```
 
 ---
@@ -193,7 +188,7 @@ test(storage): cover edge case in index rebuild
 
 ## Code Style
 
-- Format all Dart files with `dart format .` before committing.
+- Format the Dart files you change with `dart format`.
 - Follow the rules in [analysis_options.yaml](analysis_options.yaml).  
   Run `flutter analyze` — **zero warnings and errors**.
 - Prefer explicit types over `var`/`dynamic` in public APIs.
@@ -213,9 +208,10 @@ Guidelines:
 
 - Every public API change must be accompanied by tests.
 - Use descriptive test group / test names:  
-  `group('Executor', () { test('returns empty list for empty table', ...) })`.
-- Avoid relying on real file I/O in unit tests — use the in-memory path
-  provider (`PathProviderPlatform.instance = FakePathProviderPlatform()`).
+  `group('joins', () { test('LEFT JOIN pads unmatched rows with NULL', ...) })`.
+- Use `persist: false` when a test does not need files; when it does, use
+  `test/helpers/temp_paths.dart`, which points path_provider at a
+  temporary directory.
 - Target ≥ 80 % line coverage for new code.
 
 ---

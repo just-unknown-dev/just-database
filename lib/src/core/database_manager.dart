@@ -1,167 +1,191 @@
-import 'package:flutter/foundation.dart';
-import '../storage/persistence.dart';
-import 'database.dart';
+import 'dart:async';
+
+import 'package:flutter/foundation.dart' show internal;
+
+import '../persistence/crypto.dart' show looksEncrypted;
+import '../persistence/store.dart';
 import 'database_mode.dart';
+import 'just_database.dart';
+import '../io/file_store.dart'
+    if (dart.library.js_interop) '../web/idb_store.dart';
 
-/// Summary information about a database (open or persisted).
-class DatabaseInfo {
-  final String name;
-  final DatabaseMode mode;
-  final bool isPersisted;
-  final int sizeBytes;
-  final int tableCount;
-  final int totalRows;
-  final bool isOpen;
-
+/// What [DatabaseManager.listDatabases] knows about one database.
+final class DatabaseInfo {
+  /// Creates an entry.
   const DatabaseInfo({
     required this.name,
-    required this.mode,
-    required this.isPersisted,
-    required this.sizeBytes,
-    required this.tableCount,
-    required this.totalRows,
     required this.isOpen,
+    required this.isPersisted,
+    required this.isEncrypted,
+    required this.sizeBytes,
+    this.mode,
+    this.tableCount,
+    this.totalRows,
   });
 
-  /// Human-readable size string, e.g. "2.4 KB", "1.1 MB".
-  String get formattedSize {
-    if (sizeBytes < 1024) return '$sizeBytes B';
-    if (sizeBytes < 1024 * 1024) {
-      return '${(sizeBytes / 1024).toStringAsFixed(1)} KB';
-    }
-    return '${(sizeBytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-  }
+  final String name;
 
-  String get modeName {
-    switch (mode) {
-      case DatabaseMode.standard:
-        return 'Standard';
-      case DatabaseMode.readFast:
-        return 'Read Fast';
-      case DatabaseMode.writeFast:
-        return 'Write Fast';
-      case DatabaseMode.secure:
-        return 'Secure';
-    }
-  }
+  /// Whether it is open in this app.
+  final bool isOpen;
 
-  @override
-  String toString() => 'DatabaseInfo($name, mode=$modeName, open=$isOpen)';
+  /// Whether it is saved (false for an in-memory database).
+  final bool isPersisted;
+
+  /// Whether its file is encrypted.
+  final bool isEncrypted;
+
+  /// The stored size in bytes (an estimate for an in-memory database).
+  final int sizeBytes;
+
+  /// The mode it is open in; null when closed.
+  final DatabaseMode? mode;
+
+  /// The number of tables; null when closed.
+  final int? tableCount;
+
+  /// The number of rows; null when closed.
+  final int? totalRows;
 }
 
-/// Global registry and lifecycle manager for [JustDatabase] instances.
-class DatabaseManager {
-  /// All currently open database instances. Key = lowercase database name.
-  @visibleForTesting
-  static final Map<String, JustDatabase> openDatabases = {};
+/// Opens databases by name and lists, closes and deletes them; the admin
+/// UI works through it.
+///
+/// It holds one reference to each database it opened: [close] releases
+/// that reference, so a database the app opened itself with
+/// `JustDatabase.open` stays open for the app.
+abstract final class DatabaseManager {
+  static final Map<String, JustDatabase> _held = {};
+  static final StreamController<void> _listChanges =
+      StreamController<void>.broadcast();
 
-  /// Opens a database and registers it with the manager.
-  /// If the database is already open, returns the existing instance.
-  ///
-  /// See [JustDatabase.open] for details on [mode], [persist], and
-  /// [encryptionKey] ([DatabaseMode.secure] only).
+  /// An event whenever a database is opened, closed, deleted or encrypted
+  /// in this app (also when another opener starts or stops using an open
+  /// one), so a list of databases can refresh itself. Events come
+  /// asynchronously.
+  static Stream<void> get listChanges => _listChanges.stream;
+
+  /// Sends a [listChanges] event.
+  @internal
+  static void notifyListChanged() => _listChanges.add(null);
+  // A fresh store each time: it resolves the storage directory anew.
+  static DatabaseStore get _store => createPlatformStore();
+
+  /// Every open database in this app, by lower-case name (whoever opened
+  /// it).
+  static Map<String, JustDatabase> get openDatabases => Map.unmodifiable({
+    for (final db in JustDatabase.openDatabases) db.name.toLowerCase(): db,
+  });
+
+  /// Opens [name] (see `JustDatabase.open`), or returns it when it is open
+  /// already with the same settings.
   static Future<JustDatabase> open(
     String name, {
     DatabaseMode mode = DatabaseMode.standard,
     bool persist = true,
     String? encryptionKey,
   }) async {
-    final key = name.toLowerCase();
-    if (openDatabases.containsKey(key)) return openDatabases[key]!;
     final db = await JustDatabase.open(
       name,
       mode: mode,
       persist: persist,
       encryptionKey: encryptionKey,
     );
-    openDatabases[key] = db;
+    final key = name.toLowerCase();
+    if (identical(_held[key], db)) {
+      await db.close(); // drop the reference this call added
+    } else {
+      _held[key] = db;
+    }
     return db;
   }
 
-  /// Returns the open database with [name], or null if not open.
-  static JustDatabase? getOpenDatabase(String name) {
-    return openDatabases[name.toLowerCase()];
+  /// The open database named [name] (opened by anyone), or null.
+  static JustDatabase? getOpenDatabase(String name) =>
+      JustDatabase.findOpen(name);
+
+  /// Releases the manager's reference to [name].
+  static Future<void> close(String name) async {
+    final db = _held.remove(name.toLowerCase());
+    if (db != null) await db.close();
   }
 
-  /// Returns [DatabaseInfo] for all open and all persisted (closed) databases.
-  static Future<List<DatabaseInfo>> listDatabases() async {
-    final result = <DatabaseInfo>[];
+  /// Releases every reference the manager holds.
+  static Future<void> closeAll() async {
+    final dbs = List.of(_held.values);
+    _held.clear();
+    for (final db in dbs) {
+      await db.close();
+    }
+  }
 
-    // Open databases
-    for (final entry in openDatabases.entries) {
-      result.add(
-        DatabaseInfo(
-          name: entry.value.name,
-          mode: entry.value.mode,
-          isPersisted: entry.value.persist,
-          sizeBytes: entry.value.estimatedSizeBytes,
-          tableCount: entry.value.tableNames.length,
-          totalRows: entry.value.totalRows,
-          isOpen: true,
-        ),
+  /// Every database: the open ones and those saved by this app.
+  static Future<List<DatabaseInfo>> listDatabases() async {
+    final out = <String, DatabaseInfo>{};
+    for (final db in JustDatabase.openDatabases) {
+      out[db.name.toLowerCase()] = DatabaseInfo(
+        name: db.name,
+        isOpen: true,
+        isPersisted: db.persist,
+        isEncrypted: db.persist && await _isEncrypted(db.name),
+        sizeBytes: db.persist
+            ? await _store.size(db.name)
+            : db.estimatedSizeBytes,
+        mode: db.mode,
+        tableCount: db.tableNames.length,
+        totalRows: db.totalRows,
       );
     }
-
-    // Persisted but not currently open
+    List<String> saved;
     try {
-      final persistedNames = await PersistenceManager.listPersistedNames();
-      for (final persName in persistedNames) {
-        final key = persName.toLowerCase();
-        if (!openDatabases.containsKey(key)) {
-          final size = await PersistenceManager.getFileSize(persName);
-          final mode = await PersistenceManager.peekMode(persName);
-          result.add(
-            DatabaseInfo(
-              name: persName,
-              mode: mode,
-              isPersisted: true,
-              sizeBytes: size,
-              tableCount: 0,
-              totalRows: 0,
-              isOpen: false,
-            ),
-          );
-        }
-      }
+      saved = await _store.list();
+    } on StorageUnavailableException {
+      saved = const [];
+    }
+    for (final name in saved) {
+      if (out.containsKey(name.toLowerCase())) continue;
+      out[name.toLowerCase()] = DatabaseInfo(
+        name: name,
+        isOpen: false,
+        isPersisted: true,
+        isEncrypted: await _isEncrypted(name),
+        sizeBytes: await _store.size(name),
+      );
+    }
+    return out.values.toList()
+      ..sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
+  }
+
+  static Future<bool> _isEncrypted(String name) async {
+    try {
+      final bytes = await _store.peek(name, 64);
+      return bytes != null && looksEncrypted(bytes);
     } catch (_) {
-      // path_provider may not be available in all environments
+      return false;
     }
-
-    return result;
   }
 
-  /// Closes and unregisters a database (saves to disk first if persist=true).
-  static Future<void> close(String name) async {
-    final key = name.toLowerCase();
-    final db = openDatabases.remove(key);
-    if (db != null && db.isOpen) await db.close();
-  }
-
-  /// Closes a database and deletes its persisted file.
+  /// Closes [name] for everyone (it is being deleted) and deletes its file.
   static Future<void> deleteDatabase(String name) async {
-    await close(name);
-    try {
-      await PersistenceManager.delete(name);
-    } catch (_) {}
+    validateDatabaseName(name);
+    _held.remove(name.toLowerCase());
+    final open = JustDatabase.findOpen(name);
+    if (open != null) await open.closeAll();
+    await _store.delete(name);
+    notifyListChanged();
   }
 
-  /// Closes all open databases.
-  static Future<void> closeAll() async {
-    final names = List.of(openDatabases.keys);
-    for (final name in names) {
-      await close(name);
-    }
-    openDatabases.clear();
-  }
-
-  /// Closes and deletes all databases including all persisted files.
+  /// Deletes every database this app saved (and closes the open ones).
   static Future<void> deleteAll() async {
-    await closeAll();
-    try {
-      final names = await PersistenceManager.listPersistedNames();
-      for (final name in names) {
-        await PersistenceManager.delete(name);
-      }
-    } catch (_) {}
+    final names = <String>{
+      for (final db in JustDatabase.openDatabases) db.name,
+      ...await _store.list(),
+    };
+    for (final name in names) {
+      final open = JustDatabase.findOpen(name);
+      _held.remove(name.toLowerCase());
+      if (open != null) await open.closeAll();
+      if (open == null || open.persist) await _store.delete(name);
+    }
+    notifyListChanged();
   }
 }

@@ -1,316 +1,555 @@
-/// The supported SQL data types.
-enum DataType { integer, text, real, blob, boolean, datetime }
+/// The schema of a table: its columns and constraints, as declared by
+/// `CREATE TABLE` and changed by `ALTER TABLE`.
+library;
 
-/// Parses a SQL type name string into a [DataType].
-DataType parseDataType(String typeName) {
-  switch (typeName.toUpperCase()) {
-    case 'INTEGER':
-    case 'INT':
-    case 'BIGINT':
-    case 'SMALLINT':
-      return DataType.integer;
-    case 'TEXT':
-    case 'VARCHAR':
-    case 'CHAR':
-    case 'STRING':
-      return DataType.text;
-    case 'REAL':
-    case 'FLOAT':
-    case 'DOUBLE':
-    case 'NUMERIC':
-    case 'DECIMAL':
-      return DataType.real;
-    case 'BLOB':
-    case 'BINARY':
-      return DataType.blob;
-    case 'BOOLEAN':
-    case 'BOOL':
-      return DataType.boolean;
-    case 'DATETIME':
-    case 'DATE':
-    case 'TIMESTAMP':
-      return DataType.datetime;
-    default:
-      return DataType.text; // fallback
+import 'values.dart';
+
+/// The type affinity of a column, derived from its declared type by
+/// SQLite's rules (section 3.1 of https://sqlite.org/datatype3.html).
+enum Affinity {
+  /// Declared type contains `INT`. Text that looks like a number is stored
+  /// as a number; reals with no fractional part are stored as integers.
+  integer,
+
+  /// Declared type contains `CHAR`, `CLOB` or `TEXT`. Numbers are stored as
+  /// text.
+  text,
+
+  /// Declared type contains `BLOB`, or no type was declared. Values are
+  /// stored as given.
+  blob,
+
+  /// Declared type contains `REAL`, `FLOA` or `DOUB`. Integers are stored as
+  /// reals.
+  real,
+
+  /// Any other declared type, such as `NUMERIC`, `DECIMAL`, `BOOLEAN` or
+  /// `DATETIME`. Text that looks like a number is stored as a number.
+  numeric;
+
+  /// The affinity of a column declared with [declaredType].
+  static Affinity of(String declaredType) {
+    final t = declaredType.toUpperCase();
+    if (t.contains('INT')) return Affinity.integer;
+    if (t.contains('CHAR') || t.contains('CLOB') || t.contains('TEXT')) {
+      return Affinity.text;
+    }
+    if (t.isEmpty || t.contains('BLOB')) return Affinity.blob;
+    if (t.contains('REAL') || t.contains('FLOA') || t.contains('DOUB')) {
+      return Affinity.real;
+    }
+    return Affinity.numeric;
   }
+
+  /// Whether values of this affinity are compared as numbers.
+  bool get isNumeric =>
+      this == Affinity.integer ||
+      this == Affinity.real ||
+      this == Affinity.numeric;
 }
 
-/// Constraint definitions for a column.
-class ConstraintDefinition {
-  final bool notNull;
-  final bool primaryKey;
-  final bool unique;
-  final bool autoIncrement;
-  final bool hasDefault;
-  final dynamic defaultValue;
-  final String? foreignKeyTable;
-  final String? foreignKeyColumn;
+/// What happens to child rows when the parent row they reference is deleted
+/// (`ON DELETE`) or its referenced key changes (`ON UPDATE`).
+enum ForeignKeyAction {
+  /// The default. The change fails if, when the statement ends, a child row
+  /// still references a parent row that no longer exists.
+  noAction('NO ACTION'),
 
-  const ConstraintDefinition({
-    this.notNull = false,
-    this.primaryKey = false,
-    this.unique = false,
-    this.autoIncrement = false,
-    this.hasDefault = false,
-    this.defaultValue,
-    this.foreignKeyTable,
-    this.foreignKeyColumn,
+  /// The change fails at once while child rows reference the parent row.
+  restrict('RESTRICT'),
+
+  /// Child rows are deleted (`ON DELETE`) or take the new key (`ON UPDATE`).
+  cascade('CASCADE'),
+
+  /// The child's foreign key columns are set to NULL.
+  setNull('SET NULL'),
+
+  /// The child's foreign key columns are set to their DEFAULT values.
+  setDefault('SET DEFAULT');
+
+  const ForeignKeyAction(this.sql);
+
+  /// The action as written in SQL, e.g. `SET NULL`.
+  final String sql;
+
+  /// Parses an action from its [name] (as stored in JSON), falling back to
+  /// [noAction] for null or unknown values.
+  static ForeignKeyAction fromName(String? name) => ForeignKeyAction.values
+      .firstWhere((a) => a.name == name, orElse: () => noAction);
+}
+
+/// A foreign key: [columns] of this table reference [parentColumns] of
+/// [parentTable].
+final class ForeignKeyDefinition {
+  /// Creates a foreign key. An empty [parentColumns] means the parent
+  /// table's primary key.
+  const ForeignKeyDefinition({
+    required this.columns,
+    required this.parentTable,
+    this.parentColumns = const [],
+    this.onDelete = ForeignKeyAction.noAction,
+    this.onUpdate = ForeignKeyAction.noAction,
   });
 
-  ConstraintDefinition copyWith({
-    bool? notNull,
-    bool? primaryKey,
-    bool? unique,
-    bool? autoIncrement,
-    bool? hasDefault,
-    dynamic defaultValue,
-    String? foreignKeyTable,
-    String? foreignKeyColumn,
-  }) {
-    return ConstraintDefinition(
-      notNull: notNull ?? this.notNull,
-      primaryKey: primaryKey ?? this.primaryKey,
-      unique: unique ?? this.unique,
-      autoIncrement: autoIncrement ?? this.autoIncrement,
-      hasDefault: hasDefault ?? this.hasDefault,
-      defaultValue: defaultValue ?? this.defaultValue,
-      foreignKeyTable: foreignKeyTable ?? this.foreignKeyTable,
-      foreignKeyColumn: foreignKeyColumn ?? this.foreignKeyColumn,
-    );
+  /// The referencing (child) columns of this table.
+  final List<String> columns;
+
+  /// The referenced (parent) table.
+  final String parentTable;
+
+  /// The referenced columns; empty for the parent's primary key.
+  final List<String> parentColumns;
+
+  /// The action on this table's rows when the parent row is deleted.
+  final ForeignKeyAction onDelete;
+
+  /// The action on this table's rows when the parent key changes.
+  final ForeignKeyAction onUpdate;
+
+  /// The `REFERENCES …` clause, without the leading `FOREIGN KEY (…)`.
+  String get referencesSql {
+    final b = StringBuffer('REFERENCES ${quoteIdentifier(parentTable)}');
+    if (parentColumns.isNotEmpty) {
+      b.write('(${parentColumns.map(quoteIdentifier).join(', ')})');
+    }
+    if (onDelete != ForeignKeyAction.noAction) {
+      b.write(' ON DELETE ${onDelete.sql}');
+    }
+    if (onUpdate != ForeignKeyAction.noAction) {
+      b.write(' ON UPDATE ${onUpdate.sql}');
+    }
+    return b.toString();
   }
 
-  Map<String, dynamic> toJson() => {
-    'notNull': notNull,
-    'primaryKey': primaryKey,
-    'unique': unique,
-    'autoIncrement': autoIncrement,
-    'hasDefault': hasDefault,
-    'defaultValue': defaultValue,
-    'foreignKeyTable': foreignKeyTable,
-    'foreignKeyColumn': foreignKeyColumn,
+  /// A copy with column names replaced through [rename] (old → new,
+  /// compared case-insensitively) on the child side, the parent side, or
+  /// both.
+  ForeignKeyDefinition renamed({
+    String Function(String)? child,
+    String Function(String)? parent,
+    String? parentTable,
+  }) => ForeignKeyDefinition(
+    columns: child == null ? columns : columns.map(child).toList(),
+    parentTable: parentTable ?? this.parentTable,
+    parentColumns: parent == null
+        ? parentColumns
+        : parentColumns.map(parent).toList(),
+    onDelete: onDelete,
+    onUpdate: onUpdate,
+  );
+
+  /// The JSON form stored in database files.
+  Map<String, Object?> toJson() => {
+    'columns': columns,
+    'parentTable': parentTable,
+    if (parentColumns.isNotEmpty) 'parentColumns': parentColumns,
+    if (onDelete != ForeignKeyAction.noAction) 'onDelete': onDelete.name,
+    if (onUpdate != ForeignKeyAction.noAction) 'onUpdate': onUpdate.name,
   };
 
-  factory ConstraintDefinition.fromJson(Map<String, dynamic> json) {
-    return ConstraintDefinition(
-      notNull: json['notNull'] as bool? ?? false,
-      primaryKey: json['primaryKey'] as bool? ?? false,
-      unique: json['unique'] as bool? ?? false,
-      autoIncrement: json['autoIncrement'] as bool? ?? false,
-      hasDefault: json['hasDefault'] as bool? ?? false,
-      defaultValue: json['defaultValue'],
-      foreignKeyTable: json['foreignKeyTable'] as String?,
-      foreignKeyColumn: json['foreignKeyColumn'] as String?,
-    );
-  }
+  /// Reads the form written by [toJson].
+  factory ForeignKeyDefinition.fromJson(Map<String, Object?> json) =>
+      ForeignKeyDefinition(
+        columns: (json['columns'] as List).cast<String>(),
+        parentTable: json['parentTable'] as String,
+        parentColumns:
+            (json['parentColumns'] as List?)?.cast<String>() ?? const [],
+        onDelete: ForeignKeyAction.fromName(json['onDelete'] as String?),
+        onUpdate: ForeignKeyAction.fromName(json['onUpdate'] as String?),
+      );
 }
 
-/// Definition of a single table column.
-class ColumnDefinition {
-  final String name;
-  final DataType type;
-  final ConstraintDefinition constraints;
-
+/// One column of a table.
+final class ColumnDefinition {
+  /// Creates a column definition.
   const ColumnDefinition({
     required this.name,
-    required this.type,
-    this.constraints = const ConstraintDefinition(),
+    this.type = '',
+    this.notNull = false,
+    this.primaryKey = false,
+    this.autoIncrement = false,
+    this.unique = false,
+    this.defaultSql,
+    this.collation,
+    this.hidden = false,
   });
 
+  /// The column's name, in the case it was declared with.
+  final String name;
+
+  /// The declared type exactly as written (`INTEGER`, `VARCHAR(20)`, …), or
+  /// empty when none was given.
+  final String type;
+
+  /// Whether NULL is rejected.
+  final bool notNull;
+
+  /// Whether this column was declared `PRIMARY KEY` by itself.
+  final bool primaryKey;
+
+  /// Whether `AUTOINCREMENT` was declared (only on an `INTEGER PRIMARY KEY`).
+  final bool autoIncrement;
+
+  /// Whether this column was declared `UNIQUE` by itself.
+  final bool unique;
+
+  /// The `DEFAULT` expression as SQL text, or null when there is none.
+  final String? defaultSql;
+
+  /// The declared collation (`BINARY`, `NOCASE` or `RTRIM`), or null for
+  /// the default.
+  final String? collation;
+
+  /// Internal: true for columns that are not part of `SELECT *`.
+  final bool hidden;
+
+  /// The column's type affinity.
+  Affinity get affinity => Affinity.of(type);
+
+  /// Whether a DEFAULT was declared.
+  bool get hasDefault => defaultSql != null;
+
+  /// A copy with the given fields replaced. Pass a value for [defaultSql]
+  /// or [collation] to replace them; they cannot be cleared this way.
   ColumnDefinition copyWith({
     String? name,
-    DataType? type,
-    ConstraintDefinition? constraints,
-  }) {
-    return ColumnDefinition(
-      name: name ?? this.name,
-      type: type ?? this.type,
-      constraints: constraints ?? this.constraints,
-    );
+    String? type,
+    bool? notNull,
+    bool? primaryKey,
+    bool? autoIncrement,
+    bool? unique,
+    String? defaultSql,
+    String? collation,
+  }) => ColumnDefinition(
+    name: name ?? this.name,
+    type: type ?? this.type,
+    notNull: notNull ?? this.notNull,
+    primaryKey: primaryKey ?? this.primaryKey,
+    autoIncrement: autoIncrement ?? this.autoIncrement,
+    unique: unique ?? this.unique,
+    defaultSql: defaultSql ?? this.defaultSql,
+    collation: collation ?? this.collation,
+    hidden: hidden,
+  );
+
+  /// The column as it appears in `CREATE TABLE`, without table-level
+  /// constraints.
+  String get sql {
+    final b = StringBuffer(quoteIdentifier(name));
+    if (type.isNotEmpty) b.write(' $type');
+    if (primaryKey) {
+      b.write(' PRIMARY KEY');
+      if (autoIncrement) b.write(' AUTOINCREMENT');
+    }
+    if (notNull) b.write(' NOT NULL');
+    if (unique) b.write(' UNIQUE');
+    if (defaultSql != null) b.write(' DEFAULT $defaultSql');
+    if (collation != null) b.write(' COLLATE $collation');
+    return b.toString();
   }
 
-  Map<String, dynamic> toJson() => {
+  /// The JSON form stored in database files.
+  Map<String, Object?> toJson() => {
     'name': name,
-    'type': type.name,
-    'constraints': constraints.toJson(),
+    if (type.isNotEmpty) 'type': type,
+    if (notNull) 'notNull': true,
+    if (primaryKey) 'primaryKey': true,
+    if (autoIncrement) 'autoIncrement': true,
+    if (unique) 'unique': true,
+    if (defaultSql != null) 'default': defaultSql,
+    if (collation != null) 'collation': collation,
   };
 
-  factory ColumnDefinition.fromJson(Map<String, dynamic> json) {
-    return ColumnDefinition(
-      name: json['name'] as String,
-      type: DataType.values.firstWhere(
-        (e) => e.name == json['type'],
-        orElse: () => DataType.text,
-      ),
-      constraints: json['constraints'] != null
-          ? ConstraintDefinition.fromJson(
-              json['constraints'] as Map<String, dynamic>,
-            )
-          : const ConstraintDefinition(),
-    );
-  }
+  /// Reads the form written by [toJson].
+  factory ColumnDefinition.fromJson(Map<String, Object?> json) =>
+      ColumnDefinition(
+        name: json['name'] as String,
+        type: json['type'] as String? ?? '',
+        notNull: json['notNull'] as bool? ?? false,
+        primaryKey: json['primaryKey'] as bool? ?? false,
+        autoIncrement: json['autoIncrement'] as bool? ?? false,
+        unique: json['unique'] as bool? ?? false,
+        defaultSql: json['default'] as String?,
+        collation: json['collation'] as String?,
+      );
 
   @override
-  String toString() => 'ColumnDefinition($name: $type)';
+  String toString() => 'ColumnDefinition($sql)';
 }
 
-/// Table-level constraint (multi-column PRIMARY KEY or UNIQUE).
-class TableConstraint {
-  final TableConstraintType type;
-  final List<String> columns;
-  final String? name;
+/// The kind of a [TableConstraint].
+enum TableConstraintKind {
+  /// `PRIMARY KEY (…)`.
+  primaryKey,
 
-  const TableConstraint({required this.type, required this.columns, this.name});
+  /// `UNIQUE (…)`.
+  unique,
 
-  Map<String, dynamic> toJson() => {
-    'type': type.name,
-    'columns': columns,
-    'name': name,
-  };
+  /// `CHECK (…)`.
+  check,
 
-  factory TableConstraint.fromJson(Map<String, dynamic> json) {
-    return TableConstraint(
-      type: TableConstraintType.values.firstWhere(
-        (e) => e.name == json['type'],
-        orElse: () => TableConstraintType.unique,
-      ),
-      columns: (json['columns'] as List<dynamic>).cast<String>(),
-      name: json['name'] as String?,
-    );
-  }
-
-  @override
-  String toString() => 'TableConstraint(${type.name} on ${columns.join(", ")})';
+  /// `FOREIGN KEY (…) REFERENCES …`, or a column's `REFERENCES` clause.
+  foreignKey,
 }
 
-/// Type of table-level constraint.
-enum TableConstraintType { primaryKey, unique }
-
-/// Schema definition for a table.
-class TableSchema {
-  final String tableName;
-  final List<ColumnDefinition> columns;
-  final List<TableConstraint> tableConstraints;
-
-  const TableSchema({
-    required this.tableName,
-    required this.columns,
-    this.tableConstraints = const [],
+/// A table constraint. Column-level `CHECK` and `REFERENCES` clauses are
+/// stored as table constraints too; column-level `PRIMARY KEY` and `UNIQUE`
+/// stay on the [ColumnDefinition].
+final class TableConstraint {
+  /// Creates a constraint.
+  const TableConstraint({
+    required this.kind,
+    this.name,
+    this.columns = const [],
+    this.checkSql,
+    this.foreignKey,
   });
 
-  /// Returns the primary key column, or null if none is defined.
-  /// If a composite primary key exists, returns null (use primaryKeyColumns).
-  ColumnDefinition? get primaryKeyColumn {
-    for (final col in columns) {
-      if (col.constraints.primaryKey) return col;
+  /// What kind of constraint this is.
+  final TableConstraintKind kind;
+
+  /// The `CONSTRAINT <name>`, if one was given.
+  final String? name;
+
+  /// The constrained columns (PRIMARY KEY, UNIQUE, FOREIGN KEY).
+  final List<String> columns;
+
+  /// The CHECK expression as SQL text.
+  final String? checkSql;
+
+  /// The foreign key, for [TableConstraintKind.foreignKey].
+  final ForeignKeyDefinition? foreignKey;
+
+  /// The constraint as it appears in `CREATE TABLE`.
+  String get sql {
+    final b = StringBuffer();
+    if (name != null) b.write('CONSTRAINT ${quoteIdentifier(name!)} ');
+    final cols = columns.map(quoteIdentifier).join(', ');
+    switch (kind) {
+      case TableConstraintKind.primaryKey:
+        b.write('PRIMARY KEY ($cols)');
+      case TableConstraintKind.unique:
+        b.write('UNIQUE ($cols)');
+      case TableConstraintKind.check:
+        b.write('CHECK ($checkSql)');
+      case TableConstraintKind.foreignKey:
+        b.write('FOREIGN KEY ($cols) ${foreignKey!.referencesSql}');
     }
-    return null;
+    return b.toString();
   }
 
-  /// Returns the list of columns that form the primary key.
-  /// For single-column PK, returns a list with one element.
-  /// For composite PK, returns all columns in the constraint.
-  List<String> get primaryKeyColumns {
-    // Check for table-level composite PK first
-    for (final constraint in tableConstraints) {
-      if (constraint.type == TableConstraintType.primaryKey) {
-        return constraint.columns;
-      }
-    }
-    // Check for column-level PK
-    final pk = primaryKeyColumn;
-    if (pk != null) return [pk.name];
-    return [];
+  /// The JSON form stored in database files.
+  Map<String, Object?> toJson() => {
+    'kind': kind.name,
+    if (name != null) 'name': name,
+    if (columns.isNotEmpty) 'columns': columns,
+    if (checkSql != null) 'check': checkSql,
+    if (foreignKey != null) 'foreignKey': foreignKey!.toJson(),
+  };
+
+  /// Reads the form written by [toJson]. Returns null for a kind this
+  /// version does not know, so a newer file's constraint is never misread.
+  static TableConstraint? fromJson(Map<String, Object?> json) {
+    final kind = TableConstraintKind.values
+        .where((k) => k.name == json['kind'])
+        .firstOrNull;
+    if (kind == null) return null;
+    final fk = json['foreignKey'] as Map<String, Object?>?;
+    return TableConstraint(
+      kind: kind,
+      name: json['name'] as String?,
+      columns: (json['columns'] as List?)?.cast<String>() ?? const [],
+      checkSql: json['check'] as String?,
+      foreignKey: fk == null ? null : ForeignKeyDefinition.fromJson(fk),
+    );
   }
 
-  /// Returns all UNIQUE constraints (both column-level and table-level).
-  List<List<String>> get uniqueConstraints {
-    final result = <List<String>>[];
-    // Table-level unique constraints
-    for (final constraint in tableConstraints) {
-      if (constraint.type == TableConstraintType.unique) {
-        result.add(constraint.columns);
-      }
-    }
-    // Column-level unique constraints
-    for (final col in columns) {
-      if (col.constraints.unique) {
-        result.add([col.name]);
-      }
-    }
-    return result;
-  }
+  @override
+  String toString() => 'TableConstraint($sql)';
+}
 
-  /// Returns the column with the given name (case-insensitive), or null.
-  ColumnDefinition? getColumn(String name) {
-    final lower = name.toLowerCase();
-    for (final col in columns) {
-      if (col.name.toLowerCase() == lower) return col;
-    }
-    return null;
-  }
+/// The schema of one table.
+final class TableSchema {
+  /// Creates a schema.
+  const TableSchema({
+    required this.name,
+    required this.columns,
+    this.constraints = const [],
+  });
 
-  bool hasColumn(String name) => getColumn(name) != null;
+  /// The table's name, in the case it was created with.
+  final String name;
 
-  /// Returns the 0-based index of the column, or null if not found.
-  int? columnIndex(String name) {
-    final lower = name.toLowerCase();
-    for (int i = 0; i < columns.length; i++) {
+  /// The columns, in declaration order.
+  final List<ColumnDefinition> columns;
+
+  /// Table-level constraints, plus column-level CHECK and REFERENCES.
+  final List<TableConstraint> constraints;
+
+  /// The position of the column named [column] (case-insensitive), or null.
+  int? indexOf(String column) {
+    final lower = column.toLowerCase();
+    for (var i = 0; i < columns.length; i++) {
       if (columns[i].name.toLowerCase() == lower) return i;
     }
     return null;
   }
 
-  TableSchema addColumn(ColumnDefinition col) {
-    return TableSchema(
-      tableName: tableName,
-      columns: [...columns, col],
-      tableConstraints: tableConstraints,
-    );
+  /// The column named [column] (case-insensitive), or null.
+  ColumnDefinition? column(String column) {
+    final i = indexOf(column);
+    return i == null ? null : columns[i];
   }
 
-  TableSchema dropColumn(String name) {
-    return TableSchema(
-      tableName: tableName,
-      columns: columns
-          .where((c) => c.name.toLowerCase() != name.toLowerCase())
-          .toList(),
-      tableConstraints: tableConstraints,
-    );
+  /// The primary key's columns, in key order; empty when there is none.
+  List<String> get primaryKey {
+    for (final c in constraints) {
+      if (c.kind == TableConstraintKind.primaryKey) return c.columns;
+    }
+    for (final c in columns) {
+      if (c.primaryKey) return [c.name];
+    }
+    return const [];
   }
 
-  TableSchema renameColumn(String oldName, String newName) {
-    return TableSchema(
-      tableName: tableName,
-      columns: columns.map((c) {
-        if (c.name.toLowerCase() == oldName.toLowerCase()) {
-          return c.copyWith(name: newName);
-        }
-        return c;
-      }).toList(),
-      tableConstraints: tableConstraints,
-    );
+  /// The position of the column that aliases the rowid: a single-column
+  /// primary key declared exactly `INTEGER`, as in SQLite. Null when there
+  /// is none.
+  int? get rowidAlias {
+    final pk = primaryKey;
+    if (pk.length != 1) return null;
+    final i = indexOf(pk.first);
+    if (i == null || columns[i].type.toUpperCase() != 'INTEGER') return null;
+    return i;
   }
 
-  Map<String, dynamic> toJson() => {
-    'tableName': tableName,
-    'columns': columns.map((c) => c.toJson()).toList(),
-    'tableConstraints': tableConstraints.map((c) => c.toJson()).toList(),
+  /// Whether the rowid alias was declared `AUTOINCREMENT`.
+  bool get autoIncrement {
+    final i = rowidAlias;
+    return i != null && columns[i].autoIncrement;
+  }
+
+  /// Every unique key: the primary key (unless it aliases the rowid, which
+  /// is unique by construction), then each UNIQUE constraint and column.
+  List<List<String>> get uniqueKeys => [
+    if (primaryKey.isNotEmpty && rowidAlias == null) primaryKey,
+    for (final c in constraints)
+      if (c.kind == TableConstraintKind.unique) c.columns,
+    for (final c in columns)
+      if (c.unique) [c.name],
+  ];
+
+  /// Every foreign key of this table.
+  List<ForeignKeyDefinition> get foreignKeys => [
+    for (final c in constraints)
+      if (c.kind == TableConstraintKind.foreignKey) c.foreignKey!,
+  ];
+
+  /// Every CHECK expression, as SQL text.
+  List<String> get checks => [
+    for (final c in constraints)
+      if (c.kind == TableConstraintKind.check) c.checkSql!,
+  ];
+
+  /// The visible column names, in order.
+  List<String> get columnNames => [
+    for (final c in columns)
+      if (!c.hidden) c.name,
+  ];
+
+  /// A copy with [name], [columns] or [constraints] replaced.
+  TableSchema copyWith({
+    String? name,
+    List<ColumnDefinition>? columns,
+    List<TableConstraint>? constraints,
+  }) => TableSchema(
+    name: name ?? this.name,
+    columns: columns ?? this.columns,
+    constraints: constraints ?? this.constraints,
+  );
+
+  /// The `CREATE TABLE` statement that recreates this schema.
+  String get sql {
+    final parts = [
+      for (final c in columns) c.sql,
+      for (final c in constraints) c.sql,
+    ];
+    return 'CREATE TABLE ${quoteIdentifier(name)} (${parts.join(', ')})';
+  }
+
+  /// The JSON form stored in database files.
+  Map<String, Object?> toJson() => {
+    'name': name,
+    'columns': [for (final c in columns) c.toJson()],
+    if (constraints.isNotEmpty)
+      'constraints': [for (final c in constraints) c.toJson()],
   };
 
-  factory TableSchema.fromJson(Map<String, dynamic> json) {
-    return TableSchema(
-      tableName: json['tableName'] as String,
-      columns: (json['columns'] as List<dynamic>)
-          .map((c) => ColumnDefinition.fromJson(c as Map<String, dynamic>))
-          .toList(),
-      tableConstraints:
-          (json['tableConstraints'] as List<dynamic>?)
-              ?.map((c) => TableConstraint.fromJson(c as Map<String, dynamic>))
-              .toList() ??
-          [],
-    );
-  }
+  /// Reads the form written by [toJson].
+  factory TableSchema.fromJson(Map<String, Object?> json) => TableSchema(
+    name: json['name'] as String,
+    columns: [
+      for (final c in json['columns'] as List)
+        ColumnDefinition.fromJson(c as Map<String, Object?>),
+    ],
+    constraints: [
+      for (final c in (json['constraints'] as List?) ?? const [])
+        ?TableConstraint.fromJson(c as Map<String, Object?>),
+    ],
+  );
 
   @override
-  String toString() => 'TableSchema($tableName, ${columns.length} columns)';
+  String toString() => 'TableSchema($name, ${columns.length} columns)';
+}
+
+/// Where an index came from.
+enum IndexOrigin {
+  /// Created for the table's PRIMARY KEY.
+  primaryKey,
+
+  /// Created for a UNIQUE constraint.
+  unique,
+
+  /// Created by `CREATE [UNIQUE] INDEX`.
+  manual,
+
+  /// Created by `CREATE SPATIAL INDEX`: an R-tree over two columns.
+  spatial,
+
+  /// Internal: kept on a foreign key's columns so that changing a parent
+  /// row finds its children without a scan. Never listed or saved.
+  foreignKey,
+}
+
+/// A description of one index, for introspection.
+final class IndexInfo {
+  /// Creates an index description.
+  const IndexInfo({
+    required this.name,
+    required this.table,
+    required this.columns,
+    required this.unique,
+    required this.origin,
+  });
+
+  /// The index's name. Constraint indexes are named
+  /// `sqlite_autoindex_<table>_<n>`, as in SQLite.
+  final String name;
+
+  /// The indexed table.
+  final String table;
+
+  /// The indexed columns, in key order.
+  final List<String> columns;
+
+  /// Whether the index enforces uniqueness.
+  final bool unique;
+
+  /// What created the index.
+  final IndexOrigin origin;
+
+  @override
+  String toString() =>
+      'IndexInfo($name on $table(${columns.join(', ')})'
+      '${unique ? ', unique' : ''})';
 }

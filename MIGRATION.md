@@ -1,578 +1,183 @@
-# Migration Guide
+# Migrating from just_database 1.x to 2.0
 
-Guide for upgrading between versions and migrating from other databases.
+2.0 replaces the SQL engine with one that follows SQLite, moves the files,
+changes the file format, and tidies the API. It reads every 1.x database
+file. This guide lists what you may have to change, most common first.
 
-## Table of Contents
+## 1. Dependencies
 
-- [Migrating from SQLite](#migrating-from-sqlite)
-- [Migrating from Hive](#migrating-from-hive)
-- [Migrating from Shared Preferences](#migrating-from-shared-preferences)
-- [Version Upgrades](#version-upgrades)
-- [Data Format Conversion](#data-format-conversion)
-- [Performance Optimization Guide](#performance-optimization-guide)
-- [Common Migration Patterns](#common-migration-patterns)
-- [Troubleshooting](#troubleshooting)
-
----
-
-## Migrating from SQLite
-
-### Key Differences
-
-| Feature | SQLite | JustDatabase |
-|---------|--------|---------------|
-| Implementation | Native C library | Pure Dart |
-| Platform support | Requires platform-specific builds | Works everywhere |
-| File format | Binary | JSON (when persisted) |
-| JOINs | Full support | Full support (INNER, LEFT, RIGHT) |
-| Transactions | Full support | Full support (BEGIN/COMMIT/ROLLBACK/SAVEPOINT) |
-| Triggers | Supported | Supported (BEFORE/AFTER INSERT/UPDATE/DELETE) |
-| Views | Supported | Supported (CREATE VIEW, INSTEAD OF triggers) |
-
-### Migration Steps
-
-1. **Export data from SQLite:**
-
-```dart
-// SQLite code
-final db = await openDatabase('my_sqlite.db');
-final List<Map<String, dynamic>> users = await db.query('users');
+```yaml
+dependencies:
+  just_database: ^2.0.0
 ```
 
-2. **Import into just_database:**
+2.0 needs Flutter 3.47.1 or newer and `just_storage` 2.x. It no longer
+depends on `encrypt` or `just_signals`.
+
+## 2. Encryption is not a mode
 
 ```dart
-final jdb = await JustDatabase.open('my_db');
-await jdb.execute('''
-  CREATE TABLE users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    email TEXT
-  )
-''');
-
-for (final user in users) {
-  await jdb.execute(
-    "INSERT INTO users (id, name, email) VALUES "
-    "(${user['id']}, '${user['name']}', '${user['email']}')"
-  );
-}
+// 1.x
+JustDatabase.open('vault', mode: DatabaseMode.secure, encryptionKey: key);
+// 2.0
+JustDatabase.open('vault', encryptionKey: key);
 ```
 
-3. **Update queries:**
+`DatabaseMode` is now `standard`, `readFast` or `writeFast`; any of them can
+be encrypted. An empty key is rejected, and so is a key with
+`persist: false`.
 
-```dart
-// SQLite with joins
-final result = await db.rawQuery('''
-  SELECT u.name, p.title 
-  FROM users u 
-  JOIN posts p ON u.id = p.user_id
-''');
+The passphrase now goes through PBKDF2-HMAC-SHA256 (600 000 iterations, a
+salt per file); 1.x used a single SHA-256. A 1.x encrypted file opens with
+the same `encryptionKey` and is re-encrypted the 2.0 way on the next save.
+Opening an encrypted file without its key, or a plain file with a key,
+throws `StateError`; `db.changeEncryptionKey()` encrypts, re-keys or
+decrypts an open database.
 
-// just_database — same syntax works!
-final result = await jdb.query('''
-  SELECT u.name, p.title
-  FROM users u
-  INNER JOIN posts p ON u.id = p.user_id
-''');
-```
+`SecureKeyManager.resolveKey` and `resolveAutoKey` work as before and return
+the same keys for databases created with them. New salts made by
+`resolveKey` derive the key from the password's UTF-8 bytes; 1.x salts keep
+the 1.x derivation.
 
-### What to Keep in Mind
+## 3. Files moved
 
-- ✅ Basic CRUD operations work the same
-- ✅ Constraints and indexes are supported
-- ✅ JOINs (INNER, LEFT, RIGHT) are fully supported
-- ✅ Triggers (BEFORE/AFTER INSERT/UPDATE/DELETE) are supported
-- ✅ Views and INSTEAD OF triggers are supported
-- ✅ Transactions with savepoints are supported
-- ✅ Performance is comparable for most use cases
-- ⚠️ Persistence is JSON-based (not binary), so large BLOBs are less efficient
+1.x saved to `<documents>/just_database/`, which on desktop every app shares.
+2.0 saves to `<application support>/just_database/`. When you open a
+database that only exists in the old place, it is copied (moved on Android
+and iOS) the first time. Files other apps left in the shared documents
+folder are not touched, and `DatabaseManager.deleteAll()` only deletes this
+app's databases.
 
----
+On the web, the OPFS/Web Worker backend (which never activated) is gone;
+databases stay in IndexedDB, and an encrypted database is now really
+encrypted there.
 
-## Migrating from Hive
+## 4. The file format
 
-### Key Differences
+The first save rewrites a 1.x file in format 2, which 1.x cannot read: after
+upgrading, do not go back without a backup. Format 2 keeps views,
+triggers, CREATE INDEX indexes, rowids and AUTOINCREMENT counters (1.x
+silently lost the first three).
 
-| Feature | Hive | just_database |
-|---------|------|---------------|
-| Data model | Key-value / Box | Relational tables |
-| Query language | Dart code | SQL |
-| Relationships | Manual | Foreign keys |
-| Schema | TypeAdapter | SQL DDL |
-| Indexing | None / Basic | Advanced with auto-indexing |
+1.x did not enforce some keys, so a 1.x file can hold duplicates in a
+UNIQUE or PRIMARY KEY column. 2.0 keeps those rows, drops that constraint
+and prints a warning; recreate the constraint once the data is clean.
 
-### Migration Steps
+## 5. SQL now behaves like SQLite
 
-1. **Export data from Hive:**
+Most code keeps working. These differences can change results:
 
-```dart
-final box = await Hive.openBox<User>('users');
-final users = box.values.toList();
-```
-
-2. **Create schema in just_database:**
-
-```dart
-final db = await JustDatabase.open('my_db');
-await db.execute('''
-  CREATE TABLE users (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    email TEXT,
-    age INTEGER
-  )
-''');
-```
-
-3. **Import data:**
-
-```dart
-for (final user in users) {
-  await db.execute(
-    "INSERT INTO users (id, name, email, age) VALUES "
-    "(${user.id}, '${user.name}', '${user.email}', ${user.age})"
-  );
-}
-```
-
-4. **Update code:**
-
-```dart
-// Hive
-final user = box.get(userId);
-user.name = 'New Name';
-await box.put(userId, user);
-
-// just_database
-await db.execute("UPDATE users SET name = 'New Name' WHERE id = $userId");
-```
-
-### Benefits of Migration
-
-- ✅ More powerful queries with SQL
-- ✅ Better support for relationships
-- ✅ Automatic indexing and optimization
-- ✅ Schema validation and constraints
-- ✅ Built-in admin UI
-
----
-
-## Migrating from Shared Preferences
-
-### When to Migrate
-
-Consider migrating if you have:
-- Complex data structures
-- Need for queries
-- More than 50-100 keys
-- Relational data
-
-### Migration Steps
-
-1. **Read existing preferences:**
-
-```dart
-final prefs = await SharedPreferences.getInstance();
-final users = <Map<String, dynamic>>[];
-
-// Assuming you stored JSON strings
-final userKeys = prefs.getKeys()
-  .where((k) => k.startsWith('user_'))
-  .toList();
-
-for (final key in userKeys) {
-  final json = prefs.getString(key);
-  users.add(jsonDecode(json!));
-}
-```
-
-2. **Create database schema:**
-
-```dart
-final db = await DatabaseManager.open('app_db', persist: true);
-await db.execute('''
-  CREATE TABLE users (
-    id INTEGER PRIMARY KEY,
-    name TEXT,
-    email TEXT,
-    settings TEXT
-  )
-''');
-```
-
-3. **Import data:**
-
-```dart
-for (final user in users) {
-  await db.execute(
-    "INSERT INTO users (id, name, email) VALUES "
-    "(${user['id']}, '${user['name']}', '${user['email']}')"
-  );
-}
-```
-
-4. **Clean up old preferences:**
-
-```dart
-for (final key in userKeys) {
-  await prefs.remove(key);
-}
-```
-
-### Code Updates
-
-```dart
-// Old: SharedPreferences
-final userId = prefs.getInt('current_user_id');
-final userName = prefs.getString('user_${userId}_name');
-
-// New: just_database
-final result = await db.execute('SELECT * FROM users WHERE id = $userId');
-final user = result.rows.first;
-final userName = user['name'];
-```
-
----
-
-## Version Upgrades
-
-### 1.2.0 → 1.3.0
-
-This is a **non-breaking** release. No code changes are required for existing
-apps. The public API is unchanged — `JustDatabase.open()` works identically on
-all platforms.
-
-#### New: OPFS Web Persistence with Web Worker
-
-Web databases now persist data across sessions using the **Origin Private File
-System (OPFS)** via the File System Access API. The SQL engine runs in a
-dedicated **Web Worker** (Dart isolate compiled to a worker) with synchronous
-byte-level I/O and a **Write-Ahead Log (WAL)** for crash safety.
-
-**Storage backend selection (automatic):**
-
-| Priority | Backend | When selected |
+| | 1.x | 2.0 |
 |---|---|---|
-| 1 | **OPFS + Web Worker** | Browser supports `FileSystemSyncAccessHandle` |
-| 2 | **IndexedDB** | OPFS unavailable (older browsers, private browsing) |
-| 3 | **In-memory** | Neither API available, or `persist: false` |
+| `NULL = NULL`, `x != 1` on NULL | true / matched | NULL: not matched (use `IS`, `IS NOT`) |
+| `'a' + 'b'` | `'ab'` | `0` (use `'a' \|\| 'b'`) |
+| `BOOLEAN` values | Dart `bool` | `1` / `0` (`WHERE active = 1` now works) |
+| `DATETIME` values | Dart `DateTime` | ISO-8601 text (UTC when bound from a `DateTime`) |
+| unknown column in `WHERE`/`SET` | NULL / silently stored | error |
+| `DELETE FROM t WHRE id = 1` | deleted every row | syntax error |
+| two statements in one `execute` | ran the first | error; use `executeScript` |
+| `SELECT UPPER(name) FROM t` | one row | every row |
+| `SELECT a+1, a+2` | one column | two columns (`a+1`, `a+2`) |
+| table-level `PRIMARY KEY (id)`, `CREATE UNIQUE INDEX` | not enforced | enforced |
+| `id INTEGER PRIMARY KEY` | a counter | the rowid (`INT PRIMARY KEY` is a plain key) |
+| `TINYINT`, `NVARCHAR`, … | text | SQLite affinity (`TINYINT` is integer) |
+| `3.7` into `INTEGER` | `3` | `3.7` (as SQLite) |
+| `LIKE`, `lower()`, `upper()` | Unicode case | ASCII case only |
+| a failing multi-row statement | kept the rows before the failure | changes nothing |
+| foreign keys | partly checked | enforced, with actions (`PRAGMA foreign_keys = OFF` to stop) |
+| triggers' `NEW.id` for an auto id | NULL | the new id (in `AFTER` triggers) |
+| `CREATE OR REPLACE VIEW` | replaced the view | syntax error (`DROP VIEW` then `CREATE VIEW`) |
+| `DROP INDEX name ON table` | accepted | syntax error (`DROP INDEX name`) |
+
+Result column names follow SQLite: `SELECT COUNT(*)` is `COUNT(*)` even on
+an empty table, and repeated names get `:1`, `:2`.
+
+## 6. Statements and results
 
 ```dart
-final db = await JustDatabase.open('mydb');
-// db.storageBackend tells you which backend was chosen:
-//   WebStorageBackend.opfsWorker
-//   WebStorageBackend.indexedDb
-//   WebStorageBackend.memory
+// 1.x: values pasted into SQL
+db.execute("INSERT INTO t (name) VALUES ('${name.replaceAll("'", "''")}')");
+// 2.0: bound
+db.execute('INSERT INTO t (name) VALUES (?)', [name]);
 ```
 
-**Behavior on web / WASM (updated):**
+* `query()` only runs `SELECT`; a write there fails (it used to run without
+  being saved). Use `execute()`.
+* `QueryResult` adds `values`, `error` (a `SqlException`), `scalar`,
+  `lastInsertRowId` and `orThrow()`. Its `rows` are unmodifiable.
 
-| Feature | Behavior |
+## 7. Transactions
+
+```dart
+// 1.x: the callback got the database; failures returned results
+await db.transaction((db) async { await db.execute(...); });
+// 2.0: the callback gets a Transaction whose statements throw
+await db.transaction((tx) async { await tx.execute(...); });
+```
+
+A failing statement inside now rolls the transaction back (1.x committed
+it). Other callers wait until the transaction ends.
+
+## 8. Opening, closing, saving
+
+* Opening an open name returns the same instance; call `close()` once per
+  `open()`. Opening it with other settings throws.
+* `close()` waits for running statements, rolls back an open transaction,
+  saves, and throws if that save fails. Closing twice is harmless.
+* Nothing uncommitted is ever saved; `close()` inside a transaction no
+  longer saves half of it.
+* `onSaveError` reports background save failures; `flush()` throws them.
+* Database names are now checked: 1–128 letters, digits, `_`, `.` or `-`.
+
+## 9. Removed APIs
+
+| 1.x | 2.0 |
 |---|---|
-| SQL queries, ORM, transactions | ✅ fully supported |
-| Persistence (`persist: true`) | ✅ OPFS (preferred) or IndexedDB (fallback) |
-| `BackupManager.exportSql` / `exportJson` | ✅ fully supported |
-| `BackupManager.backupToFile` / `restoreFromFile` | Throws `UnsupportedError` |
-| `SecureKeyManager` | ✅ uses browser `localStorage` via `just_storage` |
+| `Executor`, `Parser`, the AST classes, `Table`, `TableIndex`, `DatabaseRow`, `LockManager`, `QueryTracker`, `PersistenceManager`, `RTreeIndex`, `BoundingBox`, `Point` | internal; use `JustDatabase` |
+| `BackupManager` | `db.exportSql()`, `exportJson()`, `importSql()`, `importJson()` |
+| `JustDatabaseAdminWidget` | `JustDatabaseAdminScreen` |
+| `JUDatabaseAdminScreen` | `JustDatabaseAdminScreen({controller, readOnly, theme, title, onSeedDatabase})` |
+| `DatabaseProvider` | `JustDatabaseAdminController` (`refresh()`, `selectDatabase(name)`, `database`, `lastError`) |
+| `DatabaseDetailPage`, `InsertPage`, `BenchmarkPage`, the admin tabs | parts of the workbench, no longer public |
+| UI exports in `just_database.dart` | `import 'package:just_database/ui.dart';` |
+| `DataType`, `ConstraintDefinition` | `ColumnDefinition` (`type`, `affinity`, `notNull`, …), `TableConstraint`, `ForeignKeyDefinition` |
+| `TableSchema.tableName` | `TableSchema.name` |
+| `DatabaseManager.openDatabases` as a mutable map | read-only |
+| `MigrationStatus.skipped` (rollback) | `MigrationStatus.rolledBack` |
+| `MigrationGuard` | not needed: migrations run on `JustDatabase` |
+| automatic query-pattern indexes | gone; create indexes yourself |
 
-#### New: `WebStorageBackend` enum
+## 10. Migrations
 
-On web, the `JustDatabase` instance exposes a `storageBackend` getter so you
-can inspect which backend was selected at runtime.
-
-#### New: `web` direct dependency
-
-`package:web ^1.1.0` is now a direct dependency (previously transitive via
-`just_storage`). If your app pins `web` directly, ensure your constraint is
-compatible.
-
-#### Architecture: conditional export for `database.dart`
-
-`database.dart` is now a conditional export gateway (like `persistence.dart`):
-- Native → `database_native.dart`
-- Web → `database_web.dart`
-
-This is an internal change with no public API impact.
-
----
-
-### 1.1.0 → 1.2.0
-
-This is a **non-breaking** release. No code changes are required for existing
-native (Android / iOS / Desktop) apps.
-
-#### New: full Web and WASM support
-
-The package now works on Flutter Web (both JS and WASM compilation targets).
-The `platforms:` key is declared in `pubspec.yaml`, and conditional imports
-use `dart.library.js_interop` so the correct stub is selected on both web
-targets.
-
-**Behavior on web / WASM:**
-
-| Feature | Behavior |
-|---|---|
-| SQL queries, ORM, transactions | ✅ fully supported |
-| File persistence (`persist: true`) | Silent no-op — data lives in memory only |
-| `BackupManager.exportSql` / `exportJson` | ✅ fully supported |
-| `BackupManager.backupToFile` / `restoreFromFile` | Throws `UnsupportedError` |
-| `SecureKeyManager` | ✅ uses browser `localStorage` via `just_storage` |
+`Migration.up`/`down` receive a `Transaction` (it was an `Executor`):
 
 ```dart
-// On web: use in-memory backup helpers instead of file helpers
-final sql = BackupManager.exportSql(tables);
-// Send `sql` to your server for persistence
-```
-
-#### Changed dependency
-
-`just_storage` bumped from path dependency to `^1.1.2` (published release).
-
-If your app pins `just_storage` directly, update its constraint to `^1.1.2`.
-
----
-
-### 1.0.0 → 1.1.0
-
-This is a **non-breaking** release. No code changes are required for apps that
-do not use `DatabaseMode.secure`.
-
-#### New: `DatabaseMode.secure` (opt-in)
-
-Encrypted databases are fully new — existing code is unaffected. To create a
-new encrypted database:
-
-```dart
-// Fully automatic (no user password) — recommended
-final key = await SecureKeyManager.resolveAutoKey(dbName: 'vault');
-final db  = await JustDatabase.open('vault',
-    mode: DatabaseMode.secure, encryptionKey: key);
-```
-
-Or via the Admin UI: set the mode to **Secure** in the Create Database dialog.
-The key is generated and stored automatically — no password prompt.
-
-#### Renamed: `Row` → `DatabaseRow`
-
-The internal storage class `Row` was renamed to `DatabaseRow` to avoid
-shadowing Flutter’s `Row` widget. This affects you only if you were accessing
-`Table.rows` or passing `Table.update` / `Table.delete` callbacks directly:
-
-```dart
-// Before (1.0.0)
-final List<Row> rows = table.rows;
-table.update(values, (Row r) => r.values['active'] == true);
-
-// After (1.1.0)
-final List<DatabaseRow> rows = table.rows;
-table.update(values, (DatabaseRow r) => r.values['active'] == true);
-```
-
-If you had any `import 'package:just_database/just_database.dart' hide Row;`
-directive to avoid the Flutter widget conflict, **remove it** — the rename
-resolves the ambiguity automatically.
-
-#### New dependencies (transitive — no action required)
-
-| Package | Version | Purpose |
-|---|---|---|
-| `just_storage` | path dep | Encrypted key-value store for `SecureKeyManager` |
-| `encrypt` | `^5.0.3` | AES-256-GCM cipher primitives |
-| `crypto` | `^3.0.3` | PBKDF2-HMAC-SHA256 key derivation |
-
-If your app has a direct dependency on any of these, ensure version constraints
-are compatible, then run `flutter pub get`.
-
-#### Admin UI — new tabs
-
-The Admin UI now has 6 tabs (previously 4). `JUDatabaseAdminScreen` requires no
-constructor changes; the new **Insert** and **Benchmark** tabs are available
-automatically.
-
----
-
-## Data Format Conversion
-
-### Converting Between Persistence Modes
-
-**From In-Memory to Persistent:**
-
-```dart
-// 1. Create in-memory database
-final memDb = await JustDatabase.open('temp_db', persist: false);
-await memDb.execute('CREATE TABLE data (id INTEGER, value TEXT)');
-await memDb.execute("INSERT INTO data VALUES (1, 'test')");
-
-// 2. Create persistent database
-final persistDb = await DatabaseManager.open(
-  'permanent_db',
-  persist: true,
+CallbackMigration(
+  version: 2,
+  name: 'add email',
+  upCallback: (tx) => tx.execute('ALTER TABLE users ADD COLUMN email TEXT'),
 );
-
-// 3. Copy schema
-for (final tableName in memDb.getTableNames()) {
-  final schema = memDb.getTableSchema(tableName)!;
-  // Recreate table in persistent DB
-  await persistDb.execute(/* CREATE TABLE statement */);
-}
-
-// 4. Copy data
-final result = await memDb.execute('SELECT * FROM data');
-for (final row in result.rows) {
-  await persistDb.execute(
-    "INSERT INTO data (id, value) VALUES (${row['id']}, '${row['value']}')"
-  );
-}
 ```
 
-**From Persistent to In-Memory:**
+Each migration runs in its own transaction. Duplicate versions or versions
+below 1 throw `ArgumentError`; a changed applied migration or a pending one
+older than the newest applied throws `MigrationException`. The `_migrations`
+table is unchanged, so existing history carries over.
 
-```dart
-// Open existing database (persist: false means in-memory copy)
-final memDb = await DatabaseManager.open('saved_db', persist: false);
-```
+## 11. ORM
 
----
+* `fromRow` receives `Map<String, Object?>`; booleans and dates come back as
+  `1`/`0` and text. Use the row helpers: `row.boolValue('active')`,
+  `row.dateTimeValue('at')`, `row.intValue('id')`, …
+* `findAll`, `findWhere`, `findFirst`, `count`, `updateWhere` and
+  `deleteWhere` take `whereArgs` for `?` placeholders.
+* `insert` returns the row it inserted even when others insert at the same
+  time; `insertAll` runs in one transaction.
 
-## Performance Optimization Guide
+## 12. Query builder and benchmarks
 
-### After Migration
-
-1. **Create indexes on frequently queried columns:**
-
-```dart
-// SQL-based index creation
-await db.execute('CREATE INDEX idx_email ON users (email)');
-await db.execute('CREATE UNIQUE INDEX idx_slug ON posts (slug)');
-await db.execute('CREATE INDEX idx_dept_sal ON employees (department, salary)');
-```
-
-2. **Enable query tracking:**
-
-Query tracking is enabled by default. After ~100 queries with the same pattern, indexes are automatically created.
-
-3. **Check index performance:**
-
-```dart
-for (final index in table.indexMetadata) {
-  debugPrint('${index.columns}: ${index.hitRatio * 100}% hit rate');
-}
-```
-
-4. **Choose the right database mode:**
-
-- Use `DatabaseMode.readFast` for read-heavy workloads
-- Use `DatabaseMode.writeFast` for write-heavy workloads
-- Use `DatabaseMode.standard` for balanced workloads
-
-5. **Monitor query execution times:**
-
-```dart
-final result = await db.execute('SELECT * FROM large_table');
-debugPrint('Execution time: ${result.executionTime?.inMilliseconds}ms');
-```
-
----
-
-## Common Migration Patterns
-
-### Pattern 1: Batch Import
-
-For large datasets, process in batches:
-
-```dart
-const batchSize = 1000;
-for (var i = 0; i < oldData.length; i += batchSize) {
-  final batch = oldData.skip(i).take(batchSize);
-  for (final record in batch) {
-    await db.execute(/* INSERT */);
-  }
-  debugPrint('Processed ${i + batch.length} records');
-}
-```
-
-### Pattern 2: Schema Validation
-
-Validate migrated data:
-
-```dart
-final result = await db.execute('SELECT COUNT(*) as count FROM users');
-final newCount = result.rows.first['count'];
-debugPrint('Migrated $newCount records (expected: ${oldData.length})');
-
-if (newCount != oldData.length) {
-  debugPrint('WARNING: Record count mismatch!');
-}
-```
-
-### Pattern 3: Gradual Migration
-
-Run both systems in parallel:
-
-```dart
-class DualDatabase {
-  final oldDb;
-  final newDb;
-  
-  Future<void> write(Map<String, dynamic> data) async {
-    await oldDb.write(data);  // Keep old system working
-    await newDb.execute(/* INSERT */);  // Populate new system
-  }
-  
-  Future<Map<String, dynamic>> read(int id) async {
-    // Read from new system first, fallback to old
-    try {
-      final result = await newDb.execute('SELECT * FROM data WHERE id = $id');
-      return result.rows.first;
-    } catch (e) {
-      return await oldDb.read(id);
-    }
-  }
-}
-```
-
----
-
-## Troubleshooting
-
-### Migration Issues
-
-**Problem:** Data types don't match
-
-**Solution:** Convert data types during migration:
-```dart
-// Convert string to integer
-final age = int.tryParse(oldUser['age']) ?? 0;
-await db.execute("INSERT INTO users (age) VALUES ($age)");
-```
-
-**Problem:** Large dataset migration takes too long
-
-**Solution:** Use persistence and process in background:
-```dart
-final db = await DatabaseManager.open('new_db', persist: true);
-// Process in isolate or with periodic UI updates
-```
-
-**Problem:** Complex queries don't translate
-
-**Solution:** Break into simpler queries or use Dart for processing:
-```dart
-final users = await db.execute('SELECT * FROM users');
-final result = users.rows.where((u) => /* complex condition */).toList();
-```
-
----
-
-## Getting Help
-
-- 📚 [README](README.md) - Full documentation
-- 📖 [API Reference](API.md) - Complete API docs
-- 🤝 [Contributing Guide](CONTRIBUTING.md) - How to report bugs and open PRs
-- 💬 [Discussions](https://github.com/just-unknown-dev/just-database/discussions)
-- 🐛 [Issue tracker](https://github.com/just-unknown-dev/just-database/issues)
-
----
-
-*Last updated: 2026-02-23*
+* `db.from(t).where(condition, [params])` binds values; `whereEquals`
+  added; names are quoted.
+* `runStandardBenchmark` runs on a private in-memory database (1.x created
+  and dropped `_bench_t` in yours); `benchmarkQuery` only runs reads.
+  `DatabaseBenchmark` is replaced by these and `runStandardDatabaseBenchmark`.
