@@ -1,4 +1,4 @@
-import 'package:flutter/foundation.dart';
+import 'package:just_signals/just_signals.dart';
 import '../core/database.dart';
 import '../core/database_manager.dart';
 import '../core/database_mode.dart';
@@ -6,7 +6,7 @@ import '../core/secure_key_manager.dart';
 import '../sql/executor.dart';
 
 /// Provider for managing database state and operations in the admin UI.
-class DatabaseProvider extends ChangeNotifier {
+class DatabaseProvider {
   List<DatabaseInfo> _databases = [];
   JustDatabase? _currentDatabase;
   DatabaseMode _defaultMode = DatabaseMode.standard;
@@ -15,6 +15,12 @@ class DatabaseProvider extends ChangeNotifier {
   String? _lastError;
   bool _isLoading = false;
   final List<String> _queryHistory = [];
+
+  /// Incremented whenever state changes so widgets can rebuild via SignalBuilder.
+  final Signal<int> revision = Signal(
+    0,
+    debugLabel: 'databaseProviderRevision',
+  );
 
   // ---------------------------------------------------------------------------
   // Getters
@@ -175,12 +181,12 @@ class DatabaseProvider extends ChangeNotifier {
 
   void setPersistEnabled(bool value) {
     _persistEnabled = value;
-    notifyListeners();
+    _notify();
   }
 
   void setDefaultMode(DatabaseMode mode) {
     _defaultMode = mode;
-    notifyListeners();
+    _notify();
   }
 
   Future<void> clearAllDatabases() async {
@@ -210,15 +216,19 @@ class DatabaseProvider extends ChangeNotifier {
 
   void _setLoading(bool v) {
     _isLoading = v;
-    notifyListeners();
+    _notify();
   }
 
   void _setError(String msg) {
     _lastError = msg;
-    notifyListeners();
+    _notify();
   }
 
   void _clearError() {
     _lastError = null;
+  }
+
+  void _notify() {
+    revision.value++;
   }
 }

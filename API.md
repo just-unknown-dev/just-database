@@ -17,19 +17,20 @@ Complete API reference for just_database package.
 
 ## Platform Support
 
-| Platform | SQL / ORM | File persistence | Backup file helpers | `SecureKeyManager` |
+| Platform | SQL / ORM | Persistence | Backup file helpers | `SecureKeyManager` |
 |---|---|---|---|---|
-| Android | ✅ | ✅ | ✅ | ✅ |
-| iOS | ✅ | ✅ | ✅ | ✅ |
-| macOS | ✅ | ✅ | ✅ | ✅ |
-| Windows | ✅ | ✅ | ✅ | ✅ |
-| Linux | ✅ | ✅ | ✅ | ✅ |
-| Web (JS) | ✅ | ❌ no-op | ❌ `UnsupportedError` | ✅ `localStorage` |
-| Web (WASM) | ✅ | ❌ no-op | ❌ `UnsupportedError` | ✅ `localStorage` |
+| Android | ✅ | ✅ JSON file | ✅ | ✅ |
+| iOS | ✅ | ✅ JSON file | ✅ | ✅ |
+| macOS | ✅ | ✅ JSON file | ✅ | ✅ |
+| Windows | ✅ | ✅ JSON file | ✅ | ✅ |
+| Linux | ✅ | ✅ JSON file | ✅ | ✅ |
+| Web (JS) | ✅ | ✅ OPFS / IndexedDB | ❌ `UnsupportedError` | ✅ `localStorage` |
+| Web (WASM) | ✅ | ✅ OPFS / IndexedDB | ❌ `UnsupportedError` | ✅ `localStorage` |
 
-On web/WASM, `persist: true` is silently ignored — the database lives in memory
-only. All SQL, ORM, and in-memory backup operations (`exportSql`, `exportJson`,
-etc.) work normally.
+On web/WASM, `persist: true` selects the best available storage backend
+automatically: OPFS with Web Worker (preferred), IndexedDB (fallback), or
+in-memory (last resort). All SQL, ORM, and in-memory backup operations
+(`exportSql`, `exportJson`, etc.) work normally on all platforms.
 
 ---
 
@@ -114,6 +115,23 @@ List<String> indexNamesForTable(String tableName)  // Index names for a table
 int          totalRows             // Sum of row counts across all tables
 int          estimatedSizeBytes    // Estimated in-memory + persisted size in bytes
 ```
+
+#### Web-only: storage backend
+
+```dart
+WebStorageBackend storageBackend   // Which backend was selected (web only)
+```
+
+`WebStorageBackend` is an enum with three values:
+
+| Value | Description |
+|---|---|
+| `opfsWorker` | Full OPFS with synchronous I/O inside a Web Worker + WAL |
+| `indexedDb` | Main-thread SQL engine with IndexedDB snapshot persistence |
+| `memory` | In-memory only — no persistence |
+
+On native platforms, `storageBackend` is not available (native always uses
+file-based persistence).
 
 #### Benchmark helpers
 

@@ -1,7 +1,8 @@
 import '../core/database_mode.dart';
+import '../web/idb_persistence.dart' as idb;
 import 'table.dart';
 
-/// A snapshot of a persisted database loaded from disk.
+/// A snapshot of a persisted database loaded from storage.
 class DatabaseSnapshot {
   final String name;
   final DatabaseMode mode;
@@ -14,37 +15,62 @@ class DatabaseSnapshot {
   });
 }
 
-/// Web stub for [PersistenceManager].
+/// Web [PersistenceManager] backed by IndexedDB.
 ///
-/// File-based persistence is not supported on the web platform.
-/// All operations are no-ops or return empty/default values.
+/// OPFS persistence is handled inside the Web Worker (see [database_web.dart]),
+/// so this class only needs to cover the IndexedDB fallback path for
+/// non-worker usage (e.g. direct [PersistenceManager] calls from tests or the
+/// admin widget).
 class PersistenceManager {
   PersistenceManager._();
 
-  /// No-op on web — file persistence is not available.
+  /// Saves the database tables to IndexedDB.
   static Future<void> save(
     String name,
     Map<String, Table> tables,
     DatabaseMode mode, {
     String? encryptionKey,
-  }) async {}
+  }) async {
+    if (!idb.IdbPersistenceManager.isAvailable) return;
+    await idb.IdbPersistenceManager.save(name, tables, mode);
+  }
 
-  /// Always returns null on web — no files to load from.
+  /// Loads a database from IndexedDB.
   static Future<DatabaseSnapshot?> load(
     String name, {
     String? encryptionKey,
-  }) async => null;
+  }) async {
+    if (!idb.IdbPersistenceManager.isAvailable) return null;
+    final snapshot = await idb.IdbPersistenceManager.load(name);
+    if (snapshot == null) return null;
+    return DatabaseSnapshot(
+      name: snapshot.name,
+      mode: snapshot.mode,
+      tables: snapshot.tables,
+    );
+  }
 
-  /// Always returns [DatabaseMode.standard] on web.
-  static Future<DatabaseMode> peekMode(String name) async =>
-      DatabaseMode.standard;
+  /// Peeks at the stored mode without loading full data.
+  static Future<DatabaseMode> peekMode(String name) async {
+    if (!idb.IdbPersistenceManager.isAvailable) return DatabaseMode.standard;
+    return idb.IdbPersistenceManager.peekMode(name);
+  }
 
-  /// No-op on web.
-  static Future<void> delete(String name) async {}
+  /// Deletes a persisted database from IndexedDB.
+  static Future<void> delete(String name) async {
+    if (!idb.IdbPersistenceManager.isAvailable) return;
+    await idb.IdbPersistenceManager.delete(name);
+  }
 
-  /// Always returns an empty list on web.
-  static Future<List<String>> listPersistedNames() async => [];
+  /// Lists all persisted database names.
+  static Future<List<String>> listPersistedNames() async {
+    if (!idb.IdbPersistenceManager.isAvailable) return [];
+    return idb.IdbPersistenceManager.listPersistedNames();
+  }
 
-  /// Always returns 0 on web.
-  static Future<int> getFileSize(String name) async => 0;
+  /// Returns the approximate size of a persisted database.
+  static Future<int> getFileSize(String name) async {
+    if (!idb.IdbPersistenceManager.isAvailable) return 0;
+    return idb.IdbPersistenceManager.getFileSize(name);
+  }
 }

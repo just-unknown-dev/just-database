@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:just_signals/just_signals.dart';
 import 'package:just_database/just_database.dart';
 
 /// Callback type for seeding a database with initial sample data.
@@ -22,6 +22,7 @@ class JUDatabaseAdminScreen extends StatefulWidget {
 class _JUDatabaseAdminScreenState extends State<JUDatabaseAdminScreen>
     with SingleTickerProviderStateMixin {
   late final TabController _tabController;
+  late final DatabaseProvider _provider;
 
   static const _tabs = [
     Tab(icon: Icon(Icons.storage), text: 'Databases'),
@@ -34,9 +35,10 @@ class _JUDatabaseAdminScreenState extends State<JUDatabaseAdminScreen>
   void initState() {
     super.initState();
     _tabController = TabController(length: 4, vsync: this);
+    _provider = DatabaseProvider();
     // Refresh on startup
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      context.read<DatabaseProvider>().refreshDatabases();
+      _provider.refreshDatabases();
     });
   }
 
@@ -48,59 +50,64 @@ class _JUDatabaseAdminScreenState extends State<JUDatabaseAdminScreen>
 
   @override
   Widget build(BuildContext context) {
-    final provider = context.watch<DatabaseProvider>();
-    final scaffold = Scaffold(
-      appBar: AppBar(
-        leading: IconButton(
-          onPressed: () {
-            Navigator.of(context).pop();
-          },
-          icon: Icon(Icons.arrow_back_ios_outlined, size: 18),
-        ),
-        title: Row(
-          children: [
-            const Text('Just Database'),
-            if (provider.currentDatabase != null) ...[
-              const SizedBox(width: 8),
-              _DatabaseBadge(db: provider.currentDatabase!),
+    final scaffold = SignalBuilder<int>(
+      signal: _provider.revision,
+      builder: (context, value, child) => Scaffold(
+        appBar: AppBar(
+          leading: IconButton(
+            onPressed: () {
+              Navigator.of(context).pop();
+            },
+            icon: Icon(Icons.arrow_back_ios_outlined, size: 18),
+          ),
+          title: Row(
+            children: [
+              const Text('Just Database'),
+              if (_provider.currentDatabase != null) ...[
+                const SizedBox(width: 8),
+                _DatabaseBadge(db: _provider.currentDatabase!),
+              ],
             ],
+          ),
+          bottom: TabBar(
+            controller: _tabController,
+            tabs: _tabs,
+            indicatorSize: TabBarIndicatorSize.tab,
+          ),
+          actions: [
+            if (_provider.isLoading)
+              const Padding(
+                padding: EdgeInsets.only(right: 16),
+                child: Center(
+                  child: SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ),
+              )
+            else
+              IconButton(
+                icon: const Icon(Icons.refresh),
+                tooltip: 'Refresh',
+                onPressed: _provider.refreshDatabases,
+              ),
           ],
         ),
-        bottom: TabBar(
+        body: TabBarView(
           controller: _tabController,
-          tabs: _tabs,
-          indicatorSize: TabBarIndicatorSize.tab,
-        ),
-        actions: [
-          if (provider.isLoading)
-            const Padding(
-              padding: EdgeInsets.only(right: 16),
-              child: Center(
-                child: SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-              ),
-            )
-          else
-            IconButton(
-              icon: const Icon(Icons.refresh),
-              tooltip: 'Refresh',
-              onPressed: provider.refreshDatabases,
+          physics:
+              const NeverScrollableScrollPhysics(), // prevent accidental swipes
+          children: [
+            DatabasesTab(
+              provider: _provider,
+              seedCallback: widget.onSeedDatabase,
             ),
-        ],
-      ),
-      body: TabBarView(
-        controller: _tabController,
-        physics:
-            const NeverScrollableScrollPhysics(), // prevent accidental swipes
-        children: [
-          DatabasesTab(seedCallback: widget.onSeedDatabase),
-          const SchemaTab(),
-          const QueryEditorTab(),
-          const SettingsTab(),
-        ],
+            SchemaTab(provider: _provider),
+            QueryEditorTab(provider: _provider),
+            SettingsTab(provider: _provider),
+          ],
+        ),
       ),
     );
 

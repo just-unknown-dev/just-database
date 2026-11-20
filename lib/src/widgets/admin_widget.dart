@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:just_signals/just_signals.dart';
 
 import '../core/database.dart';
 import '../core/database_manager.dart';
@@ -12,7 +12,7 @@ import '../sql/executor.dart';
 /// // Embed in a route or dialog
 /// JustDatabaseAdminWidget(initialDatabase: myDb)
 /// ```
-class JustDatabaseAdminWidget extends StatelessWidget {
+class JustDatabaseAdminWidget extends StatefulWidget {
   final JustDatabase? initialDatabase;
   final String title;
 
@@ -23,15 +23,28 @@ class JustDatabaseAdminWidget extends StatelessWidget {
   });
 
   @override
+  State<JustDatabaseAdminWidget> createState() =>
+      _JustDatabaseAdminWidgetState();
+}
+
+class _JustDatabaseAdminWidgetState extends State<JustDatabaseAdminWidget> {
+  late final _AdminState _state;
+
+  @override
+  void initState() {
+    super.initState();
+    _state = _AdminState(widget.initialDatabase);
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return ChangeNotifierProvider(
-      create: (_) => _AdminState(initialDatabase),
-      child: _AdminView(title: title),
-    );
+    return _AdminView(title: widget.title, state: _state);
   }
 }
 
-class _AdminState extends ChangeNotifier {
+class _AdminState {
+  final Signal<int> revision = Signal(0, debugLabel: 'adminWidgetRevision');
+
   JustDatabase? currentDatabase;
   List<DatabaseInfo> databases = [];
   QueryResult? lastResult;
@@ -45,7 +58,7 @@ class _AdminState extends ChangeNotifier {
 
   Future<void> refresh() async {
     isLoading = true;
-    notifyListeners();
+    _notify();
     try {
       databases = await DatabaseManager.listDatabases();
       lastError = null;
@@ -53,18 +66,18 @@ class _AdminState extends ChangeNotifier {
       lastError = e.toString();
     } finally {
       isLoading = false;
-      notifyListeners();
+      _notify();
     }
   }
 
   Future<void> runQuery(String sql) async {
     if (currentDatabase == null) {
       lastError = 'No database selected.';
-      notifyListeners();
+      _notify();
       return;
     }
     isLoading = true;
-    notifyListeners();
+    _notify();
     try {
       final s = sql.trim().toLowerCase();
       if (s.startsWith('select')) {
@@ -78,7 +91,7 @@ class _AdminState extends ChangeNotifier {
       lastError = e.toString();
     } finally {
       isLoading = false;
-      notifyListeners();
+      _notify();
     }
   }
 
@@ -88,17 +101,23 @@ class _AdminState extends ChangeNotifier {
           DatabaseManager.getOpenDatabase(info.name) ??
           await DatabaseManager.open(info.name);
       lastError = null;
-      notifyListeners();
+      _notify();
     } catch (e) {
       lastError = e.toString();
-      notifyListeners();
+      _notify();
     }
+  }
+
+  void _notify() {
+    revision.value++;
   }
 }
 
 class _AdminView extends StatefulWidget {
   final String title;
-  const _AdminView({required this.title});
+  final _AdminState state;
+
+  const _AdminView({required this.title, required this.state});
 
   @override
   State<_AdminView> createState() => _AdminViewState();
@@ -124,47 +143,55 @@ class _AdminViewState extends State<_AdminView>
 
   @override
   Widget build(BuildContext context) {
-    final state = context.watch<_AdminState>();
-    final colorScheme = Theme.of(context).colorScheme;
-    return Scaffold(
-      appBar: AppBar(
-        title: Row(
-          children: [
-            Text(widget.title),
-            if (state.currentDatabase != null) ...[
-              const SizedBox(width: 8),
-              Chip(
-                label: Text(state.currentDatabase!.name),
-                backgroundColor: colorScheme.primaryContainer,
-                labelStyle: TextStyle(color: colorScheme.onPrimaryContainer),
-                padding: EdgeInsets.zero,
-                visualDensity: VisualDensity.compact,
-              ),
-            ],
-          ],
-        ),
-        bottom: TabBar(
-          controller: _tabs,
-          tabs: const [
-            Tab(icon: Icon(Icons.storage), text: 'DBs'),
-            Tab(icon: Icon(Icons.schema), text: 'Schema'),
-            Tab(icon: Icon(Icons.code), text: 'Query'),
-          ],
-        ),
-      ),
-      body: TabBarView(
-        controller: _tabs,
-        children: [
-          _DatabaseListTab(
-            onSelect: (info) {
-              context.read<_AdminState>().selectDatabase(info);
-              _tabs.animateTo(2); // jump to query tab
-            },
+    return SignalBuilder<int>(
+      signal: widget.state.revision,
+      builder: (context, value, child) {
+        final state = widget.state;
+        final colorScheme = Theme.of(context).colorScheme;
+        return Scaffold(
+          appBar: AppBar(
+            title: Row(
+              children: [
+                Text(widget.title),
+                if (state.currentDatabase != null) ...[
+                  const SizedBox(width: 8),
+                  Chip(
+                    label: Text(state.currentDatabase!.name),
+                    backgroundColor: colorScheme.primaryContainer,
+                    labelStyle: TextStyle(
+                      color: colorScheme.onPrimaryContainer,
+                    ),
+                    padding: EdgeInsets.zero,
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ],
+              ],
+            ),
+            bottom: TabBar(
+              controller: _tabs,
+              tabs: const [
+                Tab(icon: Icon(Icons.storage), text: 'DBs'),
+                Tab(icon: Icon(Icons.schema), text: 'Schema'),
+                Tab(icon: Icon(Icons.code), text: 'Query'),
+              ],
+            ),
           ),
-          _SchemaTab(),
-          _QueryTab(controller: _queryController),
-        ],
-      ),
+          body: TabBarView(
+            controller: _tabs,
+            children: [
+              _DatabaseListTab(
+                state: state,
+                onSelect: (info) {
+                  state.selectDatabase(info);
+                  _tabs.animateTo(2); // jump to query tab
+                },
+              ),
+              _SchemaTab(state: state),
+              _QueryTab(state: state, controller: _queryController),
+            ],
+          ),
+        );
+      },
     );
   }
 }
@@ -174,12 +201,12 @@ class _AdminViewState extends State<_AdminView>
 // ---------------------------------------------------------------------------
 
 class _DatabaseListTab extends StatelessWidget {
+  final _AdminState state;
   final void Function(DatabaseInfo) onSelect;
-  const _DatabaseListTab({required this.onSelect});
+  const _DatabaseListTab({required this.state, required this.onSelect});
 
   @override
   Widget build(BuildContext context) {
-    final state = context.watch<_AdminState>();
     if (state.isLoading) {
       return const Center(child: CircularProgressIndicator());
     }
@@ -193,7 +220,7 @@ class _DatabaseListTab extends StatelessWidget {
             const Text('No databases found.'),
             const SizedBox(height: 8),
             TextButton.icon(
-              onPressed: () => context.read<_AdminState>().refresh(),
+              onPressed: state.refresh,
               icon: const Icon(Icons.refresh),
               label: const Text('Refresh'),
             ),
@@ -202,7 +229,7 @@ class _DatabaseListTab extends StatelessWidget {
       );
     }
     return RefreshIndicator(
-      onRefresh: context.read<_AdminState>().refresh,
+      onRefresh: state.refresh,
       child: ListView.builder(
         itemCount: state.databases.length,
         itemBuilder: (_, i) {
@@ -234,9 +261,12 @@ class _DatabaseListTab extends StatelessWidget {
 // ---------------------------------------------------------------------------
 
 class _SchemaTab extends StatelessWidget {
+  final _AdminState state;
+
+  const _SchemaTab({required this.state});
+
   @override
   Widget build(BuildContext context) {
-    final state = context.watch<_AdminState>();
     final db = state.currentDatabase;
     if (db == null) {
       return const Center(child: Text('Select a database first.'));
@@ -309,12 +339,12 @@ class _SchemaTab extends StatelessWidget {
 // ---------------------------------------------------------------------------
 
 class _QueryTab extends StatelessWidget {
+  final _AdminState state;
   final TextEditingController controller;
-  const _QueryTab({required this.controller});
+  const _QueryTab({required this.state, required this.controller});
 
   @override
   Widget build(BuildContext context) {
-    final state = context.watch<_AdminState>();
     return Column(
       children: [
         // SQL input
@@ -344,8 +374,7 @@ class _QueryTab extends StatelessWidget {
               FilledButton.icon(
                 onPressed: state.isLoading
                     ? null
-                    : () =>
-                          context.read<_AdminState>().runQuery(controller.text),
+                    : () => state.runQuery(controller.text),
                 icon: state.isLoading
                     ? const SizedBox(
                         width: 16,

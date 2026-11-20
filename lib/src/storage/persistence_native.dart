@@ -5,6 +5,7 @@ import 'package:crypto/crypto.dart';
 import 'package:encrypt/encrypt.dart' as enc;
 import 'package:path_provider/path_provider.dart';
 import '../core/database_mode.dart';
+import 'serialization.dart';
 import 'table.dart';
 
 /// A snapshot of a persisted database loaded from disk.
@@ -199,20 +200,8 @@ class PersistenceManager {
   static Map<String, dynamic> _encodeDatabase(
     Map<String, Table> tables,
     DatabaseMode mode,
-  ) {
-    return {
-      'version': 1,
-      'mode': mode.name,
-      'tables': {
-        for (final entry in tables.entries) entry.key: entry.value.toJson(),
-      },
-    };
-  }
+  ) => DatabaseSerializer.encodeDatabase(tables, mode);
 
-  static Map<String, Table> _decodeTables(Map<String, dynamic> json) {
-    return {
-      for (final entry in json.entries)
-        entry.key: Table.fromJson(entry.value as Map<String, dynamic>),
-    };
-  }
+  static Map<String, Table> _decodeTables(Map<String, dynamic> json) =>
+      DatabaseSerializer.decodeTables(json);
 }

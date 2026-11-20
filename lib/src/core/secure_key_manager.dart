@@ -1,7 +1,7 @@
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:just_storage/just_storage.dart';
 
 /// Manages the lifecycle of a database encryption key derived from a user
@@ -33,10 +33,9 @@ import 'package:just_storage/just_storage.dart';
 class SecureKeyManager {
   SecureKeyManager._();
 
-  // Number of PBKDF2 iterations — NIST recommends ≥ 310 000 for SHA-256
-  // but 100 000 is a reasonable default that doesn't block the UI noticeably
-  // on low-end devices when called once at login time.
-  static const int _iterations = 100000;
+  // NIST SP 800-132 (2023) minimum for PBKDF2-HMAC-SHA256.
+  // Key derivation runs in a background isolate so this never blocks the UI.
+  static const int _iterations = 310000;
 
   // Output key length in bytes (32 bytes = 256-bit AES key).
   static const int _keyLength = 32;
@@ -81,7 +80,12 @@ class SecureKeyManager {
     }
 
     final salt = _hexToBytes(saltHex);
-    final keyBytes = _pbkdf2HmacSha256(password, salt, _iterations, _keyLength);
+    // Run the CPU-heavy derivation off the UI thread via compute, which uses
+    // isolates on native and web workers on web/WASM.
+    final keyBytes = await compute(
+      _runPbkdf2,
+      (password: password, salt: salt, iterations: _iterations, keyLength: _keyLength),
+    );
     return _bytesToHex(keyBytes);
   }
 
@@ -141,6 +145,11 @@ class SecureKeyManager {
   // PBKDF2-HMAC-SHA256 implementation using the `crypto` package.
   // ---------------------------------------------------------------------------
 
+  static Uint8List _runPbkdf2(
+    ({String password, Uint8List salt, int iterations, int keyLength}) args,
+  ) =>
+      _pbkdf2HmacSha256(args.password, args.salt, args.iterations, args.keyLength);
+
   /// Derives a [dkLen]-byte key from [password] and [salt] using
   /// PBKDF2-HMAC-SHA256 with [c] iterations.
   static Uint8List _pbkdf2HmacSha256(
@@ -186,8 +195,16 @@ class SecureKeyManager {
   // Hex helpers
   // ---------------------------------------------------------------------------
 
-  static String _bytesToHex(Uint8List bytes) =>
-      bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  static const _hexAlphabet = '0123456789abcdef';
+
+  static String _bytesToHex(Uint8List bytes) {
+    final buf = StringBuffer();
+    for (final b in bytes) {
+      buf.writeCharCode(_hexAlphabet.codeUnitAt(b >> 4));
+      buf.writeCharCode(_hexAlphabet.codeUnitAt(b & 0xf));
+    }
+    return buf.toString();
+  }
 
   static Uint8List _hexToBytes(String hex) {
     final length = hex.length ~/ 2;

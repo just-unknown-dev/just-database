@@ -1,59 +1,65 @@
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+import 'package:just_signals/just_signals.dart';
 import 'package:just_database/just_database.dart';
 import '../pages/benchmark_page.dart';
 import '../pages/insert_page.dart';
 
 class DatabasesTab extends StatelessWidget {
+  final DatabaseProvider provider;
+
   /// Optional seed callback passed down from [JUDatabaseAdminScreen].
   final Future<void> Function(JustDatabase db)? seedCallback;
 
-  const DatabasesTab({super.key, this.seedCallback});
+  const DatabasesTab({super.key, required this.provider, this.seedCallback});
 
   @override
   Widget build(BuildContext context) {
-    final provider = context.watch<DatabaseProvider>();
-    return Scaffold(
-      body: provider.isLoading
-          ? const Center(child: CircularProgressIndicator())
-          : provider.databases.isEmpty
-          ? _EmptyView(
-              onCreatePressed: () => _showCreateDialog(context, provider),
-            )
-          : RefreshIndicator(
-              onRefresh: provider.refreshDatabases,
-              child: ListView.builder(
-                itemCount: provider.databases.length,
-                itemBuilder: (_, i) {
-                  final info = provider.databases[i];
-                  return _DatabaseCard(
-                    info: info,
-                    isSelected: provider.currentDatabase?.name == info.name,
-                    onOpen: () => provider.selectDatabase(info.name),
-                    onDelete: () =>
-                        _confirmDelete(context, provider, info.name),
-                    onSeed: seedCallback != null
-                        ? () => _seedDatabase(
-                            context,
-                            provider,
-                            info,
-                            seedCallback!,
-                          )
-                        : null,
-                    onInsert: () => _openInsertPage(context, provider, info),
-                    onBenchmark: () =>
-                        _openBenchmarkPage(context, provider, info),
-                  );
-                },
+    return SignalBuilder<int>(
+      signal: provider.revision,
+      builder: (context, value, child) => Scaffold(
+        body: provider.isLoading
+            ? const Center(child: CircularProgressIndicator())
+            : provider.databases.isEmpty
+            ? _EmptyView(
+                onCreatePressed: () => _showCreateDialog(context, provider),
+              )
+            : RefreshIndicator(
+                onRefresh: provider.refreshDatabases,
+                child: ListView.builder(
+                  itemCount: provider.databases.length,
+                  itemBuilder: (_, i) {
+                    final info = provider.databases[i];
+                    return _DatabaseCard(
+                      info: info,
+                      isSelected: provider.currentDatabase?.name == info.name,
+                      onOpen: () => provider.selectDatabase(info.name),
+                      onOpenDetail: () =>
+                          _openDetailPage(context, provider, info),
+                      onDelete: () =>
+                          _confirmDelete(context, provider, info.name),
+                      onSeed: seedCallback != null
+                          ? () => _seedDatabase(
+                              context,
+                              provider,
+                              info,
+                              seedCallback!,
+                            )
+                          : null,
+                      onInsert: () => _openInsertPage(context, provider, info),
+                      onBenchmark: () =>
+                          _openBenchmarkPage(context, provider, info),
+                    );
+                  },
+                ),
               ),
-            ),
-      floatingActionButton: provider.databases.isEmpty
-          ? null
-          : FloatingActionButton.extended(
-              onPressed: () => _showCreateDialog(context, provider),
-              icon: const Icon(Icons.add),
-              label: const Text('New Database'),
-            ),
+        floatingActionButton: provider.databases.isEmpty
+            ? null
+            : FloatingActionButton.extended(
+                onPressed: () => _showCreateDialog(context, provider),
+                icon: const Icon(Icons.add),
+                label: const Text('New Database'),
+              ),
+      ),
     );
   }
 
@@ -192,6 +198,22 @@ class DatabasesTab extends StatelessWidget {
     );
   }
 
+  Future<void> _openDetailPage(
+    BuildContext context,
+    DatabaseProvider provider,
+    DatabaseInfo info,
+  ) async {
+    await provider.selectDatabase(info.name);
+    if (!context.mounted) return;
+    await Navigator.push<void>(
+      context,
+      MaterialPageRoute<void>(
+        builder: (_) =>
+            DatabaseDetailPage(provider: provider, info: info),
+      ),
+    );
+  }
+
   Future<void> _openBenchmarkPage(
     BuildContext context,
     DatabaseProvider provider,
@@ -201,7 +223,9 @@ class DatabasesTab extends StatelessWidget {
     if (!context.mounted) return;
     await Navigator.push<void>(
       context,
-      MaterialPageRoute<void>(builder: (_) => BenchmarkPage(info: info)),
+      MaterialPageRoute<void>(
+        builder: (_) => BenchmarkPage(info: info, provider: provider),
+      ),
     );
   }
 
@@ -214,7 +238,7 @@ class DatabasesTab extends StatelessWidget {
     if (!context.mounted) return;
     await Navigator.push<void>(
       context,
-      MaterialPageRoute<void>(builder: (_) => const InsertPage()),
+      MaterialPageRoute<void>(builder: (_) => InsertPage(provider: provider)),
     );
   }
 
@@ -255,6 +279,7 @@ class _DatabaseCard extends StatelessWidget {
   final DatabaseInfo info;
   final bool isSelected;
   final VoidCallback onOpen;
+  final VoidCallback onOpenDetail;
   final VoidCallback onDelete;
   final VoidCallback? onSeed;
   final VoidCallback onInsert;
@@ -264,6 +289,7 @@ class _DatabaseCard extends StatelessWidget {
     required this.info,
     required this.isSelected,
     required this.onOpen,
+    required this.onOpenDetail,
     required this.onDelete,
     this.onSeed,
     required this.onInsert,
@@ -330,7 +356,7 @@ class _DatabaseCard extends StatelessWidget {
           onSelected: (action) {
             switch (action) {
               case 'open':
-                onOpen();
+                onOpenDetail();
               case 'insert':
                 onInsert();
               case 'benchmark':

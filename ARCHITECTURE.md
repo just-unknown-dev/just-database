@@ -1,6 +1,6 @@
 # Just Database — Architecture
 
-> Version 1.2.0 · Last updated 2026-03-14
+> Version 1.3.0 · Last updated 2026-03-19
 
 ---
 
@@ -33,7 +33,7 @@
 
 ## Overview
 
-`just_database` is a **pure-Dart, in-memory relational database engine** built for Flutter. It implements a full SQL dialect — DDL, DML, JOINs, aggregates, views, triggers, transactions, and spatial queries — entirely in Dart without any native plugins or FFI. Optional JSON-serialised persistence is provided via `path_provider` on native platforms and browser `localStorage`/`sessionStorage` on web/WASM through `just_storage`.
+`just_database` is a **pure-Dart, in-memory relational database engine** built for Flutter. It implements a full SQL dialect — DDL, DML, JOINs, aggregates, views, triggers, transactions, and spatial queries — entirely in Dart without any native plugins or FFI. Optional JSON-serialised persistence is provided via `path_provider` on native platforms, and via the **Origin Private File System (OPFS)** with a Web Worker or an **IndexedDB** fallback on web/WASM.
 
 Key design decisions:
 
@@ -42,7 +42,9 @@ Key design decisions:
 | In-memory row store | Zero native dependencies; works on all Flutter targets |
 | Handwritten Lexer/Parser | Full control over the SQL dialect; no codegen needed |
 | Pluggable `LockManager` | One concurrency strategy per `DatabaseMode` |
-| Conditional export for persistence | `dart.library.js_interop` guard routes to web stubs |
+| Conditional export for persistence & database | `dart.library.js_interop` guard routes to web implementations |
+| OPFS + Web Worker for web persistence | Synchronous byte-level I/O in a dedicated worker; WAL for crash safety |
+| IndexedDB fallback | Broad browser support when OPFS is unavailable |
 | `ChangeNotifier` admin UI | Drop-in Flutter widget with zero routing changes |
 
 ---
@@ -69,7 +71,8 @@ Key design decisions:
 │             LockManager (Standard | ReadFast | WriteFast)                │
 ├──────────────────────────────────────────────────────────────────────────┤
 │                       Persistence Layer                                  │
-│       PersistenceManager (native: dart:io + encrypt) / (web: no-op)      │
+│       PersistenceManager (native: dart:io + encrypt)                      │
+│                        / (web: OPFS + IndexedDB)                          │
 │                  BackupManager (native) / (web stubs)                    │
 │                       SecureKeyManager (just_storage)                    │
 └──────────────────────────────────────────────────────────────────────────┘
@@ -100,16 +103,28 @@ lib/
     │   ├── rtree.dart         ← R-tree spatial index
     │   ├── persistence.dart           ← conditional export gateway
     │   ├── persistence_native.dart    ← dart:io + encrypt implementation
-    │   └── persistence_web.dart       ← no-op web/WASM stubs
+    │   ├── persistence_web.dart       ← IndexedDB-backed web implementation
+    │   └── serialization.dart         ← shared JSON encode/decode
     ├── core/
     │   ├── database_mode.dart         ← DatabaseMode enum
-    │   ├── database.dart              ← JustDatabase + QueryBuilder
+    │   ├── database.dart              ← conditional export gateway
+    │   ├── database_native.dart       ← native JustDatabase + QueryBuilder
+    │   ├── database_web.dart          ← web JustDatabase (Worker + IDB fallback)
     │   ├── database_manager.dart      ← DatabaseManager + DatabaseInfo
     │   ├── migration.dart             ← Migration, SqlMigration, MigrationRunner
     │   ├── secure_key_manager.dart    ← AES key lifecycle via just_storage
     │   ├── backup.dart                ← conditional export gateway
     │   ├── backup_native.dart         ← full BackupManager implementation
     │   └── backup_web.dart            ← partial stubs + in-memory methods
+    ├── web/
+    │   ├── opfs_support.dart          ← OPFS feature detection (OpfsCapability)
+    │   ├── opfs_storage.dart          ← sync byte I/O driver (OpfsStorageDriver)
+    │   ├── opfs_persistence.dart      ← OPFS PersistenceManager
+    │   ├── wal_manager.dart           ← Write-Ahead Log with CRC32 integrity
+    │   ├── idb_persistence.dart       ← IndexedDB fallback (IdbPersistenceManager)
+    │   ├── worker_protocol.dart       ← request/response message types
+    │   ├── database_worker.dart       ← worker isolate entry point
+    │   └── worker_client.dart         ← main-thread async proxy
     ├── concurrency/
     │   └── lock_manager.dart          ← abstract + Standard/ReadFast/WriteFast
     ├── orm/
@@ -295,7 +310,7 @@ The ORM emits raw SQL and delegates to `JustDatabase.execute` / `query`, so all 
 
 ### Persistence Layer
 
-Persistence is split into a platform-conditional export pair.
+Persistence is split into platform-conditional export pairs.
 
 #### `persistence.dart` (gateway)
 
@@ -317,7 +332,72 @@ Full implementation for Android, iOS, macOS, Linux, Windows:
 
 #### `persistence_web.dart`
 
-No-op stubs with matching signatures. Returns empty data on load; `save` and `delete` silently succeed. Allows the rest of the codebase to compile and run on web/WASM without conditional imports scattered everywhere.
+IndexedDB-backed implementation. Delegates to `IdbPersistenceManager` for
+snapshot storage as JSON blobs. When IndexedDB is unavailable (restricted
+contexts), gracefully degrades to no-op behaviour. The `DatabaseSnapshot` type
+matches the native variant so the rest of the codebase compiles unchanged.
+
+#### `database.dart` (gateway)
+
+```dart
+export 'database_native.dart'
+    if (dart.library.js_interop) 'database_web.dart';
+```
+
+- **`database_native.dart`** — the original `JustDatabase` + `QueryBuilder` classes for native platforms. Unchanged from the previous release.
+- **`database_web.dart`** — web-specific `JustDatabase` that selects the best storage backend at `open()` time:
+  1. **OPFS Worker** — spawns a Dart isolate (compiled to a Web Worker) running the full SQL engine with synchronous OPFS I/O and WAL. Maximum performance.
+  2. **IndexedDB** — runs the SQL engine on the main thread with async IDB persistence.
+  3. **In-memory** — no persistence fallback.
+
+  Exposes a `storageBackend` getter (`WebStorageBackend` enum) so callers can inspect the chosen path.
+
+#### Web Worker Architecture
+
+```
+Main Thread                         Worker Isolate
+─────────────                       ──────────────
+JustDatabase (web)                  databaseWorkerMain()
+  │                                   │
+  ├── WorkerClient                    ├── Parser + Executor
+  │     send request ──► SendPort ──► │   (full SQL engine)
+  │     ◄── ReceivePort ◄── reply     │
+  │                                   ├── OpfsStorageDriver
+  │                                   │   (sync read/write via
+  │                                   │    FileSystemSyncAccessHandle)
+  │                                   │
+  │                                   └── WalManager
+  │                                       (binary WAL with CRC32)
+  └── storageBackend == opfsWorker
+```
+
+The `WorkerClient` maps every public API method (`query`, `execute`,
+`beginTransaction`, `commit`, `rollback`, etc.) to a message-passing protocol
+(`worker_protocol.dart`). Each request carries an auto-incrementing `id`;
+the client correlates responses via a `Map<int, Completer>`.
+
+#### WAL (Write-Ahead Log)
+
+The `WalManager` writes a binary log alongside the main `.jdb` file in OPFS:
+
+- **Entry format:** `[4B length][4B CRC32][8B sequence][1B type][NB JSON payload]` (17-byte header)
+- **Entry types:** `statement` (individual DML/DDL) and `checkpoint` (full snapshot)
+- **Auto-checkpoint:** triggered when the WAL exceeds 1 MB or 1 000 entries
+- **Replay on open:** all entries after the last checkpoint are replayed to recover uncommitted writes
+
+#### IndexedDB Fallback
+
+`IdbPersistenceManager` stores each database as a single JSON blob in an
+IndexedDB object store (`databases` in DB `just_database`). Full CRUD with
+`save()`, `load()`, `peekMode()`, `delete()`, `listPersistedNames()`,
+`getFileSize()`. Uses `package:web` bindings (`IDBFactory`, `IDBDatabase`,
+`IDBTransaction`).
+
+#### `DatabaseSerializer`
+
+Shared JSON encode/decode logic extracted into `serialization.dart`. Used by
+both `persistence_native.dart` and the web persistence classes to avoid
+duplication.
 
 #### `BackupManager` / `backup_native.dart` / `backup_web.dart`
 
@@ -508,10 +588,14 @@ PersistenceManager.load(name, encryptionKey)
 | macOS | ✅ | ✅ | ✅ |
 | Linux | ✅ | ✅ | ✅ |
 | Windows | ✅ | ✅ | ✅ |
-| Web (JS) | ⚠️ no-op (in-memory only) | ✅ `just_storage` (localStorage) | ⚠️ in-memory only |
-| Web (WASM) | ⚠️ no-op (in-memory only) | ✅ `just_storage` (localStorage) | ⚠️ in-memory only |
+| Web (JS) | ✅ OPFS + Worker / IndexedDB | ✅ `just_storage` (localStorage) | ⚠️ in-memory only |
+| Web (WASM) | ✅ OPFS + Worker / IndexedDB | ✅ `just_storage` (localStorage) | ⚠️ in-memory only |
 
 The conditional export guard `if (dart.library.js_interop)` covers both JS-web and WASM. `dart.library.html` is not used because it evaluates to `false` under WASM.
+
+On web, `JustDatabase.open()` probes the environment and selects the best
+available storage backend (OPFS → IndexedDB → in-memory). The `storageBackend`
+getter on the web `JustDatabase` reveals which backend was chosen.
 
 ---
 
@@ -579,6 +663,7 @@ just_database
 ├── path_provider ^2.1.4 (native persistence only — excluded on web/WASM)
 ├── encrypt ^5.0.3 (AES-256-GCM — native only)
 ├── crypto ^3.0.3 (PBKDF2 key derivation, migration checksums)
+├── web ^1.1.0 (OPFS + IndexedDB bindings for web persistence)
 └── just_storage ^1.1.2 (SecureKeyManager — cross-platform, WASM-ready)
 ```
 
@@ -589,4 +674,6 @@ UI  →  Core  →  SQL Pipeline  →  Storage Engine
              →  Concurrency
              →  Persistence   →  just_storage (cross-platform)
                               →  dart:io (native only)
+             →  Web Layer     →  package:web (web only)
+                              →  dart:js_interop (web only)
 ```

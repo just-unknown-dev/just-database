@@ -24,7 +24,8 @@ persistence, a rich SQL dialect, an ORM layer, and an embeddable admin UI.
 | Benchmarking | DatabaseBenchmark, BenchmarkSuite, QueryStats (p95/p99) |
 | ORM | DbTable<T> / DbRecord / DbColumn — type-safe CRUD with zero boilerplate |
 | **Secure mode** | **AES-256-GCM encryption at rest, SHA-256 key derivation, per-save random IV** |
-| Admin UI | 4-tab Flutter admin screen embeddable in any app |
+| **Web persistence** | **OPFS + Web Worker (sync I/O, WAL) with IndexedDB fallback** |
+| Admin UI | 4-tab Flutter admin screen + drill-down `DatabaseDetailPage`, embeddable in any app |
 
 ---
 
@@ -41,8 +42,8 @@ persistence, a rich SQL dialect, an ORM layer, and an embeddable admin UI.
 | Feature | **just\_database** | sqflite | drift | hive | isar |
 |---|---|---|---|---|---|
 | Pure Dart (no native code) | ✅ | ❌ native SQLite | ❌ native SQLite | ✅ | ❌ native (Rust) |
-| Web (JS) | ✅ | ❌ | ⚠️ via sql.js | ✅ | ⚠️ partial |
-| Web (WASM) | ✅ | ❌ | ❌ | ✅ | ❌ |
+| Web (JS) | ✅ | ✅ OPFS/IDB | ⚠️ via sql.js | ✅ | ⚠️ partial |
+| Web (WASM) | ✅ | ✅ OPFS/IDB | ❌ | ✅ | ❌ |
 | Full SQL dialect | ✅ | ✅ SQLite | ✅ SQLite | ❌ | ❌ |
 | Views & triggers | ✅ | ✅ | ✅ | ❌ | ❌ |
 | Transactions & savepoints | ✅ | ✅ | ✅ | ❌ | ✅ |
@@ -62,7 +63,7 @@ persistence, a rich SQL dialect, an ORM layer, and an embeddable admin UI.
 
 ```yaml
 dependencies:
-  just_database: ^1.2.0
+  just_database: ^1.4.0
 ```
 
 ```bash
@@ -73,22 +74,51 @@ flutter pub get
 
 ## Platform Support
 
-| Platform | SQL queries | File persistence | Backup file helpers | `SecureKeyManager` |
+| Platform | SQL queries | Persistence | Backup file helpers | `SecureKeyManager` |
 |---|---|---|---|---|
-| Android | ✅ | ✅ | ✅ | ✅ |
-| iOS | ✅ | ✅ | ✅ | ✅ |
-| macOS | ✅ | ✅ | ✅ | ✅ |
-| Windows | ✅ | ✅ | ✅ | ✅ |
-| Linux | ✅ | ✅ | ✅ | ✅ |
-| Web (JS) | ✅ | ❌ no-op | ❌ throws | ✅ `localStorage` |
-| Web (WASM) | ✅ | ❌ no-op | ❌ throws | ✅ `localStorage` |
+| Android | ✅ | ✅ JSON file | ✅ | ✅ |
+| iOS | ✅ | ✅ JSON file | ✅ | ✅ |
+| macOS | ✅ | ✅ JSON file | ✅ | ✅ |
+| Windows | ✅ | ✅ JSON file | ✅ | ✅ |
+| Linux | ✅ | ✅ JSON file | ✅ | ✅ |
+| Web (JS) | ✅ | ✅ OPFS / IndexedDB | ❌ throws | ✅ `localStorage` |
+| Web (WASM) | ✅ | ✅ OPFS / IndexedDB | ❌ throws | ✅ `localStorage` |
 
-> **Web / WASM note:** Opening a database with `persist: true` on web silently
-> keeps all data in-memory only for the page lifetime — no error is thrown, but
-> `.jdb` files are never written. `BackupManager.backupToFile` and the other
-> file helpers throw `UnsupportedError` on web/WASM; use
-> `BackupManager.exportSql` / `BackupManager.exportJson` to serialise data as a
-> string or map instead.
+> **Web persistence:** When `persist: true` on web, the database engine
+> automatically selects the best available storage backend:
+>
+> 1. **OPFS + Web Worker** — if the browser supports the Origin Private File
+>    System with synchronous access handles, the full SQL engine runs in a
+>    dedicated Web Worker with synchronous byte-level I/O and a Write-Ahead Log
+>    (WAL). This is the fastest path.
+> 2. **IndexedDB** — if OPFS is unavailable (e.g. older browsers, private
+>    browsing), the SQL engine runs on the main thread and persists database
+>    snapshots as JSON blobs in IndexedDB.
+> 3. **In-memory** — if neither storage API is available, data lives in memory
+>    only for the page lifetime.
+>
+> The public API is unchanged — `JustDatabase.open('name')` handles backend
+> selection transparently. Use `db.storageBackend` to inspect which backend was
+> chosen at runtime.
+>
+> If the engine falls back to in-memory while `persist: true` was requested,
+> set `JustDatabase.onStorageDowngrade` to receive a notification:
+>
+> ```dart
+> import 'dart:developer' as dev;
+> JustDatabase.onStorageDowngrade = (name, reason) =>
+>     dev.log('[just_database] $name: $reason', level: 900);
+> ```
+>
+> On web, the **sync getters** (`tableNames`, `viewNames`, etc.) return empty
+> collections in OPFS worker mode. Use the **async equivalents** instead:
+> `tableNamesAsync()`, `viewNamesAsync()`, `triggerNamesAsync()`,
+> `indexNamesForTableAsync()`, `getTableSchemaAsync()`, `totalRowsAsync()`,
+> `estimatedSizeBytesAsync()`. These work across all backends.
+>
+> `BackupManager.backupToFile` and the other file helpers still throw
+> `UnsupportedError` on web/WASM; use `BackupManager.exportSql` /
+> `BackupManager.exportJson` to serialise data as a string or map instead.
 
 ---
 
@@ -214,7 +244,9 @@ before writing to disk and decrypts it on load.
 
 ### How it works
 
-1. The `encryptionKey` string is hashed with **SHA-256** to produce a 32-byte AES key.
+1. The `encryptionKey` string is passed through **PBKDF2-HMAC-SHA256** (310 000 iterations,
+   random per-database salt) to produce a 32-byte AES key. Derivation runs in a background
+   isolate so the UI thread is never blocked.
 2. A fresh random **16-byte IV** is generated on every `save()` — so two saves of identical
    data produce different ciphertext.
 3. GCM provides **authenticated encryption**: if the key is wrong or the file is tampered
@@ -541,40 +573,44 @@ Embed a full database management screen in your app with a single widget:
 
 ```dart
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
 import 'package:just_database/ui.dart';
 
 class MyApp extends StatelessWidget {
+  const MyApp({super.key});
+
   @override
   Widget build(BuildContext context) {
-    return ChangeNotifierProvider(
-      create: (_) => DatabaseProvider(),
-      child: MaterialApp(
-        home: JUDatabaseAdminScreen(
-          // Optional: provide seed data shown in each database's popup menu
-          onSeedDatabase: (db) async {
-            await db.execute("INSERT INTO demo (name) VALUES ('sample')");
-          },
-          // Optional: custom theme
-          // theme: ThemeData(
-          //   colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
-          //   useMaterial3: true,
-          // ),
-        ),
+    return MaterialApp(
+      theme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+        useMaterial3: true,
       ),
+      home: const JUDatabaseAdminScreen(),
     );
   }
 }
 ```
 
-The admin screen has **4 tabs** (Benchmark and Insert Row are accessible from each database card's popup menu):
+No `provider` setup required — state is managed internally with `just_signals`.
 
-| Tab | Purpose |
+You can also embed just the widget inside an existing route:
+
+```dart
+import 'package:just_database/ui.dart';
+
+// Inside any build method:
+JustDatabaseAdminWidget(initialDatabase: myDb)
+```
+
+The admin screen has **4 tabs**; tapping a database card opens `DatabaseDetailPage`:
+
+| Tab / Page | Purpose |
 |---|---|
-| Databases | Create, open, delete databases; popup menu per card: Open · Insert Row · Benchmark · Seed Sample Data (optional) · Delete |
+| Databases | Create, open, delete databases; tap a card to open `DatabaseDetailPage` |
 | Schema | Inspect tables, columns, types, constraints, indexes |
 | Query | Full SQL editor, example gallery, query history, result table |
 | Settings | Default persistence toggle, default mode, DB stats, engine-feature reference |
+| `DatabaseDetailPage` | Per-database view: table list, row counts, schema inspector, live query runner |
 
 ---
 
@@ -635,8 +671,12 @@ RELEASE SAVEPOINT name
 ```dart
 static Future<JustDatabase> open(String name, {
   DatabaseMode mode = DatabaseMode.standard,
-  bool persist = true,   // persisted by default
+  bool persist = true,
+  String? encryptionKey,
 })
+
+// Called when persist: true falls back to in-memory on web (no durable backend)
+static void Function(String dbName, String reason)? onStorageDowngrade;
 
 Future<QueryResult> query(String sql)
 Future<QueryResult> execute(String sql)
@@ -650,7 +690,7 @@ Future<QueryResult> rollback({String? savepoint})
 Future<QueryResult> savepoint(String name)
 Future<QueryResult> releaseSavepoint(String name)
 
-// Introspection
+// Introspection — sync (native / web non-worker backends)
 List<String> get tableNames
 List<String> get viewNames
 List<String> get triggerNames
@@ -658,6 +698,15 @@ List<String> indexNamesForTable(String tableName)
 TableSchema?  getTableSchema(String name)
 int get totalRows
 int get estimatedSizeBytes
+
+// Introspection — async (works on ALL backends including OPFS worker)
+Future<List<String>> tableNamesAsync()
+Future<List<String>> viewNamesAsync()
+Future<List<String>> triggerNamesAsync()
+Future<List<String>> indexNamesForTableAsync(String tableName)
+Future<TableSchema?> getTableSchemaAsync(String name)
+Future<int> totalRowsAsync()
+Future<int> estimatedSizeBytesAsync()
 
 // Benchmarking
 Future<BenchmarkSuiteResult> runStandardBenchmark({int rowCount, int warmup, int iterations})

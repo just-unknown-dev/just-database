@@ -1,6 +1,8 @@
 import '../core/database.dart';
 import '../sql/executor.dart';
 
+const _hexAlphabet = '0123456789abcdef';
+
 // =============================================================================
 // DbRecord
 // =============================================================================
@@ -484,8 +486,13 @@ String _sqlLiteral(dynamic v) {
   if (v is num) return '$v';
   if (v is DateTime) return "'${v.toIso8601String()}'";
   if (v is List<int>) {
-    final hex = v.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-    return "X'$hex'";
+    final buf = StringBuffer("X'");
+    for (final b in v) {
+      buf.writeCharCode(_hexAlphabet.codeUnitAt((b >> 4) & 0xf));
+      buf.writeCharCode(_hexAlphabet.codeUnitAt(b & 0xf));
+    }
+    buf.write("'");
+    return buf.toString();
   }
   return "'${v.toString().replaceAll("'", "''")}'";
 }
