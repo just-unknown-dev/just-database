@@ -1,84 +1,42 @@
-import '../core/database.dart';
-import '../sql/executor.dart';
+import 'dart:typed_data';
 
-// =============================================================================
-// DbRecord
-// =============================================================================
+import '../core/just_database.dart';
+import '../core/query_result.dart';
+import '../storage/values.dart';
 
-/// Base class for every record managed by a [DbTable].
-///
-/// Extend this class for each entity and implement [toMap()].
+/// Base class for every record a [DbTable] manages.
 ///
 /// ```dart
 /// class User extends DbRecord {
+///   const User({super.id, required this.name, required this.active});
 ///   final String name;
-///   final int    age;
-///
-///   const User({super.id, required this.name, required this.age});
+///   final bool active;
 ///
 ///   @override
-///   Map<String, dynamic> toMap() => {'name': name, 'age': age};
-///
-///   User copyWith({int? id, String? name, int? age}) => User(
-///     id:   id   ?? this.id,
-///     name: name ?? this.name,
-///     age:  age  ?? this.age,
-///   );
+///   Map<String, Object?> toMap() => {'name': name, 'active': active};
 /// }
 /// ```
 abstract class DbRecord {
-  /// Primary-key assigned by the database, or `null` for unsaved records.
-  final int? id;
-
+  /// Creates a record; [id] is null until it is saved.
   const DbRecord({this.id});
 
-  /// Serialise all non-id fields to a column-name  value map.
-  ///
-  /// Do **not** include `id` — it is managed automatically by [DbTable].
-  Map<String, dynamic> toMap();
+  /// The primary key the database assigned, or null for an unsaved record.
+  final int? id;
+
+  /// Every field but `id`, by column name. Values may be null, `int`,
+  /// `double`, `String`, `bool`, `DateTime` or `Uint8List`.
+  Map<String, Object?> toMap();
 }
 
-// =============================================================================
-// DbColumn
-// =============================================================================
-
-/// Describes a single column in a [DbTable].
-///
-/// Use the named factory constructors to create columns:
-/// ```dart
-/// DbColumn.text('name',    notNull: true)
-/// DbColumn.integer('age',  defaultValue: 0)
-/// DbColumn.real('score')
-/// DbColumn.boolean('flag', defaultValue: false)
-/// DbColumn.datetime('created_at')
-/// DbColumn.blob('data')
-/// ```
+/// A column of a [DbTable].
 class DbColumn {
-  /// Column name (used verbatim in SQL).
-  final String name;
-
-  final String _sqlType;
-
-  /// Whether `NOT NULL` is added to the column definition.
-  final bool notNull;
-
-  /// Whether `UNIQUE` is added to the column definition.
-  final bool unique;
-
-  /// Optional `DEFAULT` value in the column definition.
-  final dynamic defaultValue;
-
   const DbColumn._({
     required this.name,
-    required String sqlType,
+    required this.type,
     this.notNull = false,
     this.unique = false,
     this.defaultValue,
-  }) : _sqlType = sqlType;
-
-  // --------------------------------------------------------------------------
-  // Factories
-  // --------------------------------------------------------------------------
+  });
 
   /// An `INTEGER` column.
   factory DbColumn.integer(
@@ -88,7 +46,7 @@ class DbColumn {
     int? defaultValue,
   }) => DbColumn._(
     name: name,
-    sqlType: 'INTEGER',
+    type: 'INTEGER',
     notNull: notNull,
     unique: unique,
     defaultValue: defaultValue,
@@ -102,78 +60,128 @@ class DbColumn {
     String? defaultValue,
   }) => DbColumn._(
     name: name,
-    sqlType: 'TEXT',
+    type: 'TEXT',
     notNull: notNull,
     unique: unique,
     defaultValue: defaultValue,
   );
 
-  /// A `REAL` (double) column.
+  /// A `REAL` column.
   factory DbColumn.real(
     String name, {
     bool notNull = false,
     double? defaultValue,
   }) => DbColumn._(
     name: name,
-    sqlType: 'REAL',
+    type: 'REAL',
     notNull: notNull,
     defaultValue: defaultValue,
   );
 
-  /// A `BOOLEAN` column (stored as 0/1).
+  /// A `BOOLEAN` column: stored as 1/0, read back with [DbRowValues.boolValue].
   factory DbColumn.boolean(
     String name, {
     bool notNull = false,
     bool? defaultValue,
   }) => DbColumn._(
     name: name,
-    sqlType: 'BOOLEAN',
+    type: 'BOOLEAN',
     notNull: notNull,
     defaultValue: defaultValue,
   );
 
-  /// A `DATETIME` column.
+  /// A `DATETIME` column: stored as ISO-8601 UTC text, read back with
+  /// [DbRowValues.dateTimeValue].
   factory DbColumn.datetime(
     String name, {
     bool notNull = false,
     DateTime? defaultValue,
   }) => DbColumn._(
     name: name,
-    sqlType: 'DATETIME',
+    type: 'DATETIME',
     notNull: notNull,
     defaultValue: defaultValue,
   );
 
   /// A `BLOB` column.
   factory DbColumn.blob(String name, {bool notNull = false}) =>
-      DbColumn._(name: name, sqlType: 'BLOB', notNull: notNull);
+      DbColumn._(name: name, type: 'BLOB', notNull: notNull);
 
-  // --------------------------------------------------------------------------
-  // DDL
-  // --------------------------------------------------------------------------
+  /// The column's name (quoted in SQL, so any name works).
+  final String name;
 
-  /// Returns the column DDL fragment, e.g. `"name TEXT NOT NULL DEFAULT 'x'"`.
+  /// The declared type.
+  final String type;
+
+  /// Whether NULL is rejected.
+  final bool notNull;
+
+  /// Whether values must be unique.
+  final bool unique;
+
+  /// The DEFAULT value, or null for none.
+  final Object? defaultValue;
+
+  /// The column's part of `CREATE TABLE`.
   String toSql() {
-    final buf = StringBuffer('$name $_sqlType');
-    if (notNull) buf.write(' NOT NULL');
-    if (unique) buf.write(' UNIQUE');
-    if (defaultValue != null) {
-      buf.write(' DEFAULT ${_sqlLiteral(defaultValue)}');
-    }
-    return buf.toString();
+    final b = StringBuffer('${quoteIdentifier(name)} $type');
+    if (notNull) b.write(' NOT NULL');
+    if (unique) b.write(' UNIQUE');
+    if (defaultValue != null) b.write(' DEFAULT ${sqlLiteral(defaultValue)}');
+    return b.toString();
   }
 
   @override
   String toString() => toSql();
 }
 
-// =============================================================================
-// DbTable<T>
-// =============================================================================
+/// Typed reads of a result row, for [DbTable.fromRow].
+extension DbRowValues on Map<String, Object?> {
+  /// An integer (reals are truncated); null when absent or NULL.
+  int? intValue(String column) => switch (this[column]) {
+    final int v => v,
+    final double v => v.toInt(),
+    final String v => int.tryParse(v),
+    _ => null,
+  };
 
-/// Type-safe table accessor — extend once per entity to get full CRUD.
+  /// A double; null when absent or NULL.
+  double? doubleValue(String column) => switch (this[column]) {
+    final num v => v.toDouble(),
+    final String v => double.tryParse(v),
+    _ => null,
+  };
+
+  /// A string; null when absent or NULL.
+  String? stringValue(String column) => switch (this[column]) {
+    null => null,
+    final String v => v,
+    final Object v => '$v',
+  };
+
+  /// A boolean stored as a number (non-zero is true) or `'true'`/`'false'`.
+  bool? boolValue(String column) => switch (this[column]) {
+    final num v => v != 0,
+    final String v => v == '1' || v.toLowerCase() == 'true',
+    _ => null,
+  };
+
+  /// A date stored as ISO-8601 text (or Unix seconds), in UTC.
+  DateTime? dateTimeValue(String column) => switch (this[column]) {
+    final String v => DateTime.tryParse(v)?.toUtc(),
+    final int v => DateTime.fromMillisecondsSinceEpoch(v * 1000, isUtc: true),
+    _ => null,
+  };
+
+  /// A blob.
+  Uint8List? bytesValue(String column) => switch (this[column]) {
+    final Uint8List v => v,
+    _ => null,
+  };
+}
+
+/// Typed CRUD for one table; extend it once per entity.
 ///
-/// ### Defining a table
 /// ```dart
 /// class UserTable extends DbTable<User> {
 ///   @override
@@ -181,70 +189,46 @@ class DbColumn {
 ///
 ///   @override
 ///   List<DbColumn> get columns => [
-///     DbColumn.text('name',    notNull: true),
-///     DbColumn.integer('age',  defaultValue: 0),
+///     DbColumn.text('name', notNull: true),
 ///     DbColumn.boolean('active', defaultValue: true),
 ///   ];
 ///
 ///   @override
-///   User fromRow(Map<String, dynamic> row) => User(
-///     id:     row['id']     as int?,
-///     name:   row['name']   as String,
-///     age:    row['age']    as int?  ?? 0,
-///     active: row['active'] as bool? ?? true,
+///   User fromRow(Map<String, Object?> row) => User(
+///     id: row.intValue('id'),
+///     name: row.stringValue('name')!,
+///     active: row.boolValue('active') ?? true,
 ///   );
 /// }
-/// ```
 ///
-/// ### Usage
-/// ```dart
-/// final db    = await JustDatabase.open('mydb');
 /// final users = UserTable();
-///
 /// await users.createTable(db);
-///
-/// final alice = await users.insert(db, User(name: 'Alice', age: 30));
-/// // alice.id is populated from the database
-///
-/// final all   = await users.findAll(db);
-/// final byId  = await users.findById(db, alice.id!);
-/// final young = await users.findWhere(db, 'age < 25');
-/// final total = await users.count(db);
-///
-/// await users.update(db, alice.copyWith(age: 31));
-/// await users.deleteById(db, alice.id!);
+/// final ann = await users.insert(db, const User(name: 'Ann', active: true));
+/// final active = await users.findAll(db, where: 'active = ?', whereArgs: [true]);
 /// ```
 abstract class DbTable<T extends DbRecord> {
-  // --------------------------------------------------------------------------
-  // Abstract interface — override these three members
-  // --------------------------------------------------------------------------
-
-  /// SQL table name.
+  /// The table's name.
   String get tableName;
 
-  /// Column definitions, **excluding** `id`.
-  ///
-  /// `id INTEGER PRIMARY KEY AUTOINCREMENT` is always prepended automatically.
+  /// The columns, without `id` (`id INTEGER PRIMARY KEY AUTOINCREMENT` is
+  /// added first).
   List<DbColumn> get columns;
 
-  /// Maps a raw result row (`Map<String, dynamic>`) to a typed [T] instance.
-  T fromRow(Map<String, dynamic> row);
+  /// Builds a record from a result row.
+  T fromRow(Map<String, Object?> row);
 
-  // --------------------------------------------------------------------------
-  // DDL helpers
-  // --------------------------------------------------------------------------
+  String get _table => quoteIdentifier(tableName);
 
-  /// Returns the full `CREATE TABLE` SQL string.
+  /// The `CREATE TABLE` statement.
   String createTableSql({bool ifNotExists = true}) {
-    final guard = ifNotExists ? 'IF NOT EXISTS ' : '';
-    final colDefs = [
-      'id INTEGER PRIMARY KEY AUTOINCREMENT',
-      ...columns.map((c) => c.toSql()),
-    ].join(', ');
-    return 'CREATE TABLE $guard$tableName ($colDefs)';
+    final defs = [
+      '"id" INTEGER PRIMARY KEY AUTOINCREMENT',
+      for (final c in columns) c.toSql(),
+    ];
+    return 'CREATE TABLE ${ifNotExists ? 'IF NOT EXISTS ' : ''}$_table (${defs.join(', ')})';
   }
 
-  /// Executes `CREATE TABLE` on [db].
+  /// Creates the table.
   Future<void> createTable(JustDatabase db, {bool ifNotExists = true}) async {
     _check(
       await db.execute(createTableSql(ifNotExists: ifNotExists)),
@@ -252,98 +236,85 @@ abstract class DbTable<T extends DbRecord> {
     );
   }
 
-  /// Executes `DROP TABLE` on [db].
+  /// Drops the table.
   Future<void> dropTable(JustDatabase db, {bool ifExists = true}) async {
-    final guard = ifExists ? 'IF EXISTS ' : '';
-    _check(await db.execute('DROP TABLE $guard$tableName'), 'dropTable');
+    _check(
+      await db.execute('DROP TABLE ${ifExists ? 'IF EXISTS ' : ''}$_table'),
+      'dropTable',
+    );
   }
 
-  // --------------------------------------------------------------------------
-  // INSERT
-  // --------------------------------------------------------------------------
-
-  /// Inserts [record] and returns it with [DbRecord.id] populated from the DB.
+  /// Inserts [record]; returns it as stored, with its id.
   Future<T> insert(JustDatabase db, T record) async {
     final map = record.toMap();
-    final cols = map.keys.join(', ');
-    final vals = map.values.map(_sqlLiteral).join(', ');
-    _check(
-      await db.execute('INSERT INTO $tableName ($cols) VALUES ($vals)'),
-      'insert',
-    );
-    // Re-fetch the row we just inserted (highest id in a single-writer engine).
-    final r = await db.query(
-      'SELECT * FROM $tableName ORDER BY id DESC LIMIT 1',
-    );
-    _check(r, 'insert (re-fetch)');
-    if (r.rows.isEmpty) {
-      throw const DbTableException('insert: re-fetch returned no rows');
+    final sql = map.isEmpty
+        ? 'INSERT INTO $_table DEFAULT VALUES'
+        : 'INSERT INTO $_table (${map.keys.map(quoteIdentifier).join(', ')}) '
+              'VALUES (${List.filled(map.length, '?').join(', ')})';
+    final r = await db.execute(sql, map.isEmpty ? null : map.values.toList());
+    _check(r, 'insert');
+    final saved = await findById(db, r.lastInsertRowId!);
+    if (saved == null) {
+      throw const DbTableException('insert: the new row was not found');
     }
-    return fromRow(r.rows.first);
-  }
-
-  /// Inserts multiple [records] in a single transaction and returns them all
-  /// with their new ids.
-  Future<List<T>> insertAll(JustDatabase db, List<T> records) async {
-    final saved = <T>[];
-    await db.transaction((tx) async {
-      for (final rec in records) {
-        saved.add(await insert(tx, rec));
-      }
-      return null;
-    });
     return saved;
   }
 
-  // --------------------------------------------------------------------------
-  // SELECT
-  // --------------------------------------------------------------------------
+  /// Inserts [records] in one transaction (all or none); returns them as
+  /// stored.
+  Future<List<T>> insertAll(JustDatabase db, List<T> records) => db.transaction(
+    (_) async => [for (final r in records) await insert(db, r)],
+  );
 
-  /// Returns rows, optionally filtered / ordered / paginated.
-  ///
-  /// ```dart
-  /// users.findAll(db, where: 'age > 18', orderBy: 'name', limit: 20)
-  /// ```
+  /// The rows matching [where] (SQL with `?` for [whereArgs]), ordered by
+  /// [orderBy] (a column name) and paged.
   Future<List<T>> findAll(
     JustDatabase db, {
     String? where,
+    List<Object?> whereArgs = const [],
     String? orderBy,
     bool descending = false,
     int? limit,
     int? offset,
   }) async {
-    final buf = StringBuffer('SELECT * FROM $tableName');
-    if (where != null) buf.write(' WHERE $where');
+    final b = StringBuffer('SELECT * FROM $_table');
+    if (where != null) b.write(' WHERE $where');
     if (orderBy != null) {
-      buf.write(' ORDER BY $orderBy');
-      if (descending) buf.write(' DESC');
+      b.write(
+        ' ORDER BY ${quoteIdentifier(orderBy)}${descending ? ' DESC' : ''}',
+      );
     }
-    if (limit != null) buf.write(' LIMIT $limit');
-    if (offset != null) buf.write(' OFFSET $offset');
-    return _toList(await db.query(buf.toString()), 'findAll');
+    if (limit != null || offset != null) b.write(' LIMIT ${limit ?? -1}');
+    if (offset != null) b.write(' OFFSET $offset');
+    return _toList(await db.query(b.toString(), whereArgs), 'findAll');
   }
 
-  /// Returns the row with the given [id], or `null` if not found.
+  /// The row with [id], or null.
   Future<T?> findById(JustDatabase db, int id) async {
-    final r = await db.query('SELECT * FROM $tableName WHERE id = $id LIMIT 1');
+    final r = await db.query('SELECT * FROM $_table WHERE "id" = ?', [id]);
     _check(r, 'findById');
     return r.rows.isEmpty ? null : fromRow(r.rows.first);
   }
 
-  /// Returns all rows matching a raw SQL [where] clause.
-  Future<List<T>> findWhere(JustDatabase db, String where) =>
-      findAll(db, where: where);
+  /// The rows matching [where].
+  Future<List<T>> findWhere(
+    JustDatabase db,
+    String where, [
+    List<Object?> whereArgs = const [],
+  ]) => findAll(db, where: where, whereArgs: whereArgs);
 
-  /// Returns the first matching row, or `null`.
+  /// The first matching row, or null.
   Future<T?> findFirst(
     JustDatabase db, {
     String? where,
+    List<Object?> whereArgs = const [],
     String? orderBy,
     bool descending = false,
   }) async {
     final rows = await findAll(
       db,
       where: where,
+      whereArgs: whereArgs,
       orderBy: orderBy,
       descending: descending,
       limit: 1,
@@ -351,98 +322,87 @@ abstract class DbTable<T extends DbRecord> {
     return rows.isEmpty ? null : rows.first;
   }
 
-  // --------------------------------------------------------------------------
-  // Aggregates
-  // --------------------------------------------------------------------------
-
-  /// Returns the row count (optionally filtered by [where]).
-  Future<int> count(JustDatabase db, {String? where}) async {
-    final buf = StringBuffer('SELECT COUNT(*) AS n FROM $tableName');
-    if (where != null) buf.write(' WHERE $where');
-    final r = await db.query(buf.toString());
+  /// The number of rows matching [where] (all rows when null).
+  Future<int> count(
+    JustDatabase db, {
+    String? where,
+    List<Object?> whereArgs = const [],
+  }) async {
+    final r = await db.query(
+      'SELECT COUNT(*) FROM $_table${where == null ? '' : ' WHERE $where'}',
+      whereArgs,
+    );
     _check(r, 'count');
-    return (r.rows.firstOrNull?['n'] as int?) ?? 0;
+    return r.scalar as int;
   }
 
-  // --------------------------------------------------------------------------
-  // UPDATE
-  // --------------------------------------------------------------------------
-
-  /// Updates the row matching [record.id]. Throws if `record.id` is `null`.
+  /// Updates the row of [record]'s id; returns the number updated (0 or 1).
   Future<int> update(JustDatabase db, T record) async {
-    if (record.id == null) {
-      throw const DbTableException('update() requires a non-null record.id');
+    final id = record.id;
+    if (id == null) {
+      throw const DbTableException('update() needs a record with an id');
     }
-    final set = record
-        .toMap()
-        .entries
-        .map((e) => '${e.key} = ${_sqlLiteral(e.value)}')
-        .join(', ');
+    final map = record.toMap();
+    if (map.isEmpty) return 0;
     final r = await db.execute(
-      'UPDATE $tableName SET $set WHERE id = ${record.id}',
+      'UPDATE $_table SET ${map.keys.map((k) => '${quoteIdentifier(k)} = ?').join(', ')} WHERE "id" = ?',
+      [...map.values, id],
     );
     _check(r, 'update');
     return r.affectedRows;
   }
 
-  /// Updates all rows matching [where] with the supplied [values].
-  ///
-  /// ```dart
-  /// users.updateWhere(db, {'active': false}, 'age < 13')
-  /// ```
+  /// Sets [values] on the rows matching [where]; returns how many.
   Future<int> updateWhere(
     JustDatabase db,
-    Map<String, dynamic> values,
-    String where,
-  ) async {
-    final set = values.entries
-        .map((e) => '${e.key} = ${_sqlLiteral(e.value)}')
-        .join(', ');
-    final r = await db.execute('UPDATE $tableName SET $set WHERE $where');
+    Map<String, Object?> values,
+    String where, [
+    List<Object?> whereArgs = const [],
+  ]) async {
+    if (values.isEmpty) return 0;
+    final r = await db.execute(
+      'UPDATE $_table SET ${values.keys.map((k) => '${quoteIdentifier(k)} = ?').join(', ')} WHERE $where',
+      [...values.values, ...whereArgs],
+    );
     _check(r, 'updateWhere');
     return r.affectedRows;
   }
 
-  // --------------------------------------------------------------------------
-  // DELETE
-  // --------------------------------------------------------------------------
-
-  /// Deletes the row with the given [id]. Returns rows removed (0 or 1).
+  /// Deletes the row with [id]; returns how many (0 or 1).
   Future<int> deleteById(JustDatabase db, int id) async {
-    final r = await db.execute('DELETE FROM $tableName WHERE id = $id');
+    final r = await db.execute('DELETE FROM $_table WHERE "id" = ?', [id]);
     _check(r, 'deleteById');
     return r.affectedRows;
   }
 
-  /// Deletes rows matching a raw SQL [where] clause.
-  Future<int> deleteWhere(JustDatabase db, String where) async {
-    final r = await db.execute('DELETE FROM $tableName WHERE $where');
+  /// Deletes the rows matching [where]; returns how many.
+  Future<int> deleteWhere(
+    JustDatabase db,
+    String where, [
+    List<Object?> whereArgs = const [],
+  ]) async {
+    final r = await db.execute('DELETE FROM $_table WHERE $where', whereArgs);
     _check(r, 'deleteWhere');
     return r.affectedRows;
   }
 
-  /// Deletes every row in the table. Returns the number of rows removed.
+  /// Deletes every row; returns how many.
   Future<int> deleteAll(JustDatabase db) async {
-    final r = await db.execute('DELETE FROM $tableName');
+    final r = await db.execute('DELETE FROM $_table');
     _check(r, 'deleteAll');
     return r.affectedRows;
   }
 
-  // --------------------------------------------------------------------------
-  // Raw query
-  // --------------------------------------------------------------------------
-
-  /// Executes an arbitrary SELECT [sql] and maps every result row to [T].
-  Future<List<T>> rawQuery(JustDatabase db, String sql) async =>
-      _toList(await db.query(sql), 'rawQuery');
-
-  // --------------------------------------------------------------------------
-  // Internal helpers
-  // --------------------------------------------------------------------------
+  /// Runs a SELECT [sql] and maps every row.
+  Future<List<T>> rawQuery(
+    JustDatabase db,
+    String sql, [
+    Object? parameters,
+  ]) async => _toList(await db.query(sql, parameters), 'rawQuery');
 
   List<T> _toList(QueryResult r, String op) {
     _check(r, op);
-    return r.rows.map(fromRow).toList();
+    return [for (final row in r.rows) fromRow(row)];
   }
 
   static void _check(QueryResult r, String op) {
@@ -450,42 +410,14 @@ abstract class DbTable<T extends DbRecord> {
   }
 }
 
-// =============================================================================
-// DbTableException
-// =============================================================================
-
-/// Thrown when a [DbTable] operation fails.
+/// A failed [DbTable] operation.
 class DbTableException implements Exception {
-  final String message;
-
+  /// Creates the exception.
   const DbTableException(this.message);
+
+  /// What went wrong.
+  final String message;
 
   @override
   String toString() => 'DbTableException: $message';
-}
-
-// =============================================================================
-// Internal: SQL literal encoding
-// =============================================================================
-
-/// Encodes a Dart value as a SQL literal string.
-///
-/// | Dart type      | SQL output                       |
-/// |----------------|----------------------------------|
-/// | `null`         | `NULL`                           |
-/// | `bool`         | `1` / `0`                        |
-/// | `num`          | digits as-is                     |
-/// | `DateTime`     | ISO-8601 text literal            |
-/// | `List<int>`    | `X'...'` hex blob literal        |
-/// | `String`       | single-quoted, `'` escaped as `''` |
-String _sqlLiteral(dynamic v) {
-  if (v == null) return 'NULL';
-  if (v is bool) return v ? '1' : '0';
-  if (v is num) return '$v';
-  if (v is DateTime) return "'${v.toIso8601String()}'";
-  if (v is List<int>) {
-    final hex = v.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-    return "X'$hex'";
-  }
-  return "'${v.toString().replaceAll("'", "''")}'";
 }

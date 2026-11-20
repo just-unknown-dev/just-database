@@ -1,695 +1,544 @@
-﻿# Just Database
+﻿# just_database
 
-A pure-Dart SQL database engine for Flutter — in-memory storage, optional file
-persistence, a rich SQL dialect, an ORM layer, and an embeddable admin UI.
+A SQL database for Flutter written in pure Dart: SQLite-style SQL over an
+in-memory engine, saved to a file (IndexedDB on the web) after every
+committed change, with optional AES-256-GCM encryption, migrations, backups,
+a typed ORM and a database workbench UI.
 
 [![pub.dev](https://img.shields.io/pub/v/just_database.svg)](https://pub.dev/packages/just_database)
-[![License: BSD 3-Clause License](https://img.shields.io/badge/License-BSD-blue.svg)](LICENSE)
-[![Contributing](https://img.shields.io/badge/contributions-welcome-brightgreen.svg)](CONTRIBUTING.md)
----
+[![License: BSD 3-Clause](https://img.shields.io/badge/License-BSD-blue.svg)](LICENSE)
 
-## Features
+* **SQL that behaves like SQLite**: joins of every kind, correlated
+  subqueries, `IN`/`EXISTS`, `UNION`/`INTERSECT`/`EXCEPT`, `CASE`, `CAST`,
+  aggregates with `DISTINCT`, upserts, triggers (including `INSTEAD OF`),
+  views, `CHECK`, foreign keys with `CASCADE`/`SET NULL`/…, savepoints,
+  three-valued `NULL` logic and SQLite's type affinity.
+* **Bound parameters** (`?`, `?NNN`, `:name`, `@name`, `$name`) on every
+  statement, so values never have to be pasted into SQL.
+* **Atomic statements and isolated transactions**: a failing statement
+  changes nothing; `transaction()` holds the database until it ends.
+* **Durable saves**: every committed change is written atomically (temp
+  file + rename); nothing uncommitted ever reaches the file.
+* **Encryption**: AES-256-GCM with a PBKDF2-HMAC-SHA256 key (600 000
+  iterations, random salt per file).
+* **Change events**: `db.changes` says which tables each committed
+  statement or transaction changed.
+* **A database workbench** (`package:just_database/ui.dart`): browse and
+  edit rows, edit schemas, a SQL console, backups and encryption, laid
+  out for desktops and for phones.
+* Runs everywhere Flutter does: Android, iOS, macOS, Windows, Linux and the
+  web (JS and WASM). No native code.
 
-| Capability | Details |
-|---|---|
-| Pure Dart | No native code — runs on Android, iOS, Web (JS & WASM), Desktop |
-| SQL dialect | SELECT/INSERT/UPDATE/DELETE/CREATE/DROP/ALTER, JOINs, subqueries, GROUP BY/HAVING |
-| Views | CREATE VIEW, DROP VIEW, INSTEAD OF triggers |
-| Triggers | BEFORE/AFTER INSERT/UPDATE/DELETE, NEW/OLD, WHEN clause |
-| Transactions | BEGIN/COMMIT/ROLLBACK, SAVEPOINT, WAL mode |
-| Spatial | R-tree index, ST_* functions, Point/BoundingBox/Polygon |
-| Indexes | AUTO-INDEX, CREATE [UNIQUE/SPATIAL] INDEX, composite, query hints |
-| Backup | SQL dump + JSON snapshot, file helpers |
-| Migrations | SqlMigration, CallbackMigration, MigrationRunner, checksum |
-| Benchmarking | DatabaseBenchmark, BenchmarkSuite, QueryStats (p95/p99) |
-| ORM | DbTable<T> / DbRecord / DbColumn — type-safe CRUD with zero boilerplate |
-| **Secure mode** | **AES-256-GCM encryption at rest, SHA-256 key derivation, per-save random IV** |
-| Admin UI | 4-tab Flutter admin screen embeddable in any app |
+## Contents
 
----
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Statements and results](#statements-and-results)
+- [Transactions](#transactions)
+- [Saving, files and modes](#saving-files-and-modes)
+- [Encryption](#encryption)
+- [The SQL dialect](#the-sql-dialect)
+- [Spatial data](#spatial-data)
+- [Migrations](#migrations)
+- [Backup and restore](#backup-and-restore)
+- [ORM](#orm)
+- [Query builder](#query-builder)
+- [Admin UI](#admin-ui)
+- [Benchmarks](#benchmarks)
+- [Errors](#errors)
+- [Limits](#limits)
 
-### When to choose what
-
-- **just_database** — you need pure Dart (web/WASM/tests with no native toolchain), full SQL with views and triggers, built-in encryption, spatial queries, or an embeddable admin UI.
-- **sqflite / drift** — you target Android/iOS/desktop only, already rely on SQLite, and want the most battle-tested native SQLite bindings. Drift adds a type-safe query builder and migrations on top.
-- **hive** — you only need a fast key-value store, not relational queries. Very low learning curve and startup time.
-- **isar** — you want maximum read/write throughput on a document-oriented model with a high-level query DSL, and native code is acceptable.
-
-
-## Comparison with Other Packages
-
-| Feature | **just\_database** | sqflite | drift | hive | isar |
-|---|---|---|---|---|---|
-| Pure Dart (no native code) | ✅ | ❌ native SQLite | ❌ native SQLite | ✅ | ❌ native (Rust) |
-| Web (JS) | ✅ | ❌ | ⚠️ via sql.js | ✅ | ⚠️ partial |
-| Web (WASM) | ✅ | ❌ | ❌ | ✅ | ❌ |
-| Full SQL dialect | ✅ | ✅ SQLite | ✅ SQLite | ❌ | ❌ |
-| Views & triggers | ✅ | ✅ | ✅ | ❌ | ❌ |
-| Transactions & savepoints | ✅ | ✅ | ✅ | ❌ | ✅ |
-| ORM / type-safe queries | ✅ no codegen | ❌ | ✅ codegen | ⚠️ TypeAdapters | ✅ codegen |
-| Schema migrations | ✅ | ✅ | ✅ | ❌ | ✅ |
-| AES encryption (built-in) | ✅ | ❌ | ❌ | ❌ | ✅ (paid tier) |
-| Spatial / R-tree | ✅ | ❌ | ❌ | ❌ | ❌ |
-| In-memory mode | ✅ | ❌ | ⚠️ in-memory SQLite | ✅ | ❌ |
-| Built-in admin UI | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Built-in benchmarking | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Backup / restore API | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Codegen required | ❌ | ❌ | ✅ | ❌ | ✅ |
-
----
-
-## Installation
+## Install
 
 ```yaml
 dependencies:
-  just_database: ^1.2.0
+  just_database: ^2.0.0
 ```
 
-```bash
-flutter pub get
-```
+Requires Flutter 3.47.1 or newer. Coming from 1.x? Read
+[MIGRATION.md](MIGRATION.md): 2.0 changes the SQL semantics, the file
+location and several APIs, and reads every 1.x file.
 
----
-
-## Platform Support
-
-| Platform | SQL queries | File persistence | Backup file helpers | `SecureKeyManager` |
-|---|---|---|---|---|
-| Android | ✅ | ✅ | ✅ | ✅ |
-| iOS | ✅ | ✅ | ✅ | ✅ |
-| macOS | ✅ | ✅ | ✅ | ✅ |
-| Windows | ✅ | ✅ | ✅ | ✅ |
-| Linux | ✅ | ✅ | ✅ | ✅ |
-| Web (JS) | ✅ | ❌ no-op | ❌ throws | ✅ `localStorage` |
-| Web (WASM) | ✅ | ❌ no-op | ❌ throws | ✅ `localStorage` |
-
-> **Web / WASM note:** Opening a database with `persist: true` on web silently
-> keeps all data in-memory only for the page lifetime — no error is thrown, but
-> `.jdb` files are never written. `BackupManager.backupToFile` and the other
-> file helpers throw `UnsupportedError` on web/WASM; use
-> `BackupManager.exportSql` / `BackupManager.exportJson` to serialise data as a
-> string or map instead.
-
----
-
-## Quick Start
-
-### Raw SQL
+## Quick start
 
 ```dart
 import 'package:just_database/just_database.dart';
 
-void main() async {
-  // Persistence is ON by default. Pass persist: false to keep in-memory only.
-  final db = await JustDatabase.open('mydb');
+Future<void> main() async {
+  final db = await JustDatabase.open('app');
 
   await db.execute('''
-    CREATE TABLE users (
-      id    INTEGER PRIMARY KEY AUTOINCREMENT,
-      name  TEXT    NOT NULL,
-      email TEXT    UNIQUE NOT NULL,
-      age   INTEGER
-    )
-  ''');
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE,
+      joined DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''');
 
-  await db.execute(
-    "INSERT INTO users (name, email, age) VALUES ('Alice', 'alice@example.com', 28)",
+  final added = await db.execute(
+    'INSERT INTO users (name, email) VALUES (?, ?)',
+    ["Ann O'Brien", 'ann@example.com'],
   );
+  print(added.lastInsertRowId); // 1
 
-  final result = await db.query('SELECT * FROM users WHERE age > 25');
-  debugPrint(result.rows); // [{id: 1, name: Alice, ...}]
+  final result = await db.query(
+    'SELECT id, name FROM users WHERE email = :email',
+    {'email': 'ann@example.com'},
+  );
+  for (final row in result.rows) {
+    print('${row['id']}: ${row['name']}');
+  }
 
   await db.close();
 }
 ```
 
-### ORM Layer
+## Statements and results
 
-```dart
-// 1. Define your model
-class User extends DbRecord {
-  final String name;
-  final String email;
-  final int    age;
-
-  const User({super.id, required this.name, required this.email, required this.age});
-
-  @override
-  Map<String, dynamic> toMap() => {'name': name, 'email': email, 'age': age};
-
-  User copyWith({int? id, String? name, String? email, int? age}) => User(
-    id: id ?? this.id, name: name ?? this.name,
-    email: email ?? this.email, age: age ?? this.age,
-  );
-}
-
-// 2. Define the table
-class UserTable extends DbTable<User> {
-  @override String get tableName => 'users';
-
-  @override
-  List<DbColumn> get columns => [
-    DbColumn.text('name',  notNull: true),
-    DbColumn.text('email', notNull: true, unique: true),
-    DbColumn.integer('age', defaultValue: 0),
-  ];
-
-  @override
-  User fromRow(Map<String, dynamic> row) => User(
-    id:    row['id']    as int?,
-    name:  row['name']  as String,
-    email: row['email'] as String,
-    age:   row['age']   as int? ?? 0,
-  );
-}
-
-// 3. Use it
-void main() async {
-  final db    = await JustDatabase.open('mydb');
-  final users = UserTable();
-
-  await users.createTable(db);
-
-  final alice = await users.insert(db, const User(name: 'Alice', email: 'a@x.com', age: 30));
-  debugPrint(alice.id); // auto-assigned
-
-  final all   = await users.findAll(db, where: 'age > 18', orderBy: 'name');
-  final total = await users.count(db);
-  await users.update(db, alice.copyWith(age: 31));
-  await users.deleteById(db, alice.id!);
-}
-```
-
----
-
-## Database Modes
-
-```dart
-// Balanced read/write (default) — persisted to disk by default
-final db = await JustDatabase.open('db', mode: DatabaseMode.standard);
-
-// Many concurrent readers, exclusive writers
-final db = await JustDatabase.open('db', mode: DatabaseMode.readFast);
-
-// Buffered writes with 100 ms batch commits
-final db = await JustDatabase.open('db', mode: DatabaseMode.writeFast);
-
-// Explicit in-memory only (no file written)
-final db = await JustDatabase.open('db', persist: false);
-
-// AES-256-GCM encrypted at rest (requires passphrase)
-final db = await JustDatabase.open(
-  'vault',
-  mode: DatabaseMode.secure,
-  encryptionKey: 'my-secret-passphrase',
-);
-```
-
----
-
-## Secure Database
-
-`DatabaseMode.secure` encrypts the persisted `.jdb` file using **AES-256-GCM**
-before writing to disk and decrypts it on load.
-
-### How it works
-
-1. The `encryptionKey` string is hashed with **SHA-256** to produce a 32-byte AES key.
-2. A fresh random **16-byte IV** is generated on every `save()` — so two saves of identical
-   data produce different ciphertext.
-3. GCM provides **authenticated encryption**: if the key is wrong or the file is tampered
-   with, decryption throws a `StateError`.
-
-### Usage
-
-```dart
-// Create a new encrypted database
-final db = await JustDatabase.open(
-  'vault',
-  mode: DatabaseMode.secure,
-  encryptionKey: 'my-secret-passphrase',
-);
-await db.execute('CREATE TABLE secrets (id INTEGER PRIMARY KEY, value TEXT)');
-await db.execute("INSERT INTO secrets VALUES (1, 'top secret')");
-await db.close(); // encrypts and writes the .jdb file
-
-// Reopen later — must supply the same passphrase
-final db2 = await JustDatabase.open(
-  'vault',
-  mode: DatabaseMode.secure,
-  encryptionKey: 'my-secret-passphrase',
-);
-final result = await db2.query('SELECT * FROM secrets');
-debugPrint(result.rows); // [{id: 1, value: top secret}]
-```
-
-### Rules
-
-| Rule | Detail |
-|---|---|
-| `mode: DatabaseMode.secure` requires `encryptionKey` | Omitting the key throws `ArgumentError` |
-| Non-secure modes reject `encryptionKey` | An extra key throws `ArgumentError` |
-| Wrong key on reopen | Throws `StateError` — start with a fresh database |
-| Key is never stored | Your app must supply it on every `open()` call |
-| In-memory only (`persist: false`) | No encryption I/O, but secure mode is still valid |
-
-> **Key management**: the package does not store or derive any default key.
-> For production apps derive the key from a user password (e.g. PBKDF2) and store
-> *only* the salt (not the key) using [`just_storage`](https://pub.dev/packages/just_storage) —
-> a companion package that provides AES-256-GCM encrypted key-value storage with no
-> third-party storage wrappers required.
-
-The built-in `SecureKeyManager` handles all of this automatically:
-
-```dart
-import 'package:just_database/just_database.dart';
-
-// Derives an AES-256 key from the user's password via PBKDF2-HMAC-SHA256.
-// The random salt is generated once and persisted in JustSecureStorage;
-// only the salt is stored — the password and key are never written to disk.
-final key = await SecureKeyManager.resolveKey(
-  dbName:   'vault',
-  password: 'user-entered-password',
-);
-
-final db = await JustDatabase.open(
-  'vault',
-  mode: DatabaseMode.secure,
-  encryptionKey: key,
-);
-
-// To reset (e.g. on password change or database deletion):
-await SecureKeyManager.clearSalt(dbName: 'vault');
-```
-
-`SecureKeyManager` API:
-
-| Method | Description |
-|---|---|
-| `resolveKey({dbName, password})` | Returns the hex key; generates and persists a salt on first run |
-| `clearSalt({dbName})` | Deletes the stored salt — old key becomes irrecoverable |
-
----
-
-## ORM Layer
-
-### DbRecord
-
-Extend `DbRecord` for each entity. Implement `toMap()` — do **not** include `id` there.
-
-```dart
-class Product extends DbRecord {
-  final String name;
-  final double price;
-  final int    stock;
-
-  const Product({super.id, required this.name, required this.price, this.stock = 0});
-
-  @override
-  Map<String, dynamic> toMap() => {'name': name, 'price': price, 'stock': stock};
-
-  Product copyWith({int? id, String? name, double? price, int? stock}) => Product(
-    id: id ?? this.id, name: name ?? this.name,
-    price: price ?? this.price, stock: stock ?? this.stock,
-  );
-}
-```
-
-### DbColumn
-
-| Factory | SQL type | Options |
+| Method | Runs | On failure |
 |---|---|---|
-| `DbColumn.integer(name)` | INTEGER | `notNull`, `unique`, `defaultValue` |
-| `DbColumn.text(name)` | TEXT | `notNull`, `unique`, `defaultValue` |
-| `DbColumn.real(name)` | REAL | `notNull`, `defaultValue` |
-| `DbColumn.boolean(name)` | BOOLEAN | `notNull`, `defaultValue` |
-| `DbColumn.datetime(name)` | DATETIME | `notNull`, `defaultValue` |
-| `DbColumn.blob(name)` | BLOB | `notNull` |
+| `execute(sql, [params])` | any one statement | returns a result with `success == false` |
+| `query(sql, [params])` | one `SELECT` (or reading `PRAGMA`); anything else fails | same |
+| `executeScript(sql)` | every statement, in order, until one fails | the last result is the failure |
+| `tx.execute` / `tx.query` (in `transaction`) | one statement | **throws** `SqlException` |
 
-### DbTable<T> API
+`params` is a `List` (by position) or a `Map` (by name, with or without the
+`:`/`@`/`$` prefix). Values may be `null`, `int`, `double`, `String`,
+`Uint8List`, `bool` (stored as `1`/`0`) or `DateTime` (stored as ISO-8601
+UTC text). A wrong number of parameters is an error.
 
-```
-createTable(db)           — executes CREATE TABLE
-dropTable(db)             — executes DROP TABLE
-insert(db, record)        — inserts and returns record with id
-insertAll(db, records)    — transactional bulk insert
-findAll(db, {where, orderBy, descending, limit, offset})
-findById(db, id)          — nullable
-findWhere(db, where)
-findFirst(db, {where, orderBy, descending})
-count(db, {where})
-update(db, record)        — requires record.id != null
-updateWhere(db, values, where)
-deleteById(db, id)
-deleteWhere(db, where)
-deleteAll(db)
-rawQuery(db, sql)         — arbitrary SELECT  List<T>
-```
+A `QueryResult` has:
 
----
+| Member | |
+|---|---|
+| `success`, `error`, `errorMessage` | whether it worked; the `SqlException` when not |
+| `columns` | result column names, unique (`SELECT a.id, b.id` gives `id`, `id:1`) |
+| `rows` | rows as `Map<String, Object?>` |
+| `values` | rows as lists, in column order |
+| `scalar` | first column of the first row (`SELECT COUNT(*) …`) |
+| `affectedRows`, `lastInsertRowId` | for `INSERT`/`UPDATE`/`DELETE` |
+| `elapsed` | how long the engine took to run it |
+| `orThrow()` | the result, or throws its error |
 
-## Triggers
+Values come back as SQL stores them: `int`, `double`, `String`,
+`Uint8List` or `null`. A `BOOLEAN` column holds `1`/`0`; a `DATETIME` column
+holds text. The ORM's [row helpers](#orm) convert them.
 
-```dart
-await db.execute('''
-  CREATE TRIGGER log_insert
-  AFTER INSERT ON products
-  BEGIN
-    INSERT INTO audit_log (action, table_name, row_id)
-    VALUES ('INSERT', 'products', NEW.id);
-  END
-''');
-
-// BEFORE trigger to normalise data
-await db.execute('''
-  CREATE TRIGGER normalise_email
-  BEFORE INSERT ON users
-  WHEN NEW.email IS NOT NULL
-  BEGIN
-    UPDATE users SET email = LOWER(NEW.email) WHERE id = NEW.id;
-  END
-''');
-```
-
----
-
-## Views
-
-```dart
-await db.execute('''
-  CREATE VIEW active_users AS
-  SELECT id, name, email FROM users WHERE active = 1
-''');
-
-final r = await db.query('SELECT * FROM active_users ORDER BY name');
-```
-
----
+Introspection: `tableNames`, `viewNames`, `triggerNames`,
+`getTableSchema(table)`, `getViewSql(view)`, `getTriggerSql(trigger)`,
+`triggerNamesForTable(table)`, `indexesForTable(table)`,
+`rowCount(table)`, `totalRows`, `estimatedSizeBytes`.
 
 ## Transactions
 
 ```dart
-// transaction() helper — auto-rollback on exception
 await db.transaction((tx) async {
-  await tx.execute("INSERT INTO accounts (owner, balance) VALUES ('Alice', 1000)");
-  await tx.execute("INSERT INTO accounts (owner, balance) VALUES ('Bob', 500)");
-  return null;
+  await tx.execute('UPDATE accounts SET balance = balance - ? WHERE id = ?', [100, 1]);
+  await tx.execute('UPDATE accounts SET balance = balance + ? WHERE id = ?', [100, 2]);
 });
-
-// Manual control
-await db.beginTransaction();
-try {
-  await db.execute("UPDATE accounts SET balance = balance - 100 WHERE owner = 'Alice'");
-  await db.execute("UPDATE accounts SET balance = balance + 100 WHERE owner = 'Bob'");
-  await db.commit();
-} catch (_) {
-  await db.rollback();
-}
-
-// Savepoints
-await db.beginTransaction();
-await db.execute("INSERT INTO items (name) VALUES ('Widget')");
-await db.savepoint('sp1');
-await db.execute("INSERT INTO items (name) VALUES ('Gadget')");
-await db.rollback(savepoint: 'sp1'); // undo only 'Gadget'
-await db.commit();                   // 'Widget' is kept
 ```
 
----
+* If the callback throws (a failing `tx` statement throws `SqlException`),
+  everything it did is rolled back and the error is rethrown; otherwise
+  the transaction commits.
+* The transaction holds the database: statements from other callers wait
+  until it ends, so they never see or interleave with its changes.
+* `tx.transaction(...)` (or `db.transaction` inside one) nests as a
+  savepoint.
+* `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `RELEASE` and
+  `ROLLBACK TO` also work through `execute`, but such a transaction is
+  shared by every caller of the database until it ends. Prefer
+  `transaction()`.
 
-## Spatial / R-tree
+Every statement is atomic on its own: if any row of a multi-row
+`INSERT`/`UPDATE`/`DELETE` fails (or a trigger it fires fails), none of its
+changes remain. `INSERT OR IGNORE/REPLACE/FAIL/ROLLBACK` choose otherwise,
+as in SQLite.
+
+## Saving, files and modes
+
+`JustDatabase.open(name)` keeps the database in memory and saves it to
+`<application support>/just_database/<name>.jdb` (IndexedDB on the web).
+Pass `persist: false` for a database that is never saved.
+
+* Each committed change starts a save in the background; saves that pile
+  up merge into one. A save never happens in the middle of a transaction.
+* Files are written to a temporary file and renamed over the old one, so a
+  crash leaves the old file or the new one, never a mix.
+* `await db.flush()` waits until everything so far is saved and throws if
+  the last save failed. Failed background saves are also reported to
+  `db.onSaveError`.
+* `await db.close()` waits for running statements, rolls back a
+  transaction left open, saves, and releases the file. It throws if that
+  final save fails.
+* Opening a name that is already open returns the same instance; `close()`
+  closes it when every opener has closed it. Another process (or browser
+  tab) cannot open it at the same time.
+* `JustDatabase.open` throws `StateError` for a file it cannot read
+  (damaged, written by a newer version, wrong key) and leaves the file
+  alone.
+* Names are 1–128 letters, digits, `_`, `.` or `-`.
+
+`mode` changes ordering and saving:
+
+| Mode | |
+|---|---|
+| `DatabaseMode.standard` | statements run in call order; each commit is saved |
+| `DatabaseMode.readFast` | a `SELECT` does not queue behind writes called before it |
+| `DatabaseMode.writeFast` | saves are batched (at most one per `JustDatabase.writeFastDelay`, 250 ms); `flush()` to save now |
+
+`db.changes` is a stream of what changed: a `DatabaseChange` (the
+`tables` touched, and whether the schema changed) after each statement,
+script or committed transaction, and nothing for a rollback. Statements
+run together send one event.
 
 ```dart
-await db.execute('''
-  CREATE TABLE locations (
-    id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    name  TEXT,
-    lat   REAL,
-    lng   REAL
-  )
-''');
+db.changes.listen((change) {
+  if (change.touches('scores')) refreshLeaderboard();
+});
+```
 
-await db.execute('CREATE SPATIAL INDEX ON locations (lat, lng)');
+`DatabaseManager` opens, lists (`listDatabases()`), closes and deletes
+databases by name; `DatabaseManager.listChanges` fires when a database
+is opened, closed, deleted or encrypted. The admin UI uses both.
 
-await db.execute(
-  "INSERT INTO locations (name, lat, lng) VALUES ('Park', 51.5074, -0.1278)",
+## Encryption
+
+```dart
+final db = await JustDatabase.open('vault', encryptionKey: userPassphrase);
+```
+
+* The file is encrypted with AES-256-GCM. The key is derived from the
+  passphrase with PBKDF2-HMAC-SHA256 (600 000 iterations) and a random
+  16-byte salt stored in the file's header; every save uses a new 12-byte
+  nonce. The header is authenticated, so a changed file or a wrong
+  passphrase fails to open with a `StateError`.
+* Deriving the key costs about a second on a phone. It runs on a background
+  isolate (WebCrypto on the web), so the UI does not freeze, but `open`
+  takes that long.
+* `db.changeEncryptionKey(newPassphrase)` re-encrypts; `null` decrypts.
+* 1.x encrypted files open with their old key and are rewritten in the new
+  format on the next save.
+
+Without a passphrase from the user, `SecureKeyManager.resolveAutoKey(dbName:)`
+returns a random key generated once and stored by `just_storage` in the
+app's private storage. That protects a copied database file, not a device
+where someone can read the app's private data: the stored key is there too.
+
+## The SQL dialect
+
+The engine follows SQLite. Supported:
+
+* `SELECT` with `DISTINCT`, `*`, `t.*`, joins (`INNER`, `LEFT`, `RIGHT`,
+  `FULL`, `CROSS`, comma, `NATURAL`, `USING`), `WHERE`, `GROUP BY`,
+  `HAVING`, `ORDER BY … [ASC|DESC] [NULLS FIRST|LAST]` (by expression,
+  alias or position), `LIMIT … OFFSET …` / `LIMIT o, n`, subqueries in
+  `FROM`, scalar and correlated subqueries, `IN (SELECT …)`, `EXISTS`,
+  `UNION [ALL]`, `INTERSECT`, `EXCEPT`, `VALUES (…), (…)`.
+* `INSERT [OR …] INTO … VALUES | SELECT | DEFAULT VALUES`,
+  `REPLACE INTO`, `ON CONFLICT (cols) DO NOTHING | DO UPDATE SET … [WHERE …]`
+  (with `excluded.col`), `UPDATE [OR …] … SET … WHERE …`, `DELETE`.
+* `CREATE TABLE [IF NOT EXISTS] … (…)` and `… AS SELECT`, column and table
+  constraints (`PRIMARY KEY`, `AUTOINCREMENT`, `NOT NULL`, `UNIQUE`,
+  `CHECK`, `DEFAULT` (constants, signed numbers, `CURRENT_TIMESTAMP`,
+  `(expr)`), `COLLATE`, `REFERENCES … ON DELETE/UPDATE …`), `DROP TABLE`,
+  `ALTER TABLE … RENAME TO | RENAME COLUMN | ADD COLUMN | DROP COLUMN`
+  (with SQLite's restrictions), `CREATE [UNIQUE] INDEX`, `DROP INDEX`,
+  `CREATE VIEW`, `DROP VIEW`, `CREATE TRIGGER` (`BEFORE`/`AFTER`/
+  `INSTEAD OF`, `INSERT`/`UPDATE [OF cols]`/`DELETE`, `WHEN`, `NEW`/`OLD`,
+  `RAISE(IGNORE | ABORT | FAIL | ROLLBACK, msg)`), `DROP TRIGGER`.
+* `BEGIN`, `COMMIT`/`END`, `ROLLBACK [TO]`, `SAVEPOINT`, `RELEASE`.
+* `PRAGMA foreign_keys`, `user_version`, `table_info(t)`, `index_list(t)`.
+* Quoted identifiers (`"x"`, `` `x` ``, `[x]`), blob literals (`X'0A1B'`),
+  hex integers (`0x1F`), `--` and `/* */` comments.
+
+Semantics worth knowing:
+
+* `NULL` follows three-valued logic: `NULL = NULL` is `NULL`, `x IN (…,
+  NULL)` can be `NULL`, `NOT IN` with a `NULL` matches nothing.
+* Type affinity comes from the declared type (`INT…` integer;
+  `CHAR`/`CLOB`/`TEXT` text; `BLOB` or none: as given; `REAL`/`FLOA`/`DOUB`
+  real; anything else numeric), and comparisons convert like SQLite: in an
+  `INTEGER` column `'5'` is stored as `5`, but `1 = '1'` between two
+  untyped values is false. `BOOLEAN` and `DATETIME` columns are numeric:
+  `TRUE`/`FALSE` are `1`/`0`; dates are text.
+* A column declared exactly `INTEGER PRIMARY KEY` is the rowid; a new row
+  gets the largest rowid + 1 (with `AUTOINCREMENT`: never reused). Every
+  table has a `rowid` column.
+* `+` is numeric (`'10' + 5` is `15`); use `||` to join text. Integer
+  overflow becomes a real; division by zero is `NULL`.
+* `LIKE` and `NOCASE` ignore case for ASCII letters only; `GLOB` is case
+  sensitive.
+* Foreign keys are enforced (`PRAGMA foreign_keys = OFF` turns them off),
+  unlike SQLite's default. `NO ACTION` is checked when the statement ends,
+  `RESTRICT` at once; `DEFERRABLE` is accepted but checked immediately.
+* Triggers do not fire recursively (SQLite's default); nested trigger
+  chains stop at 1000 levels.
+* Result columns are named like SQLite names them: a column's name, an
+  alias, otherwise the expression's text.
+
+Functions: `abs char coalesce concat concat_ws format glob hex ifnull iif
+instr last_insert_rowid length like likelihood likely lower ltrim max min
+nullif octet_length printf quote random randomblob replace round rtrim sign
+substr substring changes total_changes trim typeof unhex unicode unlikely
+upper zeroblob`; math `acos asin atan atan2 ceil ceiling cos cosh degrees
+exp floor ln log log10 log2 mod pi pow power radians sin sinh sqrt tan tanh
+trunc`; dates `date time datetime julianday unixepoch strftime` (with
+SQLite's modifiers: `±N days/hours/…`, `start of day/month/year`,
+`weekday N`, `unixepoch`, `localtime`, `utc`, `subsec`); aggregates `count
+sum total avg min max group_concat string_agg`, with `DISTINCT`.
+
+Indexes speed up equality lookups (`col = ?`, `col IN (…)`, `rowid = ?`) on
+the first table of a query, and joins on equal keys (other joins use a hash
+table). Query hints choose: `SELECT /*+ INDEX(t idx) */ …` (or
+`FORCE_INDEX`),
+`/*+ NO_INDEX(t) */`, `/*+ FULL_SCAN */` (`JOIN_ORDER` is accepted and
+ignored).
+
+Not supported: `WITH` (CTEs), window functions, `RETURNING`, partial and
+expression indexes, `WITHOUT ROWID`/`STRICT`/`TEMP`/virtual tables,
+`REGEXP`/`MATCH`, JSON functions, `UPDATE … FROM`, `ORDER BY`/`LIMIT` on
+`UPDATE`/`DELETE`, row values outside `VALUES`, collations other than
+`BINARY`, `NOCASE`, `RTRIM`.
+
+## Spatial data
+
+Geometries are WKT text: `POINT(x y)` and single-ring
+`POLYGON((x y, …, x y))`.
+
+```dart
+await db.execute('CREATE TABLE places (name TEXT, lng REAL, lat REAL)');
+await db.execute('CREATE SPATIAL INDEX places_pos ON places (lng, lat)');
+final near = await db.query(
+  'SELECT name FROM places '
+  'WHERE ST_WITHIN(ST_MAKEPOINT(lng, lat), ST_MAKEENVELOPE(?, ?, ?, ?))',
+  [2.2, 48.8, 2.5, 48.9],
 );
-
-// Distance query
-final r = await db.query('''
-  SELECT name, ST_DISTANCE(ST_MAKEPOINT(lat, lng), ST_MAKEPOINT(51.5, -0.1)) AS dist
-  FROM locations
-  ORDER BY dist
-  LIMIT 5
-''');
 ```
 
----
+Functions: `ST_MAKEPOINT`/`ST_POINT`, `ST_X`, `ST_Y`, `ST_MAKEENVELOPE`
+(`ST_BBOX`), `ST_ENVELOPE`, `ST_GEOMFROMTEXT`, `ST_ASTEXT`, `ST_ISVALID`,
+`ST_WITHIN`, `ST_CONTAINS`, `ST_INTERSECTS`, `ST_DWITHIN`, `ST_DISTANCE`
+(planar, in the coordinates' units) and `ST_DISTANCE_SPHERE` (metres,
+x = longitude and y = latitude in degrees). A spatial index (an R-tree over
+two numeric columns) answers `ST_WITHIN`/`ST_INTERSECTS`/`ST_CONTAINS`/
+`ST_DWITHIN` on `ST_MAKEPOINT(x, y)` of its columns.
 
-## Query Hints
-
-```dart
-// Force a specific index
-await db.query('SELECT /*+ INDEX(users idx_age) */ * FROM users WHERE age > 25');
-
-// Skip all indexes (table scan)
-await db.query('SELECT /*+ FULL_SCAN */ * FROM users');
-
-// Disable index use
-await db.query('SELECT /*+ NO_INDEX */ * FROM products WHERE price < 50');
-```
-
----
-
-## Backup & Restore
+## Migrations
 
 ```dart
-// SQL dump — works on all platforms
-final sql = BackupManager.exportSql(tables);
-await BackupManager.importSql(sql, tables);
-
-// JSON snapshot — works on all platforms
-final json = BackupManager.exportJson(tables);
-BackupManager.importJson(json, tables);
-
-// File helpers — native platforms only (throws UnsupportedError on web/WASM)
-await BackupManager.backupToFile(tables, '/path/to/backup.sql');
-await BackupManager.restoreFromFile('/path/to/backup.sql', tables);
-await BackupManager.backupToJsonFile(tables, '/path/to/backup.json');
-await BackupManager.restoreFromJsonFile('/path/to/backup.json', tables);
-```
-
-> **Web / WASM:** Use `exportSql` / `exportJson` and transmit the result to a
-> server for storage. The file helpers are not available on web.
-
----
-
-## Schema Migrations
-
-```dart
-final runner = MigrationRunner(db, migrations: [
+final results = await db.migrate([
   SqlMigration(
     version: 1,
-    name: 'create_users',
+    name: 'create users',
     upSql: 'CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)',
     downSql: 'DROP TABLE users',
   ),
   CallbackMigration(
     version: 2,
-    name: 'seed_admin',
-    up: (db) async {
-      await db.execute("INSERT INTO users (name) VALUES ('Admin')");
-    },
-    down: (db) async {
-      await db.execute("DELETE FROM users WHERE name = 'Admin'");
-    },
+    name: 'add email',
+    upCallback: (tx) => tx.execute('ALTER TABLE users ADD COLUMN email TEXT'),
   ),
 ]);
-
-await runner.migrate();            // apply all pending
-await runner.rollback(toVersion: 1); // rollback to v1
-final status = await runner.status(); // see which are applied
 ```
 
----
+Applied versions live in a `_migrations` table. Each migration runs in its
+own transaction with its bookkeeping, so a failed one leaves nothing
+behind; `migrate` stops there and reports it. `migrate` saves before it
+returns. It throws `MigrationException` when an applied `SqlMigration`
+changed (its checksum differs) or when a pending migration has a lower
+version than one already applied. `db.migrationRunner(list)` also offers
+`rollback(targetVersion:)`, `status()` and `currentVersion()`.
 
-## Benchmarking
+## Backup and restore
 
 ```dart
-// Built-in standard 8-operation suite
-final suite = await db.runStandardBenchmark(
-  rowCount:   5000,
-  warmup:     5,
-  iterations: 100,
-);
-debugPrint(DatabaseBenchmark.formatTable(suite.results));
-
-// Single query benchmark
-final stat = await db.benchmarkQuery(
-  'complex join',
-  'SELECT u.name, COUNT(o.id) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id',
-  warmup: 3, iterations: 50,
-);
-debugPrint('avg ${stat.avgMs.toStringAsFixed(2)} ms  p99 ${stat.p99Ms.toStringAsFixed(2)} ms');
+final sql = await db.exportSql();     // a script that recreates everything
+final json = await db.exportJson();   // the file format, as JSON
+await other.importSql(sql);           // replaces the whole database
+await other.importJson(json);
 ```
 
----
+Exports include tables (with rowids), indexes, views, triggers and
+`user_version`; the JSON export also keeps `AUTOINCREMENT` high-water
+marks. An import runs against an empty database first and only replaces
+the current one when every statement succeeded.
 
-## Built-in Admin UI
-
-Embed a full database management screen in your app with a single widget:
+## ORM
 
 ```dart
-import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
+class User extends DbRecord {
+  const User({super.id, required this.name, this.active = true});
+  final String name;
+  final bool active;
+
+  @override
+  Map<String, Object?> toMap() => {'name': name, 'active': active};
+}
+
+class Users extends DbTable<User> {
+  @override
+  String get tableName => 'users';
+
+  @override
+  List<DbColumn> get columns => [
+    DbColumn.text('name', notNull: true),
+    DbColumn.boolean('active', defaultValue: true),
+  ];
+
+  @override
+  User fromRow(Map<String, Object?> row) => User(
+    id: row.intValue('id'),
+    name: row.stringValue('name')!,
+    active: row.boolValue('active') ?? true,
+  );
+}
+
+final users = Users();
+await users.createTable(db);
+final ann = await users.insert(db, const User(name: 'Ann'));
+final active = await users.findAll(db, where: 'active = ?', whereArgs: [true]);
+```
+
+`DbTable` adds `id INTEGER PRIMARY KEY AUTOINCREMENT` and offers `insert`,
+`insertAll` (one transaction), `findAll`, `findById`, `findWhere`,
+`findFirst`, `count`, `update`, `updateWhere`, `deleteById`,
+`deleteWhere`, `deleteAll` and `rawQuery`. Names are quoted and values
+bound; `where` is SQL you write, so quote reserved words there. The
+`intValue`, `doubleValue`, `stringValue`, `boolValue`, `dateTimeValue` and
+`bytesValue` row helpers convert stored values.
+
+## Query builder
+
+```dart
+final page = await db.from('users')
+    .select(['id', 'name'])
+    .where('name LIKE ?', ['A%'])
+    .orderBy('name')
+    .limit(20)
+    .offset(40)
+    .get();
+await db.from('users').whereEquals('id', 3).update({'name': 'Bo'});
+```
+
+## Admin UI
+
+```dart
 import 'package:just_database/ui.dart';
 
-class MyApp extends StatelessWidget {
-  @override
-  Widget build(BuildContext context) {
-    return ChangeNotifierProvider(
-      create: (_) => DatabaseProvider(),
-      child: MaterialApp(
-        home: JUDatabaseAdminScreen(
-          // Optional: provide seed data shown in each database's popup menu
-          onSeedDatabase: (db) async {
-            await db.execute("INSERT INTO demo (name) VALUES ('sample')");
-          },
-          // Optional: custom theme
-          // theme: ThemeData(
-          //   colorScheme: ColorScheme.fromSeed(seedColor: Colors.indigo),
-          //   useMaterial3: true,
-          // ),
-        ),
-      ),
-    );
-  }
-}
+Navigator.push(context, MaterialPageRoute(
+  builder: (_) => const JustDatabaseAdminScreen(),
+));
 ```
 
-The admin screen has **4 tabs** (Benchmark and Insert Row are accessible from each database card's popup menu):
+A database workbench for your app, only in `package:just_database/ui.dart`
+(the main library has no UI). On a wide screen it shows a sidebar of
+databases, tables, views and triggers beside the selected one's panes; on a
+phone the same pieces are pages you drill into.
 
-| Tab | Purpose |
-|---|---|
-| Databases | Create, open, delete databases; popup menu per card: Open · Insert Row · Benchmark · Seed Sample Data (optional) · Delete |
-| Schema | Inspect tables, columns, types, constraints, indexes |
-| Query | Full SQL editor, example gallery, query history, result table |
-| Settings | Default persistence toggle, default mode, DB stats, engine-feature reference |
+![The workbench on a desktop, in its dark default with coral accents: the sidebar lists four databases and the tables, views and trigger of save_game; the players table is sorted by level, and row 5 is open in the side-panel editor](assets/screenshots/workbench_desktop.png)
 
----
+![The workbench on phones, in dark: the tables, views and trigger of save_game; the rows of the players table; a query and its results in the SQL console](assets/screenshots/workbench_phone.png)
 
-## SQL Reference
+* **Data**: browse a table or view a page at a time; search every column or
+  filter with a `WHERE` expression; sort by a header; resize columns; edit
+  a cell in place (double-click or F2) or a row in a side panel; view long
+  text, JSON and BLOBs in full; select and delete rows; export rows as CSV
+  or JSON.
+* **Structure**: columns, keys, checks, indexes, triggers, and the tables
+  that reference this one; add, rename and drop columns; create and drop
+  indexes; rename, empty and drop tables; a designer for new tables with a
+  live SQL preview.
+* **SQL console**: highlighting, completion of tables and columns (Tab),
+  Ctrl+Enter runs the selection or everything and Ctrl+Shift+Enter the
+  statement at the caret; one result per statement with its time; the
+  line and column of an error; a field per `?` or `:name` parameter;
+  history and snippets kept between runs, and templates from the schema.
+* **Databases**: create (plain, with a random key, or with a passphrase),
+  open (asking for a passphrase when needed), close, change the mode,
+  duplicate, export and import (SQL or JSON: copy, a file, or a browser
+  download), encrypt, re-key or decrypt, save now, benchmark, delete.
+* It lists the databases your app has open (and uses those instances) as
+  well as the saved ones, and stays current while the app writes.
+* **Its own look**: black and grey with coral accents, dark by default,
+  in the app's font. The user can switch to light or the device's setting
+  (the sun and moon button, or Settings). Pass `theme:` for your own
+  colours; a theme without the brightness picked is remade in it from its
+  colours.
 
-### Statements
+![The workbench in light mode: a parameterised query with highlighting and its results in the SQL console](assets/screenshots/workbench_desktop_light.png)
 
-```
-CREATE TABLE [IF NOT EXISTS] name (col type [constraints], )
-CREATE VIEW  [IF NOT EXISTS] name AS select_stmt
-CREATE [UNIQUE | SPATIAL] INDEX [IF NOT EXISTS] name ON table (col, )
-CREATE TRIGGER name BEFORE|AFTER|INSTEAD OF event ON table [WHEN expr] BEGIN  END
+`JustDatabaseAdminScreen({controller, readOnly, theme, title,
+onSeedDatabase})`: `readOnly: true` hides everything that writes (the
+console then only runs reads), which suits a debug menu in a shipped game;
+`onSeedDatabase` adds a "Seed sample data" action. Pass a
+`JustDatabaseAdminController` to share the state between screens or to
+choose what is shown (`selectDatabase(name)`) or how
+(`themeMode: ThemeMode.light`, `setThemeMode`); unless you turn
+`rememberSettings` off, its settings, SQL history and snippets are kept
+with just_storage.
 
-ALTER TABLE name ADD COLUMN col type [constraints]
-ALTER TABLE name DROP COLUMN col
-ALTER TABLE name RENAME COLUMN old TO new
+Check names for new databases with `JustDatabase.nameProblem(name)` (null
+means the name is fine).
 
-DROP TABLE  [IF EXISTS] name
-DROP VIEW   [IF EXISTS] name
-DROP INDEX  [IF EXISTS] name
+### The workbench in Flutter DevTools
 
-INSERT INTO name [(cols)] VALUES (vals), 
-SELECT [DISTINCT] cols FROM table [JOIN] [WHERE] [GROUP BY] [HAVING] [ORDER BY] [LIMIT] [OFFSET]
-UPDATE name SET col=val [WHERE]
-DELETE FROM name [WHERE]
+While your app runs in a debug build, the same workbench is a tab in
+Flutter DevTools, on the app's databases. Open DevTools from the link
+`flutter run` prints (or run "Dart: Open DevTools" in VS Code) and choose
+**just_database**; DevTools asks once whether to enable it. It works for
+apps on phones and emulators too, and you add nothing to your app.
 
-BEGIN [DEFERRED | IMMEDIATE]
-COMMIT
-ROLLBACK [TO SAVEPOINT name]
-SAVEPOINT name
-RELEASE SAVEPOINT name
-```
+* It does what the in-app screen does, from your browser: the databases
+  the app has open and the saved ones, kept current as the app writes;
+  editing, the SQL console, structure changes, import and export,
+  encryption (random keys never leave the app) and benchmarks, which run on
+  the device.
+* The console says so when the app opens its first database.
+* Release and profile builds have none of it. In a debug build it is one
+  service extension on the Dart VM service: nothing runs on the app's
+  writes until the workbench connects, and the app stops watching when it
+  disconnects. While it is connected, each change sends a summary of the
+  schema and row counts, and each page of rows travels as JSON.
+* `JustDatabase.debugDevToolsWorkbench = false`, before the first database
+  opens, turns it off.
 
-### Data Types
-
-`INTEGER`  `TEXT` / `VARCHAR`  `REAL` / `FLOAT`  `BOOLEAN`  `DATETIME`  `BLOB`
-
-### Functions
-
-| Category | Functions |
-|---|---|
-| Aggregate | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` |
-| String | `UPPER`, `LOWER`, `LENGTH`, `SUBSTR`, `TRIM`, `REPLACE`, `CONCAT` |
-| Math | `ABS`, `ROUND` |
-| Null | `COALESCE`, `IFNULL` |
-| Spatial | `ST_MAKEPOINT`, `ST_X`, `ST_Y`, `ST_DISTANCE`, `ST_WITHIN`, `ST_INTERSECTS`, `ST_CONTAINS`, `ST_BBOX` |
-
-### Constraints
-
-`PRIMARY KEY`  `AUTOINCREMENT`  `NOT NULL`  `UNIQUE`  `DEFAULT value`  `FOREIGN KEY  REFERENCES`
-
----
-
-## API Reference
-
-### `JustDatabase`
+## Benchmarks
 
 ```dart
-static Future<JustDatabase> open(String name, {
-  DatabaseMode mode = DatabaseMode.standard,
-  bool persist = true,   // persisted by default
-})
-
-Future<QueryResult> query(String sql)
-Future<QueryResult> execute(String sql)
-QueryBuilder from(String tableName)
-
-// Transactions
-Future<T> transaction<T>(Future<T> Function(JustDatabase) action)
-Future<QueryResult> beginTransaction({String? mode})
-Future<QueryResult> commit()
-Future<QueryResult> rollback({String? savepoint})
-Future<QueryResult> savepoint(String name)
-Future<QueryResult> releaseSavepoint(String name)
-
-// Introspection
-List<String> get tableNames
-List<String> get viewNames
-List<String> get triggerNames
-List<String> indexNamesForTable(String tableName)
-TableSchema?  getTableSchema(String name)
-int get totalRows
-int get estimatedSizeBytes
-
-// Benchmarking
-Future<BenchmarkSuiteResult> runStandardBenchmark({int rowCount, int warmup, int iterations})
-Future<QueryStats>            benchmarkQuery(String label, String sql, {int warmup, int iterations})
-
-Future<void> close()
+final suite = await db.runStandardBenchmark(rowCount: 1000);
+print(suite.formatTable());
+final stats = await db.benchmarkQuery('by name', 'SELECT * FROM users WHERE name = ?', parameters: ['Ann']);
+print(stats.format());
 ```
 
-### `QueryResult`
+The standard suite runs on a private in-memory database; `benchmarkQuery`
+only runs read-only statements.
 
-```dart
-class QueryResult {
-  final bool   success;
-  final List<String>              columns;
-  final List<Map<String, dynamic>> rows;
-  final int    affectedRows;
-  final String? errorMessage;
-  bool get isEmpty  => rows.isEmpty;
-  int  get rowCount => rows.length;
-}
-```
+## Errors
 
----
+Failures carry a `SqlException` with a `kind`: `syntax`, `schema` (no such
+table/column, name in use), `constraint` (NOT NULL, UNIQUE, CHECK, FOREIGN
+KEY), `raised` (a trigger's `RAISE`), `misuse` (wrong parameters, a write
+passed to `query`, …) or `error`. `JustDatabase.open`, `flush` and `close`
+throw `StateError`/`ArgumentError` for problems with the file, the name or
+the key.
 
-## Contributing
+## Limits
 
-Pull requests are welcome. Please open an issue first to discuss large changes.
+* The whole database lives in memory, and each save rewrites the whole
+  file (about 40 ms per MB, plus encryption). It suits app data up to tens
+  of megabytes, not hundreds.
+* Indexes are hash indexes: they help equality, not ranges or `ORDER BY`.
+* On the web, integers are JavaScript numbers: exact up to 2^53.
+* Two isolates of one process opening the same database are only kept
+  apart on Windows; use one isolate per database.
 
-## License
+## Links
 
-BSD 3-Clause License — see [LICENSE](LICENSE).
+* [MIGRATION.md](MIGRATION.md): upgrading from 1.x
+* [ARCHITECTURE.md](ARCHITECTURE.md): how it works
+* [CHANGELOG.md](CHANGELOG.md)
+* [Issues](https://github.com/just-unknown-dev/just-database/issues)
 
-## Repository
-
-[https://github.com/just-unknown-dev/just-database](https://github.com/just-unknown-dev/just-database)
+BSD 3-Clause licence.

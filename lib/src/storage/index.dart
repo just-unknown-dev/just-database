@@ -1,319 +1,204 @@
-import 'database_row.dart';
+import 'package:flutter/foundation.dart' show internal;
 
-/// Type of index for tracking its purpose and behavior.
-enum IndexType {
-  primary, // Primary key index
-  unique, // Unique constraint index
-  foreign, // Foreign key index
-  auto, // Automatically created based on query patterns
-  spatial, // Spatial (R-tree) index
-  manual, // User-created index via CREATE INDEX
-}
+import 'rtree.dart';
+import 'schema.dart';
+import 'values.dart';
 
-/// Metadata about an index, tracking its properties and usage.
-class IndexMetadata {
-  final String name;
-  final List<String> columns;
-  final IndexType type;
-  final bool unique;
-  final DateTime createdAt;
-  int usageCount;
-  DateTime? lastUsedAt;
-
-  IndexMetadata({
+/// A hash index over one or more columns of a table.
+///
+/// Keys are built with [keyOf], so values SQLite treats as equal (1 and
+/// 1.0; text equal under the column's collation) share a key. Rows with a
+/// NULL in any key column are not indexed: NULL never equals anything, so
+/// they can neither conflict in a UNIQUE index nor match an equality
+/// lookup.
+@internal
+final class TableIndex {
+  /// Creates an empty index.
+  TableIndex({
     required this.name,
     required this.columns,
-    required this.type,
+    required this.collations,
     required this.unique,
-    DateTime? createdAt,
-    this.usageCount = 0,
-    this.lastUsedAt,
-  }) : createdAt = createdAt ?? DateTime.now();
+    required this.origin,
+  }) : assert(columns.length == collations.length);
 
-  void recordUsage() {
-    usageCount++;
-    lastUsedAt = DateTime.now();
+  /// The index's name.
+  String name;
+
+  /// The positions of the indexed columns in the row, in key order.
+  List<int> columns;
+
+  /// The collation of each key column.
+  final List<Collation> collations;
+
+  /// Whether two rows may not share a key.
+  final bool unique;
+
+  /// What created the index.
+  final IndexOrigin origin;
+
+  // key → rowid (int) for a single row, or Set<int> for several.
+  final Map<Object, Object> _map = {};
+
+  /// Whether this index enforces a constraint (PRIMARY KEY or UNIQUE).
+  bool get isConstraint =>
+      origin == IndexOrigin.primaryKey || origin == IndexOrigin.unique;
+
+  /// The number of distinct keys.
+  int get keyCount => _map.length;
+
+  /// The key of [row], or null when a key column is NULL.
+  Object? keyOfRow(List<Object?> row) {
+    if (columns.length == 1) {
+      final v = row[columns[0]];
+      return v == null ? null : keyOf(v, collations[0]);
+    }
+    final parts = <Object>[];
+    for (var i = 0; i < columns.length; i++) {
+      final v = row[columns[i]];
+      if (v == null) return null;
+      parts.add(keyOf(v, collations[i]));
+    }
+    return CompositeKey(parts);
   }
 
-  Map<String, dynamic> toJson() => {
-    'name': name,
-    'columns': columns,
-    'type': type.name,
-    'unique': unique,
-    'createdAt': createdAt.toIso8601String(),
-    'usageCount': usageCount,
-    'lastUsedAt': lastUsedAt?.toIso8601String(),
-  };
-
-  factory IndexMetadata.fromJson(Map<String, dynamic> json) {
-    return IndexMetadata(
-      name: json['name'] as String,
-      columns: (json['columns'] as List<dynamic>).cast<String>(),
-      type: IndexType.values.firstWhere(
-        (e) => e.name == json['type'],
-        orElse: () => IndexType.auto,
-      ),
-      unique: json['unique'] as bool? ?? false,
-      createdAt: DateTime.parse(json['createdAt'] as String),
-      usageCount: json['usageCount'] as int? ?? 0,
-      lastUsedAt: json['lastUsedAt'] != null
-          ? DateTime.parse(json['lastUsedAt'] as String)
-          : null,
-    );
+  /// The key of [values], given in key-column order, or null when one is
+  /// NULL.
+  Object? keyOfValues(List<Object?> values) {
+    if (values.length == 1) {
+      final v = values[0];
+      return v == null ? null : keyOf(v, collations[0]);
+    }
+    final parts = <Object>[];
+    for (var i = 0; i < values.length; i++) {
+      final v = values[i];
+      if (v == null) return null;
+      parts.add(keyOf(v, collations[i]));
+    }
+    return CompositeKey(parts);
   }
 
-  @override
-  String toString() => 'IndexMetadata($name on ${columns.join(", ")})';
-}
-
-/// A hash-based index mapping column values to row IDs.
-/// Supports both single-column and composite (multi-column) indexes.
-/// Used to accelerate WHERE conditions on indexed columns.
-class TableIndex {
-  final List<String> columns;
-  final IndexMetadata metadata;
-
-  /// value (or composite key tuple) → list of rowIds that have this value.
-  final Map<Object, List<int>> _buckets = {};
-
-  TableIndex({
-    required String columnName,
-    required bool unique,
-    IndexType type = IndexType.auto,
-    String? name,
-  }) : columns = [columnName],
-       metadata = IndexMetadata(
-         name: name ?? 'idx_$columnName',
-         columns: [columnName],
-         type: type,
-         unique: unique,
-       );
-
-  /// Creates a composite index on multiple columns.
-  TableIndex.composite({
-    required List<String> columns,
-    required bool unique,
-    IndexType type = IndexType.auto,
-    String? name,
-  }) : columns = List.unmodifiable(columns),
-       metadata = IndexMetadata(
-         name: name ?? 'idx_${columns.join("_")}',
-         columns: columns,
-         type: type,
-         unique: unique,
-       );
-
-  /// Legacy getter for backward compatibility with single-column indexes.
-  String get columnName => columns.first;
-
-  /// Legacy getter for backward compatibility.
-  bool get unique => metadata.unique;
-
-  /// Whether this is a composite (multi-column) index.
-  bool get isComposite => columns.length > 1;
-
-  /// Adds a row to the index. For single-column indexes, pass the value.
-  /// For composite indexes, pass a DatabaseRow object.
-  void add(dynamic value, int rowId) {
-    final key = _makeKey(value);
+  /// Adds [row] under [rowid].
+  void add(List<Object?> row, int rowid) {
+    final key = keyOfRow(row);
     if (key == null) return;
-    _buckets.putIfAbsent(key, () => []).add(rowId);
-  }
-
-  /// Removes a row from the index.
-  void remove(dynamic value, int rowId) {
-    final key = _makeKey(value);
-    if (key == null) return;
-    _buckets[key]?.remove(rowId);
-    if (_buckets[key]?.isEmpty ?? false) _buckets.remove(key);
-  }
-
-  void update(dynamic oldValue, dynamic newValue, int rowId) {
-    remove(oldValue, rowId);
-    add(newValue, rowId);
-  }
-
-  /// Returns row IDs where the column value equals [value].
-  /// For composite indexes, [value] should be a DatabaseRow or Map with all columns.
-  List<int> lookup(dynamic value) {
-    metadata.recordUsage();
-    final key = _makeKey(value);
-    if (key == null) return [];
-    return List.unmodifiable(_buckets[key] ?? []);
-  }
-
-  /// Looks up using a partial key (for composite indexes).
-  /// [values] is a map of column names to values - only need to provide a subset.
-  List<int> lookupPartial(Map<String, dynamic> values) {
-    metadata.recordUsage();
-    if (!isComposite) {
-      // For single-column, just use regular lookup
-      return lookup(values[columns.first]);
-    }
-
-    // For composite, scan all buckets and match prefix
-    final result = <int>[];
-    for (final entry in _buckets.entries) {
-      if (entry.key is _CompositeKey) {
-        final compositeKey = entry.key as _CompositeKey;
-        bool matches = true;
-        for (final colEntry in values.entries) {
-          final colIndex = columns.indexOf(colEntry.key);
-          if (colIndex >= 0 &&
-              colIndex < compositeKey.values.length &&
-              _toKey(compositeKey.values[colIndex]) != _toKey(colEntry.value)) {
-            matches = false;
-            break;
-          }
-        }
-        if (matches) result.addAll(entry.value);
-      }
-    }
-    return result;
-  }
-
-  /// Returns row IDs satisfying the comparison [op] vs [value].
-  /// '=' benefits from O(1) hash lookup; all others fall back to bucket scan.
-  /// For composite indexes, only works for full-key comparisons.
-  List<int> scan(String op, dynamic value) {
-    metadata.recordUsage();
-    if (op == '=') return lookup(value);
-
-    final result = <int>[];
-    final targetKey = _makeKey(value);
-    if (targetKey == null) return result;
-
-    for (final entry in _buckets.entries) {
-      final cmp = _compareKeys(entry.key, targetKey);
-      bool include = false;
-      switch (op) {
-        case '!=':
-          include = cmp != 0;
-        case '<':
-          include = cmp < 0;
-        case '<=':
-          include = cmp <= 0;
-        case '>':
-          include = cmp > 0;
-        case '>=':
-          include = cmp >= 0;
-      }
-      if (include) result.addAll(entry.value);
-    }
-    return result;
-  }
-
-  bool containsValue(dynamic value) {
-    final key = _makeKey(value);
-    if (key == null) return false;
-    return _buckets.containsKey(key);
-  }
-
-  void rebuild(List<DatabaseRow> rows) {
-    _buckets.clear();
-    for (final row in rows) {
-      if (isComposite) {
-        add(row, row.rowId);
-      } else {
-        add(row.values[columns.first], row.rowId);
-      }
-    }
-  }
-
-  void clear() => _buckets.clear();
-
-  int get bucketCount => _buckets.length;
-
-  /// Creates a hash key from the value(s).
-  /// For single-column: converts the value to a hashable key.
-  /// For composite: creates a composite key from a DatabaseRow or Map.
-  Object? _makeKey(dynamic value) {
-    if (isComposite) {
-      // Extract values for all columns from DatabaseRow or Map
-      List<dynamic> values;
-      if (value is DatabaseRow) {
-        values = columns.map((col) => value.values[col]).toList();
-      } else if (value is Map<String, dynamic>) {
-        values = columns.map((col) => value[col]).toList();
-      } else {
-        return null; // Invalid input for composite index
-      }
-      // If any value is null, return null (nulls not indexed)
-      if (values.any((v) => v == null)) return null;
-      return _CompositeKey(values.map(_toKey).toList());
+    final existing = _map[key];
+    if (existing == null) {
+      _map[key] = rowid;
+    } else if (existing is int) {
+      _map[key] = <int>{existing, rowid};
     } else {
-      // Single column: just convert value
-      if (value == null) return null;
-      return _toKey(value);
+      (existing as Set<int>).add(rowid);
     }
   }
 
-  Object _toKey(dynamic value) {
-    if (value is String) return value;
-    if (value is num) return value;
-    if (value is bool) return value;
-    if (value is DateTime) return value.toUtc().millisecondsSinceEpoch;
-    return value.toString();
-  }
-
-  /// Compares two keys (handles both simple keys and composite keys).
-  int _compareKeys(Object a, Object b) {
-    if (a is _CompositeKey && b is _CompositeKey) {
-      return a.compareTo(b);
+  /// Removes [row] stored under [rowid].
+  void remove(List<Object?> row, int rowid) {
+    final key = keyOfRow(row);
+    if (key == null) return;
+    final existing = _map[key];
+    if (existing == null) return;
+    if (existing is int) {
+      if (existing == rowid) _map.remove(key);
+      return;
     }
-    return _compare(a, b);
+    final set = existing as Set<int>;
+    set.remove(rowid);
+    if (set.length == 1) {
+      _map[key] = set.first;
+    } else if (set.isEmpty) {
+      _map.remove(key);
+    }
   }
 
-  int _compare(Object a, Object b) {
-    if (a is num && b is num) return a.compareTo(b);
-    return a.toString().compareTo(b.toString());
+  /// The rowids stored under [key], in no particular order.
+  Iterable<int> lookup(Object key) {
+    final e = _map[key];
+    if (e == null) return const [];
+    if (e is int) return [e];
+    return e as Set<int>;
+  }
+
+  /// For a unique index: the rowid of another row with the same key as
+  /// [row], ignoring [except]; null when there is none.
+  int? conflict(List<Object?> row, {int? except}) {
+    final key = keyOfRow(row);
+    if (key == null) return null;
+    for (final r in lookup(key)) {
+      if (r != except) return r;
+    }
+    return null;
+  }
+
+  /// Rebuilds the index from [rows]. Returns the first key found twice, as
+  /// a pair of rowids, for a unique index; null when the rows are unique.
+  (int, int)? rebuild(Iterable<MapEntry<int, List<Object?>>> rows) {
+    _map.clear();
+    for (final e in rows) {
+      if (unique) {
+        final other = conflict(e.value);
+        if (other != null) return (other, e.key);
+      }
+      add(e.value, e.key);
+    }
+    return null;
   }
 }
 
-/// Internal class for representing composite index keys.
-class _CompositeKey {
-  final List<Object> values;
+/// An R-tree over points stored in two numeric columns, built by
+/// `CREATE SPATIAL INDEX name ON table (x, y)`.
+@internal
+final class SpatialIndex {
+  /// Creates an empty spatial index over the columns at [xColumn] and
+  /// [yColumn].
+  SpatialIndex({
+    required this.name,
+    required this.xColumn,
+    required this.yColumn,
+  });
 
-  _CompositeKey(this.values);
+  /// The index's name.
+  String name;
 
-  @override
-  bool operator ==(Object other) {
-    if (identical(this, other)) return true;
-    if (other is! _CompositeKey) return false;
-    if (values.length != other.values.length) return false;
-    for (int i = 0; i < values.length; i++) {
-      if (values[i] != other.values[i]) return false;
-    }
-    return true;
+  /// The position of the x (longitude) column.
+  int xColumn;
+
+  /// The position of the y (latitude) column.
+  int yColumn;
+
+  final RTree<int> _tree = RTree<int>();
+
+  /// The number of indexed points.
+  int get size => _tree.size;
+
+  Rect? _pointOf(List<Object?> row) {
+    final x = row[xColumn], y = row[yColumn];
+    if (x is! num || y is! num) return null;
+    final dx = x.toDouble(), dy = y.toDouble();
+    if (!dx.isFinite || !dy.isFinite) return null;
+    return Rect.point(dx, dy);
   }
 
-  @override
-  int get hashCode {
-    int hash = 0;
-    for (final v in values) {
-      hash = hash ^ v.hashCode;
-    }
-    return hash;
+  /// Adds [row] under [rowid]; rows without two finite numbers are skipped.
+  void add(List<Object?> row, int rowid) {
+    final p = _pointOf(row);
+    if (p != null) _tree.insert(p, rowid);
   }
 
-  int compareTo(_CompositeKey other) {
-    final minLen = values.length < other.values.length
-        ? values.length
-        : other.values.length;
-    for (int i = 0; i < minLen; i++) {
-      final a = values[i];
-      final b = other.values[i];
-      int cmp;
-      if (a is num && b is num) {
-        cmp = a.compareTo(b);
-      } else {
-        cmp = a.toString().compareTo(b.toString());
-      }
-      if (cmp != 0) return cmp;
-    }
-    return values.length.compareTo(other.values.length);
+  /// Removes [row] stored under [rowid].
+  void remove(List<Object?> row, int rowid) {
+    final p = _pointOf(row);
+    if (p != null) _tree.remove(p, rowid);
   }
 
-  @override
-  String toString() => '(${values.join(", ")})';
+  /// The rowids of points inside [area] (borders included).
+  List<int> search(Rect area) => _tree.search(area);
+
+  /// Rebuilds the index from [rows].
+  void rebuild(Iterable<MapEntry<int, List<Object?>>> rows) {
+    _tree.clear();
+    for (final e in rows) {
+      add(e.value, e.key);
+    }
+  }
 }

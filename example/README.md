@@ -1,62 +1,18 @@
-# just_database Examples
+# just_database example
 
-This directory contains examples demonstrating various features of just_database.
+* `lib/main.dart` — a Flutter app that opens a saved `sample` database and
+  shows the workbench (`JustDatabaseAdminScreen`). The bar above it runs the
+  API tour and switches the workbench to read-only. Make the window narrow
+  to see the phone layout.
+* `lib/tour.dart` — the API tour: tables, bound parameters, a join, a
+  transaction, a migration, the ORM and a backup (`runTour()`).
+  `example.dart` runs it on its own (`flutter run -t example.dart`).
 
-## Running the Examples
-
-### Basic Example (`example.dart`)
-
-Demonstrates basic CRUD operations, table creation, queries, and indexes:
-
-```bash
-dart run example/example.dart
-```
-
-### Persistence Example (`persistence_example.dart`)
-
-Shows how to use persistent storage and automatic indexing:
+Run it:
 
 ```bash
-dart run example/persistence_example.dart
+cd example
+flutter create .   # once, to add the platform folders
+flutter pub get
+flutter run
 ```
-
-### Flutter Admin UI Example (`flutter_admin_example.dart`)
-
-A complete Flutter application with the built-in admin UI:
-
-```bash
-flutter run example/flutter_admin_example.dart
-```
-
-## What Each Example Covers
-
-### example.dart
-- Creating a database
-- Creating tables with constraints
-- Inserting data
-- Querying with WHERE clauses
-- Updating records
-- Creating foreign keys
-- Composite indexes
-- Checking table schemas
-- Deleting records
-
-### persistence_example.dart
-- Creating persistent databases
-- Database modes
-- Automatic query-based indexing
-- Index metadata and statistics
-- Closing and reopening databases
-- Listing all databases
-
-### flutter_admin_example.dart
-- Using the built-in Flutter admin UI
-- Database provider setup
-- Custom theme configuration
-- Seed data integration
-
-## Additional Resources
-
-- [README.md](../README.md) - Full package documentation
-- [API Documentation](https://pub.dev/documentation/just_database/latest/) - Detailed API reference
-- [CHANGELOG.md](../CHANGELOG.md) - Version history and changes

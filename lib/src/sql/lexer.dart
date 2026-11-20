@@ -1,482 +1,312 @@
-import 'ast.dart';
+import 'dart:typed_data';
 
-/// SQL tokenizer — converts a SQL string into a list of [Token]s.
-class Lexer {
-  final String source;
-  int _pos = 0;
-  int _line = 1;
-  int _column = 1;
+import 'package:flutter/foundation.dart' show internal;
 
-  /// Maps uppercase keyword strings to their [TokenType].
-  static const Map<String, TokenType> _keywords = {
-    'CREATE': TokenType.kwCreate,
-    'TABLE': TokenType.kwTable,
-    'DROP': TokenType.kwDrop,
-    'ALTER': TokenType.kwAlter,
-    'ADD': TokenType.kwAdd,
-    'COLUMN': TokenType.kwColumn,
-    'RENAME': TokenType.kwRename,
-    'TO': TokenType.kwTo,
-    'IF': TokenType.kwIf,
-    'NOT': TokenType.kwNot,
-    'EXISTS': TokenType.kwExists,
-    'SELECT': TokenType.kwSelect,
-    'FROM': TokenType.kwFrom,
-    'WHERE': TokenType.kwWhere,
-    'INSERT': TokenType.kwInsert,
-    'INTO': TokenType.kwInto,
-    'VALUES': TokenType.kwValues,
-    'UPDATE': TokenType.kwUpdate,
-    'SET': TokenType.kwSet,
-    'DELETE': TokenType.kwDelete,
-    'JOIN': TokenType.kwJoin,
-    'INNER': TokenType.kwInner,
-    'LEFT': TokenType.kwLeft,
-    'RIGHT': TokenType.kwRight,
-    'OUTER': TokenType.kwOuter,
-    'ON': TokenType.kwOn,
-    'AS': TokenType.kwAs,
-    'ORDER': TokenType.kwOrder,
-    'BY': TokenType.kwBy,
-    'GROUP': TokenType.kwGroup,
-    'HAVING': TokenType.kwHaving,
-    'LIMIT': TokenType.kwLimit,
-    'OFFSET': TokenType.kwOffset,
-    'DISTINCT': TokenType.kwDistinct,
-    'ALL': TokenType.kwAll,
-    'COUNT': TokenType.kwCount,
-    'SUM': TokenType.kwSum,
-    'AVG': TokenType.kwAvg,
-    'MIN': TokenType.kwMin,
-    'MAX': TokenType.kwMax,
-    'INTEGER': TokenType.kwInteger,
-    'INT': TokenType.kwInt,
-    'TEXT': TokenType.kwText,
-    'VARCHAR': TokenType.kwVarchar,
-    'REAL': TokenType.kwReal,
-    'FLOAT': TokenType.kwFloat,
-    'DOUBLE': TokenType.kwDouble,
-    'BLOB': TokenType.kwBlob,
-    'BOOLEAN': TokenType.kwBoolean,
-    'BOOL': TokenType.kwBool,
-    'DATETIME': TokenType.kwDatetime,
-    'DATE': TokenType.kwDate,
-    'NULL': TokenType.kwNull_,
-    'PRIMARY': TokenType.kwPrimary,
-    'KEY': TokenType.kwKey,
-    'UNIQUE': TokenType.kwUnique,
-    'DEFAULT': TokenType.kwDefault,
-    'FOREIGN': TokenType.kwForeign,
-    'REFERENCES': TokenType.kwReferences,
-    'AUTOINCREMENT': TokenType.kwAutoincrement,
-    'AUTO_INCREMENT': TokenType.kwAutoincrement,
-    'AND': TokenType.kwAnd,
-    'OR': TokenType.kwOr,
-    'IN': TokenType.kwIn,
-    'LIKE': TokenType.kwLike,
-    'IS': TokenType.kwIs,
-    'BETWEEN': TokenType.kwBetween,
-    'TRUE': TokenType.kwTrue,
-    'FALSE': TokenType.kwFalse,
-    'CASE': TokenType.kwCase,
-    'WHEN': TokenType.kwWhen,
-    'THEN': TokenType.kwThen,
-    'ELSE': TokenType.kwElse,
-    'END': TokenType.kwEnd,
-    // Transaction keywords
-    'BEGIN': TokenType.kwBegin,
-    'COMMIT': TokenType.kwCommit,
-    'ROLLBACK': TokenType.kwRollback,
-    'SAVEPOINT': TokenType.kwSavepoint,
-    'RELEASE': TokenType.kwRelease,
-    'TRANSACTION': TokenType.kwTransaction,
-    'WORK': TokenType.kwWork,
-    'DEFERRED': TokenType.kwDeferred,
-    'IMMEDIATE': TokenType.kwImmediate,
-    'EXCLUSIVE': TokenType.kwExclusive,
-    // View keywords
-    'VIEW': TokenType.kwView,
-    // Trigger keywords
-    'TRIGGER': TokenType.kwTrigger,
-    'BEFORE': TokenType.kwBefore,
-    'AFTER': TokenType.kwAfter,
-    'INSTEAD': TokenType.kwInsteadOf,
-    'FOR': TokenType.kwFor,
-    'EACH': TokenType.kwEach,
-    'ROW': TokenType.kwRow,
-    // Index keywords
-    'INDEX': TokenType.kwIndex,
-    'SPATIAL': TokenType.kwSpatial,
-    'USING': TokenType.kwUsing,
-  };
+import 'sql_exception.dart';
 
-  Lexer(this.source);
+/// The kinds of token.
+@internal
+enum TokenKind {
+  /// A bare word: a keyword or an unquoted identifier. [Token.text] is
+  /// as written; [Token.upper] is upper-cased.
+  word,
 
-  /// Tokenizes the entire source string. Always ends with an [TokenType.eof] token.
-  List<Token> tokenize() {
-    final tokens = <Token>[];
-    while (!_isAtEnd()) {
-      _skipWhitespaceAndComments();
-      if (_isAtEnd()) break;
-      tokens.add(_nextToken());
+  /// `"name"`, `` `name` `` or `[name]`. [Token.text] is the name.
+  quotedIdentifier,
+
+  /// `'text'`. [Token.text] is the text with `''` unescaped.
+  string,
+
+  /// `X'0A1B'`. [Token.value] is the bytes.
+  blob,
+
+  /// An integer literal. [Token.value] is its int (or a double when it does
+  /// not fit 64 bits, as SQLite reads it).
+  integer,
+
+  /// A real literal. [Token.value] is its double.
+  real,
+
+  /// `?`, `?NNN`, `:name`, `@name` or `$name`. [Token.text] is as written.
+  parameter,
+
+  /// Punctuation or an operator. [Token.text] is the symbol.
+  symbol,
+
+  /// The body of a `/*+ … */` hint comment.
+  hint,
+
+  /// The end of the input.
+  eof,
+}
+
+/// One token of SQL text.
+@internal
+final class Token {
+  /// Creates a token.
+  Token(this.kind, this.text, this.start, this.end, [this.value])
+    : upper = kind == TokenKind.word ? text.toUpperCase() : text;
+
+  /// The kind of token.
+  final TokenKind kind;
+
+  /// The token's text (see [TokenKind]).
+  final String text;
+
+  /// [text] upper-cased, for words.
+  final String upper;
+
+  /// The offsets of the token in the SQL text.
+  final int start, end;
+
+  /// The literal value, for blobs and numbers.
+  final Object? value;
+
+  /// Whether this is the bare word [w] (upper case).
+  bool isWord(String w) => kind == TokenKind.word && upper == w;
+
+  /// Whether this is the symbol [s].
+  bool isSymbol(String s) => kind == TokenKind.symbol && text == s;
+
+  @override
+  String toString() => kind == TokenKind.eof ? 'end of input' : "'$text'";
+}
+
+const _symbols2 = ['||', '<<', '>>', '<=', '>=', '==', '!=', '<>'];
+const _symbols1 = '+-*/%&|~<>=(),;.';
+
+/// Splits SQL text into tokens.
+@internal
+List<Token> tokenize(String sql) {
+  final tokens = <Token>[];
+  final n = sql.length;
+  var i = 0;
+
+  bool isIdStart(int c) =>
+      (c >= 0x41 && c <= 0x5A) ||
+      (c >= 0x61 && c <= 0x7A) ||
+      c == 0x5F ||
+      c >= 0x80;
+  bool isIdPart(int c) => isIdStart(c) || (c >= 0x30 && c <= 0x39) || c == 0x24;
+  bool isDigit(int c) => c >= 0x30 && c <= 0x39;
+
+  while (i < n) {
+    final c = sql.codeUnitAt(i);
+    // Whitespace.
+    if (c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D || c == 0x0C) {
+      i++;
+      continue;
     }
-    tokens.add(
-      Token(type: TokenType.eof, lexeme: '', line: _line, column: _column),
-    );
-    return tokens;
-  }
-
-  Token _nextToken() {
-    final startLine = _line;
-    final startCol = _column;
-    final ch = _current();
-
-    // String literal
-    if (ch == "'") return _readString(startLine, startCol);
-
-    // Number literal
-    if (_isDigit(ch) || (ch == '.' && _isDigit(_peekChar(1)))) {
-      return _readNumber(startLine, startCol);
+    final start = i;
+    // Comments.
+    if (c == 0x2D && i + 1 < n && sql.codeUnitAt(i + 1) == 0x2D) {
+      while (i < n && sql.codeUnitAt(i) != 0x0A) {
+        i++;
+      }
+      continue;
     }
-
-    // Identifier or keyword
-    if (_isAlpha(ch) || ch == '_') {
-      return _readIdentifierOrKeyword(startLine, startCol);
+    if (c == 0x2F && i + 1 < n && sql.codeUnitAt(i + 1) == 0x2A) {
+      final close = sql.indexOf('*/', i + 2);
+      final end = close < 0 ? n : close + 2;
+      if (i + 2 < n && sql.codeUnitAt(i + 2) == 0x2B) {
+        if (close < 0) {
+          throw SqlException.syntax('unterminated hint comment', sql, start);
+        }
+        tokens.add(
+          Token(TokenKind.hint, sql.substring(i + 3, close).trim(), start, end),
+        );
+      }
+      i = end;
+      continue;
     }
-
-    // Operators and punctuation
-    _advance();
-    switch (ch) {
-      case '(':
-        return Token(
-          type: TokenType.lparen,
-          lexeme: ch,
-          line: startLine,
-          column: startCol,
+    // Strings.
+    if (c == 0x27) {
+      final (text, end) = _quoted(sql, i, 0x27, 'string');
+      tokens.add(Token(TokenKind.string, text, start, end));
+      i = end;
+      continue;
+    }
+    // Quoted identifiers.
+    if (c == 0x22 || c == 0x60) {
+      final (text, end) = _quoted(sql, i, c, 'identifier');
+      tokens.add(Token(TokenKind.quotedIdentifier, text, start, end));
+      i = end;
+      continue;
+    }
+    if (c == 0x5B) {
+      final close = sql.indexOf(']', i + 1);
+      if (close < 0) {
+        throw SqlException.syntax('unterminated [identifier]', sql, start);
+      }
+      tokens.add(
+        Token(
+          TokenKind.quotedIdentifier,
+          sql.substring(i + 1, close),
+          start,
+          close + 1,
+        ),
+      );
+      i = close + 1;
+      continue;
+    }
+    // Blob literals.
+    if ((c == 0x58 || c == 0x78) &&
+        i + 1 < n &&
+        sql.codeUnitAt(i + 1) == 0x27) {
+      final (hex, end) = _quoted(sql, i + 1, 0x27, 'blob');
+      if (hex.length.isOdd || !RegExp(r'^[0-9A-Fa-f]*$').hasMatch(hex)) {
+        throw SqlException.syntax('malformed blob literal', sql, start);
+      }
+      final bytes = Uint8List(hex.length ~/ 2);
+      for (var k = 0; k < bytes.length; k++) {
+        bytes[k] = int.parse(hex.substring(2 * k, 2 * k + 2), radix: 16);
+      }
+      tokens.add(
+        Token(TokenKind.blob, sql.substring(start, end), start, end, bytes),
+      );
+      i = end;
+      continue;
+    }
+    // Numbers.
+    if (isDigit(c) ||
+        (c == 0x2E && i + 1 < n && isDigit(sql.codeUnitAt(i + 1)))) {
+      if (c == 0x30 && i + 1 < n && (sql.codeUnitAt(i + 1) | 0x20) == 0x78) {
+        var j = i + 2;
+        while (j < n && RegExp(r'[0-9A-Fa-f]').hasMatch(sql[j])) {
+          j++;
+        }
+        final digits = sql.substring(i + 2, j);
+        if (digits.isEmpty ||
+            digits.length > 16 ||
+            (j < n && isIdPart(sql.codeUnitAt(j)))) {
+          throw SqlException.syntax('malformed hex literal', sql, start);
+        }
+        // Two's complement, as SQLite: 0xFFFFFFFFFFFFFFFF is -1.
+        final value = BigInt.parse(digits, radix: 16).toSigned(64).toInt();
+        tokens.add(
+          Token(TokenKind.integer, sql.substring(i, j), start, j, value),
         );
-      case ')':
-        return Token(
-          type: TokenType.rparen,
-          lexeme: ch,
-          line: startLine,
-          column: startCol,
-        );
-      case ',':
-        return Token(
-          type: TokenType.comma,
-          lexeme: ch,
-          line: startLine,
-          column: startCol,
-        );
-      case '.':
-        return Token(
-          type: TokenType.dot,
-          lexeme: ch,
-          line: startLine,
-          column: startCol,
-        );
-      case ';':
-        return Token(
-          type: TokenType.semicolon,
-          lexeme: ch,
-          line: startLine,
-          column: startCol,
-        );
-      case '+':
-        return Token(
-          type: TokenType.opPlus,
-          lexeme: ch,
-          line: startLine,
-          column: startCol,
-        );
-      case '-':
-        return Token(
-          type: TokenType.opMinus,
-          lexeme: ch,
-          line: startLine,
-          column: startCol,
-        );
-      case '*':
-        return Token(
-          type: TokenType.opStar,
-          lexeme: ch,
-          line: startLine,
-          column: startCol,
-        );
-      case '/':
-        // Hint comment /*+ ... */ — emit as hintComment token
-        if (_current() == '*' && _peekChar(1) == '+') {
-          _advance(); // skip *
-          _advance(); // skip +
-          final hintBuf = StringBuffer();
-          while (!_isAtEnd()) {
-            if (_current() == '*' && _peekChar(1) == '/') {
-              _advance(); // skip *
-              _advance(); // skip /
-              break;
-            }
-            if (_current() == '\n') {
-              _line++;
-              _column = 0;
-            }
-            hintBuf.write(_current());
-            _advance();
+        i = j;
+        continue;
+      }
+      var j = i;
+      var isReal = false;
+      while (j < n && isDigit(sql.codeUnitAt(j))) {
+        j++;
+      }
+      if (j < n && sql.codeUnitAt(j) == 0x2E) {
+        isReal = true;
+        j++;
+        while (j < n && isDigit(sql.codeUnitAt(j))) {
+          j++;
+        }
+      }
+      if (j < n && (sql.codeUnitAt(j) | 0x20) == 0x65) {
+        var k = j + 1;
+        if (k < n && (sql.codeUnitAt(k) == 0x2B || sql.codeUnitAt(k) == 0x2D)) {
+          k++;
+        }
+        if (k < n && isDigit(sql.codeUnitAt(k))) {
+          isReal = true;
+          j = k;
+          while (j < n && isDigit(sql.codeUnitAt(j))) {
+            j++;
           }
-          final hintBody = hintBuf.toString().trim();
-          return Token(
-            type: TokenType.hintComment,
-            lexeme: '/*+$hintBody*/',
-            value: hintBody,
-            line: startLine,
-            column: startCol,
-          );
-        }
-        return Token(
-          type: TokenType.opSlash,
-          lexeme: ch,
-          line: startLine,
-          column: startCol,
-        );
-      case '%':
-        return Token(
-          type: TokenType.opPercent,
-          lexeme: ch,
-          line: startLine,
-          column: startCol,
-        );
-      case '=':
-        return Token(
-          type: TokenType.opEq,
-          lexeme: ch,
-          line: startLine,
-          column: startCol,
-        );
-      case '!':
-        if (!_isAtEnd() && _current() == '=') {
-          _advance();
-          return Token(
-            type: TokenType.opNeq,
-            lexeme: '!=',
-            line: startLine,
-            column: startCol,
-          );
-        }
-        throw ParseException('Unexpected character "!"', startLine, startCol);
-      case '<':
-        if (!_isAtEnd() && _current() == '=') {
-          _advance();
-          return Token(
-            type: TokenType.opLte,
-            lexeme: '<=',
-            line: startLine,
-            column: startCol,
-          );
-        }
-        if (!_isAtEnd() && _current() == '>') {
-          _advance();
-          return Token(
-            type: TokenType.opNeq,
-            lexeme: '<>',
-            line: startLine,
-            column: startCol,
-          );
-        }
-        return Token(
-          type: TokenType.opLt,
-          lexeme: '<',
-          line: startLine,
-          column: startCol,
-        );
-      case '>':
-        if (!_isAtEnd() && _current() == '=') {
-          _advance();
-          return Token(
-            type: TokenType.opGte,
-            lexeme: '>=',
-            line: startLine,
-            column: startCol,
-          );
-        }
-        return Token(
-          type: TokenType.opGt,
-          lexeme: '>',
-          line: startLine,
-          column: startCol,
-        );
-      default:
-        throw ParseException('Unexpected character "$ch"', startLine, startCol);
-    }
-  }
-
-  Token _readString(int startLine, int startCol) {
-    _advance(); // consume opening '
-    final buffer = StringBuffer();
-    while (!_isAtEnd()) {
-      final ch = _current();
-      if (ch == "'") {
-        _advance();
-        // '' means escaped single-quote
-        if (!_isAtEnd() && _current() == "'") {
-          buffer.write("'");
-          _advance();
         } else {
-          break; // end of string
+          throw SqlException.syntax('malformed number', sql, start);
         }
+      }
+      if (j < n && isIdStart(sql.codeUnitAt(j))) {
+        throw SqlException.syntax(
+          'unrecognized token "${sql.substring(start, j + 1)}"',
+          sql,
+          start,
+        );
+      }
+      final text = sql.substring(i, j);
+      if (isReal) {
+        tokens.add(Token(TokenKind.real, text, start, j, double.parse(text)));
       } else {
-        buffer.write(ch);
-        if (ch == '\n') {
-          _line++;
-          _column = 0;
-        }
-        _advance();
+        final v = int.tryParse(text);
+        tokens.add(
+          v != null
+              ? Token(TokenKind.integer, text, start, j, v)
+              : Token(TokenKind.real, text, start, j, double.parse(text)),
+        );
+      }
+      i = j;
+      continue;
+    }
+    // Words.
+    if (isIdStart(c)) {
+      var j = i + 1;
+      while (j < n && isIdPart(sql.codeUnitAt(j))) {
+        j++;
+      }
+      tokens.add(Token(TokenKind.word, sql.substring(i, j), start, j));
+      i = j;
+      continue;
+    }
+    // Parameters.
+    if (c == 0x3F) {
+      var j = i + 1;
+      while (j < n && isDigit(sql.codeUnitAt(j))) {
+        j++;
+      }
+      tokens.add(Token(TokenKind.parameter, sql.substring(i, j), start, j));
+      i = j;
+      continue;
+    }
+    if ((c == 0x3A || c == 0x40 || c == 0x24) &&
+        i + 1 < n &&
+        isIdStart(sql.codeUnitAt(i + 1))) {
+      var j = i + 1;
+      while (j < n && isIdPart(sql.codeUnitAt(j))) {
+        j++;
+      }
+      tokens.add(Token(TokenKind.parameter, sql.substring(i, j), start, j));
+      i = j;
+      continue;
+    }
+    // Symbols.
+    if (i + 1 < n) {
+      final two = sql.substring(i, i + 2);
+      if (_symbols2.contains(two)) {
+        tokens.add(Token(TokenKind.symbol, two, start, i + 2));
+        i += 2;
+        continue;
       }
     }
-    final str = buffer.toString();
-    return Token(
-      type: TokenType.litString,
-      lexeme: "'$str'",
-      value: str,
-      line: startLine,
-      column: startCol,
-    );
-  }
-
-  Token _readNumber(int startLine, int startCol) {
-    final start = _pos;
-    bool isFloat = false;
-    while (!_isAtEnd() && _isDigit(_current())) {
-      _advance();
+    if (_symbols1.contains(sql[i])) {
+      tokens.add(Token(TokenKind.symbol, sql[i], start, i + 1));
+      i++;
+      continue;
     }
-    if (!_isAtEnd() && _current() == '.') {
-      isFloat = true;
-      _advance();
-      while (!_isAtEnd() && _isDigit(_current())) {
-        _advance();
+    throw SqlException.syntax('unrecognized token "${sql[i]}"', sql, start);
+  }
+  tokens.add(Token(TokenKind.eof, '', n, n));
+  return tokens;
+}
+
+/// Reads a quoted run starting at [i] (the opening quote [q]), where a
+/// doubled quote stands for one. Returns the unescaped text and the offset
+/// after the closing quote.
+(String, int) _quoted(String sql, int i, int q, String what) {
+  final b = StringBuffer();
+  var j = i + 1;
+  final n = sql.length;
+  while (true) {
+    if (j >= n) throw SqlException.syntax('unterminated $what', sql, i);
+    final c = sql.codeUnitAt(j);
+    if (c == q) {
+      if (j + 1 < n && sql.codeUnitAt(j + 1) == q) {
+        b.writeCharCode(q);
+        j += 2;
+        continue;
       }
+      return (b.toString(), j + 1);
     }
-    // Optional exponent
-    if (!_isAtEnd() && (_current() == 'e' || _current() == 'E')) {
-      isFloat = true;
-      _advance();
-      if (!_isAtEnd() && (_current() == '+' || _current() == '-')) _advance();
-      while (!_isAtEnd() && _isDigit(_current())) {
-        _advance();
-      }
-    }
-    final lexeme = source.substring(start, _pos);
-    if (isFloat) {
-      return Token(
-        type: TokenType.litFloat,
-        lexeme: lexeme,
-        value: double.parse(lexeme),
-        line: startLine,
-        column: startCol,
-      );
-    } else {
-      return Token(
-        type: TokenType.litInteger,
-        lexeme: lexeme,
-        value: int.parse(lexeme),
-        line: startLine,
-        column: startCol,
-      );
-    }
+    b.writeCharCode(c);
+    j++;
   }
-
-  Token _readIdentifierOrKeyword(int startLine, int startCol) {
-    final start = _pos;
-    while (!_isAtEnd() && (_isAlphaNumeric(_current()) || _current() == '_')) {
-      _advance();
-    }
-    final lexeme = source.substring(start, _pos);
-    final upper = lexeme.toUpperCase();
-    final kwType = _keywords[upper];
-
-    if (kwType != null) {
-      dynamic value;
-      if (kwType == TokenType.kwTrue) value = true;
-      if (kwType == TokenType.kwFalse) value = false;
-      return Token(
-        type: kwType,
-        lexeme: lexeme,
-        value: value,
-        line: startLine,
-        column: startCol,
-      );
-    }
-
-    // Backtick-quoted identifiers like `name` are handled below
-    return Token(
-      type: TokenType.identifier,
-      lexeme: lexeme,
-      value: lexeme,
-      line: startLine,
-      column: startCol,
-    );
-  }
-
-  void _skipWhitespaceAndComments() {
-    while (!_isAtEnd()) {
-      final ch = _current();
-      if (ch == ' ' || ch == '\t' || ch == '\r') {
-        _advance();
-      } else if (ch == '\n') {
-        _line++;
-        _column = 0;
-        _advance();
-      } else if (ch == '-' && _peekChar(1) == '-') {
-        // Line comment
-        while (!_isAtEnd() && _current() != '\n') {
-          _advance();
-        }
-      } else if (ch == '/' && _peekChar(1) == '*') {
-        // Hint comments /*+ ... */ must reach _nextToken — don't skip them
-        if (_peekChar(2) == '+') break;
-        // Block comment
-        _advance();
-        _advance();
-        while (!_isAtEnd()) {
-          if (_current() == '*' && _peekChar(1) == '/') {
-            _advance();
-            _advance();
-            break;
-          }
-          if (_current() == '\n') {
-            _line++;
-            _column = 0;
-          }
-          _advance();
-        }
-      } else {
-        break;
-      }
-    }
-  }
-
-  bool _isAtEnd() => _pos >= source.length;
-
-  String _current() => _isAtEnd() ? '' : source[_pos];
-
-  String _peekChar(int offset) {
-    final idx = _pos + offset;
-    return idx >= source.length ? '' : source[idx];
-  }
-
-  void _advance() {
-    if (!_isAtEnd()) {
-      _pos++;
-      _column++;
-    }
-  }
-
-  bool _isDigit(String ch) =>
-      ch.isNotEmpty && ch.codeUnitAt(0) >= 48 && ch.codeUnitAt(0) <= 57;
-
-  bool _isAlpha(String ch) {
-    if (ch.isEmpty) return false;
-    final code = ch.codeUnitAt(0);
-    return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
-  }
-
-  bool _isAlphaNumeric(String ch) => _isAlpha(ch) || _isDigit(ch);
 }
